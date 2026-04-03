@@ -1,0 +1,103 @@
+# API Gateway Configuration
+# Model routing: map model names to providers
+# Format: "model_alias" -> provider + actual model name
+
+providers:
+  ollama:
+    type: openai
+    base_url: https://ollama.com/v1
+    api_key: ${OLLAMA_API_KEY:}
+    timeout: 120
+
+  openrouter:
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY:}
+    timeout: 120
+
+  groq:
+    type: openai
+    base_url: https://api.groq.com/openai/v1
+    api_key: ${GROQ_API_KEY:}
+    timeout: 60
+    score_offset: 0.5  # Boost Groq models due to extreme low latency
+
+  cerebras:
+    type: openai
+    base_url: https://api.cerebras.ai/v1
+    api_key: ${CEREBRAS_API_KEY:}
+    timeout: 60
+
+  github:
+    type: openai
+    base_url: https://models.inference.ai.azure.com
+    api_key: ${GITHUB_TOKEN:}
+    timeout: 60
+
+  sambanova:
+    type: openai
+    base_url: https://api.sambanova.ai/v1
+    api_key: ${SAMBANOVA_API_KEY:}
+    timeout: 60
+
+  nvidia:
+    type: openai
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: ${NVIDIA_API_KEY:}
+    timeout: 60
+
+  mistral:
+    type: openai
+    base_url: https://api.mistral.ai/v1
+    api_key: ${MISTRAL_API_KEY:}
+    timeout: 60
+
+  hyperbolic:
+    type: openai
+    base_url: https://api.hyperbolic.xyz/v1
+    api_key: ${HYPERBOLIC_API_KEY:}
+    timeout: 60
+
+  novita:
+    type: openai
+    base_url: https://api.novita.ai/v1
+    api_key: ${NOVITA_API_KEY:}
+    timeout: 60
+
+  nebius:
+    type: openai
+    base_url: https://api.nebius.ai/v1
+    api_key: ${NEBIUS_API_KEY:}
+    timeout: 60
+
+  google-gemini:
+    type: openai
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    api_key: ${GEMINI_API_KEY:}
+    timeout: 300
+
+# Model routing rules
+# When a client requests a model, it will be routed to the specified provider
+# If no route matches, the default provider will be used
+models:
+  # Ollama models
+  "llama3": { provider: "ollama", model: "llama3" }
+  "llama3:8b": { provider: "ollama", model: "llama3:8b" }
+  "llama3:70b": { provider: "ollama", model: "llama3:70b" }
+  "qwen2.5": { provider: "ollama", model: "qwen2.5" }
+  "qwen2.5:72b": { provider: "ollama", model: "qwen2.5:72b" }
+  "deepseek-r1": { provider: "ollama", model: "deepseek-r1" }
+  "gemma2": { provider: "ollama", model: "gemma2" }
+  "mistral": { provider: "ollama", model: "mistral" }
+  "codellama": { provider: "ollama", model: "codellama" }
+
+  # OpenRouter models
+  "gpt-4o": { provider: "openrouter", model: "openai/gpt-4o" }
+  "gpt-4o-mini": { provider: "openrouter", model: "openai/gpt-4o-mini" }
+  "claude-3.5-sonnet": { provider: "openrouter", model: "anthropic/claude-3.5-sonnet" }
+  "claude-3-opus": { provider: "openrouter", model: "anthropic/claude-3-opus" }
+  "gemini-pro": { provider: "openrouter", model: "google/gemini-pro-1.5" }
+  "deepseek-chat": { provider: "openrouter", model: "deepseek/deepseek-chat" }
+
+# Default provider when model is not found in routing table
+default_provider: "ollama"
