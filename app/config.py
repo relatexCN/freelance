@@ -6,6 +6,7 @@ Loads settings from .env and config.yaml.
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -32,14 +33,45 @@ def find_config_file(filename: str) -> Path:
         
     return cwd_path  # Default to CWD path if none found (for error reporting)
 
-# Pre-configure logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)-8s | %(name)s | %(message)s")
+# Pre-configure logging (Logic moved to main.py)
 logger = logging.getLogger("freelance.config")
 
 # Load .env from best available location
 ENV_PATH = find_config_file(".env")
 load_dotenv(dotenv_path=ENV_PATH)
 logger.info(f"[*] Environment loaded from: {ENV_PATH.absolute()}")
+
+class CooldownSettings(BaseModel):
+    """Cooldown durations for different error types."""
+    rate_limit_429: int = 1800
+    auth_error_401: int = 10800
+    forbidden_403: int = 10800
+    quota_exceeded: int = 3600
+    timeout_network: int = 3600
+    stream_failure_fallback: int = 3600
+    other_error: int = 10800
+    provider_melt: int = 10800
+
+class StreamProbeSettings(BaseModel):
+    """Tiered first-token timeout settings for SSE."""
+    small_model_timeout: int = 15       # For small models (<10B)
+    large_model_timeout: int = 30       # For large models (10B-100B)
+    xlarge_model_timeout: int = 60      # For extra-large models (100B-500B)
+    defunct_model_timeout: int = 120    # For unrecognized models
+    ping_interval: int = 3              # Heartbeat interval (seconds)
+    read_timeout: int = 120             # Read timeout between chunks (seconds)
+    huge_model_read_timeout: int = 180  # Read timeout for huge models (500B+)
+
+class ConnectionPoolConfig(BaseModel):
+    """Configuration for a single HTTP connection pool."""
+    max_connections: int = 100
+    max_keepalive: int = 50
+    keepalive_expiry: int = 300
+
+class PoolSettings(BaseModel):
+    """Settings for isolated connection pools."""
+    stream: ConnectionPoolConfig = Field(default_factory=lambda: ConnectionPoolConfig(max_connections=100, max_keepalive=50, keepalive_expiry=600))
+    batch: ConnectionPoolConfig = Field(default_factory=lambda: ConnectionPoolConfig(max_connections=200, max_keepalive=100, keepalive_expiry=60))
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -49,6 +81,10 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="API_KEY")
     api_keys: str = Field(default="", alias="API_KEYS")  # comma-separated string of valid keys
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
+    unified_timeout: Optional[float] = Field(default=None, alias="UNIFIED_TIMEOUT")
+    cooldown: CooldownSettings = Field(default_factory=CooldownSettings)
+    stream_probe: StreamProbeSettings = Field(default_factory=StreamProbeSettings)
+    connection_pool: PoolSettings = Field(default_factory=PoolSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -69,34 +105,149 @@ def _resolve_env_vars(value: str, settings: Settings) -> str:
 class ProviderConfig:
     """Configuration for a single provider."""
 
-    def __init__(self, name: str, base_url: str, provider_type: str = "openai", api_key: str = "", timeout: int = 120, score_offset: float = 0.0):
+    def __init__(self, name: str, base_url: str, provider_type: str = "openai", api_key: str = "", timeout: int = 120, score_offset: float = 0.0, default_model: str = ""):
         self.name = name
         self.provider_type = provider_type
         self.base_url = base_url.rstrip("/")
         self.score_offset = score_offset  # Manual boost/penalty for this provider
-        # Parse comma-separated api keys
-        self.set_api_key(api_key)
         self.timeout = timeout
+        self.default_model = default_model  # Default model to use in auto mode
+        
+        # Internal API key pool and round-robin counter
+        self.api_keys = []
         self._current_key_idx = 0
+        self.key_cooldowns: dict[int, float] = {}   # index -> melted_until timestamp
+        self.fatal_keys: set[int] = set()           # set of key indices that are fatally failed
+        self.model_cooldowns: dict[str, float] = {} # model_id -> melted_until timestamp
+        self.stream_melted_until: dict[str, float] = {} # model_id -> melted_until timestamp
+        self.melted_until = 0 # Platform-level circuit breaker
+        self.set_api_key(api_key)
 
     def set_api_key(self, api_key: str):
-        """Parse comma-separated API keys into the pool."""
-        self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
-        if not self.api_keys and api_key:
-            self.api_keys = [api_key.strip()]
+        """Parse comma-separated API keys into the pool with strict filtering."""
+        if not api_key:
+            self.api_keys = []
+        else:
+            # Split and filter out empty strings after stripping (e.g., "key1, ,key2")
+            self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
+        
         self._current_key_idx = 0
+        self.key_cooldowns = {}
+        self.fatal_keys = set()
+        self.model_cooldowns = {}
+        self.stream_melted_until = {}
+        self.melted_until = 0
 
-    def get_next_key(self) -> str:
-        """Returns the next API key in the pool (Round-Robin). Returns empty string if no keys."""
+    def get_next_key(self) -> tuple[str, int]:
+        """
+        Returns (key, index) for the next healthy API key in the pool.
+        Skips keys currently in cooldown. 
+        UNLESS the key is marked as Fatal (401/403), it won't even be returned as fallback.
+        """
         if not self.api_keys:
-            return ""
+            logger.info(f"[{self.name}] get_next_key: No API keys configured")
+            return "", -1
             
-        key = self.api_keys[self._current_key_idx]
-        self._current_key_idx = (self._current_key_idx + 1) % len(self.api_keys)
-        return key
+        now = time.time()
+        num_keys = len(self.api_keys)
+        
+        # Build status info for logging
+        status_parts = []
+        for idx in range(num_keys):
+            if idx in self.fatal_keys:
+                status_parts.append(f"key[{idx}]=FATAL")
+            elif idx in self.key_cooldowns:
+                remaining = self.key_cooldowns[idx] - now
+                status_parts.append(f"key[{idx}]=COOLDOWN({remaining:.0f}s)")
+            else:
+                status_parts.append(f"key[{idx}]=HEALTHY")
+        
+        # 1. First pass: try to find a completely healthy key
+        for i in range(num_keys):
+            idx = (self._current_key_idx + i) % num_keys
+            if idx not in self.key_cooldowns or now >= self.key_cooldowns[idx]:
+                # Found a healthy key!
+                if idx in self.key_cooldowns:
+                    del self.key_cooldowns[idx] # Clean up
+                    if idx in self.fatal_keys:
+                        self.fatal_keys.remove(idx)
+                
+                self._current_key_idx = (idx + 1) % num_keys
+                logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (HEALTHY) | Status: {', '.join(status_parts)}")
+                return self.api_keys[idx], idx
+
+        # 2. Fallback: return the next one that is NOT fatal.
+        # This is for transient errors like 429.
+        for i in range(num_keys):
+            idx = (self._current_key_idx + i) % num_keys
+            if idx not in self.fatal_keys:
+                self._current_key_idx = (idx + 1) % num_keys
+                remaining = self.key_cooldowns[idx] - now if idx in self.key_cooldowns else 0
+                logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (IN_COOLDOWN, {remaining:.0f}s remaining) | Status: {', '.join(status_parts)}")
+                return self.api_keys[idx], idx
+        
+        # 3. No non-fatal keys available. Trigger platform-level melt if not already set.
+        if not self.is_platform_melted():
+             # Use provider_melt duration (default 3h)
+             self.record_platform_failure(10800)
+             logger.warning(f"[{self.name}] No non-fatal keys available. Melting platform for 3 hours.")
+
+        logger.error(f"[{self.name}] get_next_key: No available keys | Status: {', '.join(status_parts)}")
+        return "", -1
+
+    def record_key_failure(self, index: int, cooldown: int = 60, is_fatal: bool = False):
+        """Mark a specific key as hot for a period of time."""
+        if 0 <= index < len(self.api_keys):
+            self.key_cooldowns[index] = time.time() + cooldown
+            if is_fatal:
+                self.fatal_keys.add(index)
+                # If ALL keys are now fatal, melt the platform
+                if len(self.fatal_keys) >= len(self.api_keys):
+                    self.record_platform_failure() # 3 hour default
+                    logger.error(f"[{self.name}] All keys are fatal. Melting entire platform.")
+            elif index in self.fatal_keys:
+                self.fatal_keys.remove(index)
+
+    def record_model_failure(self, model_id: str, cooldown: int = 3600):
+        """Mark a specific model path as hot for a period of time."""
+        self.model_cooldowns[model_id] = time.time() + cooldown
+
+    def record_platform_failure(self, cooldown: int = 10800):
+        """Mark the entire provider as melted for a period of time."""
+        self.melted_until = time.time() + cooldown
+
+    def is_model_melted(self, model_id: str) -> bool:
+        """Check if a specific model is cooling down."""
+        if model_id in self.model_cooldowns:
+            if time.time() < self.model_cooldowns[model_id]:
+                return True
+            del self.model_cooldowns[model_id]
+        return False
+
+    def is_platform_melted(self) -> bool:
+        """Check if the entire provider is cooling down."""
+        if self.melted_until > 0:
+            if time.time() < self.melted_until:
+                return True
+            self.melted_until = 0
+        return False
+
+    def record_stream_failure(self, model_id: str, cooldown: float):
+        """Record a failure specifically for streaming protocol."""
+        self.stream_melted_until[model_id] = time.time() + cooldown
+
+    def is_stream_melted(self, model_id: str) -> bool:
+        """Check if streaming is currently disabled for this model."""
+        if model_id in self.stream_melted_until:
+            if time.time() < self.stream_melted_until[model_id]:
+                return True
+            del self.stream_melted_until[model_id]
+        return False
 
     def __repr__(self):
-        return f"ProviderConfig(name={self.name!r}, type={self.provider_type!r}, base_url={self.base_url!r}, keys={len(self.api_keys)})"
+        status = "HEALTHY"
+        if self.is_platform_melted(): status = "MELTED"
+        return f"ProviderConfig(name={self.name!r}, status={status}, keys={len(self.api_keys)}, hot_keys={len(self.key_cooldowns)}, hot_models={len(self.model_cooldowns)})"
 
 
 class ModelRoute:
@@ -135,10 +286,42 @@ class AppConfig:
                 content = f.read()
                 raw = yaml.safe_load(content) or {}
 
-            if not raw:
-                logger.warning(f"Configuration file at {config_path} is EMPTY or invalid.")
-                self._setup_default_providers()
-                return
+            self.settings = Settings()
+            if "settings" in raw:
+                s_data = raw["settings"]
+                if "max_retries" in s_data:
+                    self.settings.max_retries = int(s_data["max_retries"])
+                if "unified_timeout" in s_data:
+                    unified_timeout_val = s_data["unified_timeout"]
+                    if unified_timeout_val is not None:
+                        self.settings.unified_timeout = float(unified_timeout_val)
+                    else:
+                        self.settings.unified_timeout = None
+                
+                if "cooldown" in s_data:
+                    c_data = s_data["cooldown"]
+                    for key, val in c_data.items():
+                        if hasattr(self.settings.cooldown, key):
+                            setattr(self.settings.cooldown, key, int(val))
+                
+                if "stream_probe" in s_data:
+                    p_data = s_data["stream_probe"]
+                    for key, val in p_data.items():
+                        if hasattr(self.settings.stream_probe, key):
+                            setattr(self.settings.stream_probe, key, int(val))
+                
+                if "connection_pool" in s_data:
+                    cp_data = s_data["connection_pool"]
+                    # Load stream pool
+                    if "stream" in cp_data:
+                        for key, val in cp_data["stream"].items():
+                            if hasattr(self.settings.connection_pool.stream, key):
+                                setattr(self.settings.connection_pool.stream, key, int(val))
+                    # Load batch pool
+                    if "batch" in cp_data:
+                        for key, val in cp_data["batch"].items():
+                            if hasattr(self.settings.connection_pool.batch, key):
+                                setattr(self.settings.connection_pool.batch, key, int(val))
 
             # Load providers
             provider_count = 0
@@ -149,10 +332,12 @@ class AppConfig:
                 provider_type = str(pconf.get("type", "openai")).lower()
                 timeout = pconf.get("timeout", 120)
                 score_offset = float(pconf.get("score_offset", 0.0))
+                default_model = pconf.get("default_model", "")
                 
                 self.providers[name] = ProviderConfig(
                     name=name, base_url=base_url, provider_type=provider_type, 
-                    api_key=api_key, timeout=timeout, score_offset=score_offset
+                    api_key=api_key, timeout=timeout, score_offset=score_offset,
+                    default_model=default_model
                 )
                 provider_count += 1
             

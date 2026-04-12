@@ -34,22 +34,17 @@ def update_env_file(file_path, key, value):
     return True
 
 def keygen():
-    """Generate a new secure API key and update .env files."""
+    """Generate a new secure API key and update .env file."""
     new_key = f"sk-freelance-{secrets.token_urlsafe(32)}"
-    print(f"🔑 Generated new API Key: {new_key}")
+    print(f"Generated new API Key: {new_key}")
     
-    updated_files = []
-    # Update both .env and .env.example
-    for filename in [".env", ".env.example"]:
-        if update_env_file(filename, "API_KEY", new_key):
-            updated_files.append(filename)
-            
-    if updated_files:
-        print(f"✅ Successfully updated: {', '.join(updated_files)}")
-        print("⚠️  Please restart the gateway to apply changes if it is currently running.")
+    # Only update .env, not .env.example
+    if update_env_file(".env", "API_KEY", new_key):
+        print("Successfully updated: .env")
+        print("Please restart the gateway to apply changes if it is currently running.")
     else:
-        print("❌ Could not find .env or .env.example to update.")
-        print(f"💡 You can manually set: API_KEY={new_key}")
+        print("Could not find .env to update.")
+        print(f"You can manually set: API_KEY={new_key}")
 
 def get_pid():
     if os.path.exists(PID_FILE):
@@ -78,13 +73,14 @@ def stop_process(pid):
     except psutil.NoSuchProcess:
         return False
     except Exception as e:
-        print(f"❌ Error stopping process: {e}")
+        print(f"Error stopping process: {e}")
         return False
+
 
 def start(args):
     old_pid = get_pid()
     if old_pid and psutil.pid_exists(old_pid):
-        print(f"⚠️ Freelance API is already running with PID {old_pid}.")
+        print(f"Freelance API is already running with PID {old_pid}.")
         return
 
     # Handle Daemon mode
@@ -95,32 +91,73 @@ def start(args):
              importlib.import_module("app.main")
         except Exception as e:
             import traceback
-            print(f"\n❌ FATAL: Cannot start background service due to application error:")
+            print(f"\nFATAL: Cannot start background service due to application error:")
             print("-" * 40)
             traceback.print_exc()
             print("-" * 40)
             sys.exit(1)
 
-        print(f"🌙 Starting Freelance API in background Mode...")
-        # Construct the command to run without the --daemon flag
-        cmd = [sys.executable, "-m", "app.cli", "start", "--host", args.host, "--port", str(args.port)]
-        if args.reload:
-            cmd.append("--reload")
-            
+        print(f"Starting Freelance API in background Mode...")
+        
+        # Prepare environment for the subprocess
+        env = os.environ.copy()
+        env["FREELANCE_DAEMON"] = "1"
+
         # Launch detached process
-        process = subprocess.Popen(
-            cmd,
-            stdout=open(LOG_FILE, "a"),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
-            start_new_session=True
-        )
-        print(f"✅ Freelance API started in background (PID {process.pid}).")
-        print(f"📝 Logs are being recorded in {LOG_FILE}")
+        if os.name == 'nt':
+            # Windows: Use pythonw.exe to avoid console window
+            python_exe = sys.executable
+            if python_exe.endswith('python.exe'):
+                python_exe = python_exe.replace('python.exe', 'pythonw.exe')
+            elif python_exe.endswith('pythonw.exe'):
+                pass  # Already using pythonw
+            else:
+                # Fallback: try to find pythonw in same directory
+                import shutil
+                pythonw_path = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+                if os.path.exists(pythonw_path):
+                    python_exe = pythonw_path
+            
+            # Construct the command to run without the --daemon flag
+            cmd = [python_exe, "-m", "app.cli", "start", "--host", args.host, "--port", str(args.port)]
+            if args.reload:
+                cmd.append("--reload")
+            
+            # Windows: Create truly detached process without window
+            creationflags = (
+                subprocess.DETACHED_PROCESS |
+                subprocess.CREATE_NEW_PROCESS_GROUP |
+                subprocess.CREATE_NO_WINDOW
+            )
+            process = subprocess.Popen(
+                cmd,
+                stdout=open(LOG_FILE, "a"),
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                env=env,
+                creationflags=creationflags,
+                close_fds=True
+            )
+        else:
+            # Linux/macOS: Use start_new_session to detach from terminal
+            cmd = [sys.executable, "-m", "app.cli", "start", "--host", args.host, "--port", str(args.port)]
+            if args.reload:
+                cmd.append("--reload")
+            
+            process = subprocess.Popen(
+                cmd,
+                stdout=open(LOG_FILE, "a"),
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+                close_fds=True
+            )
+        print(f"Freelance API started in background (PID {process.pid}).")
+        print(f"Logs are being recorded in {LOG_FILE}")
         return
 
-    print(f"🚀 Starting Freelance API Gateway on {args.host}:{args.port}...")
+    print(f"Starting Freelance API Gateway on {args.host}:{args.port}...")
     save_pid(os.getpid())
     
     try:
@@ -130,11 +167,11 @@ def start(args):
              importlib.import_module("app.main")
         except Exception as e:
             import traceback
-            print(f"\n❌ FATAL during application import:")
+            print(f"\nFATAL during application import:")
             print("-" * 40)
             traceback.print_exc()
             print("-" * 40)
-            print("💡 Please check your code or environment variables.")
+            print("Please check your code or environment variables.")
             remove_pid()
             sys.exit(1)
 
@@ -147,7 +184,7 @@ def start(args):
         )
     except Exception as e:
         import traceback
-        print(f"\n❌ FATAL during runtime:")
+        print(f"\nFATAL during runtime:")
         traceback.print_exc()
     finally:
         remove_pid()
@@ -155,16 +192,16 @@ def start(args):
 def stop():
     pid = get_pid()
     if not pid or not psutil.pid_exists(pid):
-        print("ℹ️ No Freelance API instance found running.")
+        print("No Freelance API instance found running.")
         remove_pid()
         return
     
-    print(f"🛑 Stopping Freelance API (PID {pid})...")
+    print(f"Stopping Freelance API (PID {pid})...")
     if stop_process(pid):
         remove_pid()
-        print("✅ Stopped.")
+        print("Stopped.")
     else:
-        print("❌ Failed to stop process.")
+        print("Failed to stop process.")
 
 def main():
     parser = argparse.ArgumentParser(description="Freelance LLM API Gateway CLI")
@@ -204,7 +241,7 @@ def main():
         start(args)
     else:
         if args.command == "logs":
-            print("⚠️ The 'logs' command has been removed. Please check 'freelance.log' directly.")
+            print("The 'logs' command has been removed. Please check 'freelance.log' directly.")
         else:
             parser.print_help()
         sys.exit(1)

@@ -38,13 +38,36 @@ if [ ! -d ".venv" ]; then
     echo "[SUCCESS] Dependencies installed."
 fi
 
+# Check if running start command (explicit or default)
+is_start_cmd=0
+if [ "$1" = "start" ] || [ -z "$1" ]; then
+    is_start_cmd=1
+fi
+
+# Check .env file and API_KEY for start command
+if [ $is_start_cmd -eq 1 ]; then
+    # Use Python script for consistent cross-platform checking
+    bash check_api_key.sh
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
+fi
+
+# Determine freelance-api path based on OS
+if [ -f "./.venv/Scripts/freelance-api.exe" ]; then
+    FREELANCE_API="./.venv/Scripts/freelance-api.exe"
+elif [ -f "./.venv/bin/freelance-api" ]; then
+    FREELANCE_API="./.venv/bin/freelance-api"
+else
+    echo "[ERROR] freelance-api not found in virtual environment."
+    exit 1
+fi
+
 # Forward arguments to freelance-api
 if [ -z "$1" ]; then
-    echo "[USAGE] ./freelance.sh [command] [options]"
-    echo "[EXAMPLE] ./freelance.sh start -p 8000"
-    echo "[EXAMPLE] ./freelance.sh keygen"
-    ./.venv/bin/freelance-api --help
+    # Default to start command when no arguments provided
+    $FREELANCE_API start
 else
     # Correctly forward all arguments
-    ./.venv/bin/freelance-api "$@"
+    $FREELANCE_API "$@"
 fi

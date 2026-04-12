@@ -17,7 +17,7 @@
   - **并发发现 (Parallel Discovery)**: 并行抓取所有 Provider 模型列表，刷新效率提升 300%。
   - **启动预热 (Initial Hot Load)**: 启动时完成首次同步，确保上线即具备网关能力。
   - **阶梯式超时 (Tiered Timeout)**: 首选模型 20s 快速 Failover，后续尝试恢复标准超时，保障稳定性。
-  - **单次请求熔断 (Circuit Breaker)**: Provider 连续失败 2 次后在本次请求中自动避开该厂商。
+  - **单次请求熔断 (Circuit Breaker)**: Provider 连续失败 2 次后在本次请求中自动避开该厂商，配置位置在config.yaml中的max_retries。
 - **⚡ 极速推理支持**: 原生对接 Groq, Cerebras 等低延迟厂家。
 
 ***
@@ -31,7 +31,7 @@
 | 项    | 值                                                      |
 | ---- | ------------------------------------------------------ |
 | 基础路径 | `http://localhost:8000`                                |
-| 认证方式 | `Authorization: Bearer <GATEWAY_KEY>` (若 `.env` 为空可跳过) |
+| 认证方式 | `Authorization: Bearer <GATEWAY_KEY>`                  |
 | 内容类型 | `application/json`                                     |
 | 字符编码 | UTF-8                                                  |
 
@@ -431,6 +431,40 @@ Link 网关采用动态加权评分系统，自动选出当前能力最强且最
 ##  OPENCLAW接入指南
 
 **运行openclaw config->添加freelance网关->填写freelance API Gateway的API Key->填写模型ID：`auto`**
+
+***
+
+***
+## 示例：
+### 配置
+平台A = api key1,api key2
+平台B = 
+平台C = api key3,api key4
+### 运行模式
+freelance->平台A->api key1
+          |
+          V
+freelance->平台A->api key2
+          |
+          V
+freelance->平台C->api key3
+          |
+          V
+freelance->平台C->api key4
+          |
+          V
+无可用模型，报错
+### 简介
+1.freelance运行时遍历所有带api key的平台。
+2.调用models接口为所有可用平台模型打分按score高低依次排序
+3.根据模型socre排行，使用对应平台的api key调用模型(比如score分排名第一的是平台A的模型1，则使用平台A的api key1调用模型1)
+4.如果平台A的模型返回错误，则根据不同错误代码进行不同的处理
+5.若调用模型1返回的是Timeout/网络错误,则尝试max_retries次，如果max_retries次都返回Timeout/网络错误，则直接跳过模型1，使用模型2进行尝试,跳过的模型1禁用一小时不再尝试。
+6.若调用模型1返回的是非429频率限制方面的错误而是api key无效级别的错误(如401/403),则直接跳过api key1并禁用api key1三小时，使用api key2进行尝试。
+7.若调用模型1返回的是429频率限制方面的错误，则直接跳过api key1并禁用api key1半小时，使用api key2进行尝试。
+8.若调用模型1返回的是其他错误，则禁用api key1三小时，使用api key2进行尝试。
+9.如果models接口中平台A的所有模型都返回错误，则视为该平台A暂不可用，禁用平台A三小时，跳过无api key的平台B,尝试带api key的平台C。
+10.若所有api key都尝试了一遍，或者所有模型都尝试了一遍，都没有成功，则返回错误。
 
 ***
 

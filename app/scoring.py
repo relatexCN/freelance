@@ -180,7 +180,8 @@ def rank_models(models: list, only_free: bool = False) -> list:
                 # Apply provider offsets
                 p_name = model.get("_gateway_provider")
                 if p_name and p_name in config.providers:
-                    score += config.providers[p_name].score_offset
+                    p_config = config.providers[p_name]
+                    score += p_config.score_offset
                     
                 model["_score"] = score
                 scored_models.append(model)

@@ -28,7 +28,19 @@ if not exist .venv (
     echo [SUCCESS] Dependencies installed.
 )
 
-:: Forward arguments to freelance-api
+:: Check if running start command (explicit or default)
+set "is_start_cmd=0"
+if /i "%1"=="start" set "is_start_cmd=1"
+if "%1"=="" set "is_start_cmd=1"
+
+:: For start command, use the Python startup script that checks API_KEY
+if %is_start_cmd% equ 1 (
+    .venv\Scripts\python start_gateway.py %*
+    ENDLOCAL
+    exit /b %errorlevel%
+)
+
+:: For non-start commands, forward arguments directly
 if "%1"=="" (
     echo [USAGE] freelance [command] [options]
     echo [EXAMPLE] freelance start -p 8000

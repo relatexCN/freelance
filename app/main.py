@@ -1,12 +1,6 @@
-"""
-Freelance API Gateway - Main Application Entry Point.
-
-A high-performance API gateway that unifies multiple LLM providers
-(Ollama, OpenRouter, etc.) behind an OpenAI-compatible interface.
-"""
-
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -18,28 +12,53 @@ from app.config import config
 from app.routers import chat
 from app.scoring import rank_models
 
-# Configure logging
-LOG_FILE = "freelance.log"
-file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+# ----------------------------
+# LOGGING UNIFICATION
+# ----------------------------
+fl_logger = logging.getLogger("freelance")
+fl_logger.setLevel(logging.INFO)
+fl_logger.propagate = False  # Avoid duplicates from root
+
+# Clear ALL existing handlers to enable idempotent configuration
+for h in fl_logger.handlers[:]:
+    fl_logger.removeHandler(h)
+for h in logging.root.handlers[:]:
+    logging.root.removeHandler(h)
+
+# 1. Define Formatter
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)-8s | %(message)s",
     "%Y-%m-%d %H:%M:%S"
-))
-
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(),
-        file_handler
-    ]
 )
-logger = logging.getLogger("link")
 
+# 2. Add Handlers based on environment
+LOG_FILE = "freelance.log"
+
+if os.environ.get("FREELANCE_DAEMON") == "1":
+    # DAEMON MODE: OS handles redirection to file via stdout.
+    # We only need to provide the stream to stdout.
+    cons_h = logging.StreamHandler()
+    cons_h.setFormatter(formatter)
+    fl_logger.addHandler(cons_h)
+else:
+    # NORMAL MODE: We handle both terminal output AND manual file backup.
+    # Clear and set File Handler
+    file_h = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+    file_h.setFormatter(formatter)
+    fl_logger.addHandler(file_h)
+    
+    # Add Console Handler
+    cons_h = logging.StreamHandler()
+    cons_h.setFormatter(formatter)
+    fl_logger.addHandler(cons_h)
+
+logger = fl_logger
+# ----------------------------
 
 async def update_models_cache():
     """Fetch and score models from all providers in parallel."""
     try:
-        logger.info("Updating semantic auto-routing models cache...")
+        logger.info("🔄 [CACHE] Updating semantic auto-routing models cache...")
         
         # Get all initialized providers
         active_providers = list(chat._providers.items())
@@ -72,10 +91,12 @@ async def update_models_cache():
             ranked = rank_models(all_models, only_free=False)
             config.auto_models_cache = ranked
             config.auto_models_last_update = time.time()
-            logger.info(f"Auto-routing cache updated with {len(ranked)} models")
+            logger.info(f"✅ [CACHE] Auto-routing cache updated with {len(ranked)} models")
+        else:
+            logger.warning("⚠️ [CACHE] No models found or ranked. Cache is empty.")
             
     except Exception as e:
-        logger.exception(f"Error during parallel models cache update: {e}")
+        logger.exception(f"❌ [CACHE] Error during models cache update: {e}")
 
 
 async def background_cache_updater():
@@ -98,13 +119,14 @@ async def lifespan(app: FastAPI):
     
     # 1. Initialize providers eagerly
     for name, p_config in config.providers.items():
-        if p_config.api_keys:
-            chat._get_provider(name)
-        else:
-            logger.info(f"Skipping provider {name} during startup (no API keys configured)")
+        # Always try to initialize local or defined providers. 
+        # Some (like Ollama) don't require keys.
+        chat._get_provider(name)
     
     # 2. Initial Hot Load: Ensure cache is ready BEFORE yielding
+    logger.info("⚡ [STARTUP] Performing initial model cache hot load...")
     await update_models_cache()
+    logger.info("🚀 [STARTUP] Initial hot load complete.")
     
     # 3. Start background task
     task = asyncio.create_task(background_cache_updater())
