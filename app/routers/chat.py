@@ -431,82 +431,82 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
     # 获取有效提供商总数，用于计算是否全部熔断
     active_providers = [p for p in config.providers.values() if p.api_keys]
     
-    # Track platform failure state in this request
-    platform_tracking = {}
-    for p_name, _ in models_to_try:
-        platform_tracking[p_name] = platform_tracking.get(p_name, 0) + 1
-    platform_failures = {} # p_name -> failed_count
-
-    for p_name, actual_id in models_to_try:
-        p_cfg = config.providers.get(p_name)
-        if not p_cfg or not p_cfg.api_keys:
-            continue
-
-        # 1. Check Circuit Breakers
-        if p_cfg.is_platform_melted():
-            continue
-        if p_cfg.is_model_melted(actual_id):
-            continue
-
-        provider = _get_provider(p_name)
-        provider_attempt = errors.get(p_name, 0) + 1
+    # Agentic Loop State
+    iteration = 0
+    max_iterations = config.settings.max_iterations if hasattr(config.settings, "max_iterations") else 3
+    
+    while iteration < max_iterations:
+        iteration += 1
+        logger.info(f"[*] Turn {iteration} for request {model_name}")
         
-        if provider_attempt > max_retries:
-            continue
+        # Track platform failure state in this turn
+        platform_tracking = {}
+        for p_name_track, _ in models_to_try:
+            platform_tracking[p_name_track] = platform_tracking.get(p_name_track, 0) + 1
+        platform_failures = {} # p_name -> failed_count
+
+        found_response = False
         
-        # Protocol Fallback Check
-        should_stream = request.stream
-        if should_stream and p_cfg.is_stream_melted(actual_id):
-            logger.info(f"Streaming is cooling down for {p_name}/{actual_id}. Forcing fallback.")
-            should_stream = False
+        for p_name, actual_id in models_to_try:
+            p_cfg = config.providers.get(p_name)
+            if not p_cfg or not p_cfg.api_keys:
+                continue
 
-        # Use tiered timeout based on model size
-        probe_timeout = _get_probe_timeout(actual_id)
+            # 1. Check Circuit Breakers
+            if p_cfg.is_platform_melted():
+                continue
+            if p_cfg.is_model_melted(actual_id):
+                continue
 
-        try:
-            if should_stream:
-                # 初始化生成器（首包超时检测已移到 provider 内部）
-                gen = provider.chat_completion_stream(request, actual_id, timeout=probe_timeout)
-                
-                # 先获取第一个 chunk，确保 provider 有可用的 key
-                # 如果所有 key 都失败，这里会抛出异常，循环继续到下一个 provider
-                first_chunk = None
-                try:
-                    first_chunk = await gen.__anext__()
-                except StopAsyncIteration:
-                    raise Exception(f"Empty response from {p_name}/{actual_id}")
-                except Exception as e:
-                    logger.error(f"[ERROR] Failed to get first chunk from {p_name}/{actual_id}: {e}")
-                    raise
-                
-                # Success: Return the stream wrapped in Standard SSE headers
-                async def final_gen():
-                    full_content = ""
-                    logger.info(f"[*] Starting final stream for {actual_id}")
+            provider = _get_provider(p_name)
+            provider_attempt = errors.get(p_name, 0) + 1
+            
+            if provider_attempt > max_retries:
+                continue
+            
+            # Protocol Fallback Check
+            should_stream = request.stream
+            if should_stream and p_cfg.is_stream_melted(actual_id):
+                logger.info(f"Streaming is cooling down for {p_name}/{actual_id}. Forcing fallback.")
+                should_stream = False
+
+            # Use tiered timeout based on model size
+            probe_timeout = _get_probe_timeout(actual_id)
+
+            try:
+                if should_stream:
+                    # 初始化生成器
+                    gen = provider.chat_completion_stream(request, actual_id, timeout=probe_timeout)
                     
-                    # Process first chunk
+                    # 先获取第一个 chunk
+                    first_chunk = None
                     try:
-                        if first_chunk.startswith("data: ") and not first_chunk.strip() == "data: [DONE]":
-                            data = json.loads(first_chunk[6:])
-                            if "choices" in data and data["choices"] and "delta" in data["choices"][0]:
-                                full_content += data["choices"][0]["delta"].get("content", "")
-                    except: pass
+                        first_chunk = await gen.__anext__()
+                    except StopAsyncIteration:
+                        raise Exception(f"Empty response from {p_name}/{actual_id}")
+                    except Exception as e:
+                        logger.error(f"[ERROR] Failed to get first chunk from {p_name}/{actual_id}: {e}")
+                        raise
                     
-                    logger.info(f"Sending first chunk: {first_chunk[:100]}..." if len(first_chunk) > 100 else f"Sending first chunk: {first_chunk}")
-                    yield first_chunk
-                    await asyncio.sleep(0.01)
-                    
-                    try:
-                        async for chunk in _stream_with_heartbeat(gen, actual_id, fastapi_request):
-                            # 检查客户端是否断开
+                    # Success: Define the generator that handles potential agentic looping
+                    async def final_gen(current_gen, current_actual_id, current_first_chunk, current_iteration):
+                        full_content = ""
+                        # Process first chunk
+                        try:
+                            if current_first_chunk.startswith("data: ") and not current_first_chunk.strip() == "data: [DONE]":
+                                data = json.loads(current_first_chunk[6:])
+                                if "choices" in data and data["choices"] and "delta" in data["choices"][0]:
+                                    full_content += data["choices"][0]["delta"].get("content", "")
+                        except: pass
+                        
+                        yield current_first_chunk
+                        
+                        # Process remaining chunks in current turn
+                        async for chunk in _stream_with_heartbeat(current_gen, current_actual_id, fastapi_request):
                             if await fastapi_request.is_disconnected():
-                                logger.warning(f"[DISCONNECT] Client disconnected, canceling upstream for {p_name}/{actual_id}")
-                                try:
-                                    await gen.aclose()
-                                except: pass
+                                logger.warning(f"[DISCONNECT] Client disconnected, canceling upstream for {p_name}/{current_actual_id}")
                                 break
                             
-                            # Accumulate content for tool detection
                             if chunk.startswith("data: ") and not chunk.strip() == "data: [DONE]":
                                 try:
                                     data = json.loads(chunk[6:])
@@ -515,169 +515,118 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
                                 except: pass
                                 yield chunk
                             elif chunk.strip() == "data: [DONE]":
-                                # Don't yield [DONE] yet if we might have tools
-                                pass
+                                pass # Wait for potential turn continuation
                             else:
-                                # Heartbeats etc.
                                 yield chunk
-                                
-                            await asyncio.sleep(0.01)
                         
-                        # Post-stream tool check
-                        if has_xml_tool_call(full_content):
-                            logger.info(f"[TOOL] Detected tool call in stream for {p_name}/{actual_id}")
-                            tool_results = await _process_tool_calls(full_content, p_name, actual_id, request)
+                        # Check for tools in the accumulated content
+                        if has_xml_tool_call(full_content) and current_iteration < max_iterations:
+                            logger.info(f"[AGENT] Turn {current_iteration} produced tool call in stream. Resolving...")
+                            
+                            # Inform user about tool execution
+                            status_chunk = {
+                                "id": f"tool-status-{uuid.uuid4().hex[:12]}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": current_actual_id,
+                                "choices": [{"index": 0, "delta": {"content": "\n\n> [系统] 正在调用工具查询数据...\n"}, "finish_reason": None}]
+                            }
+                            yield f"data: {json.dumps(status_chunk, ensure_ascii=False)}\n\n"
+                            
+                            tool_results = await _process_tool_calls(full_content, p_name, current_actual_id, request)
                             
                             if tool_results:
-                                # Stream results header
-                                header_delta = "\n\n工具执行结果:\n"
-                                header_chunk = {
-                                    "id": f"tool-{uuid.uuid4().hex[:12]}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": actual_id,
-                                    "choices": [{"index": 0, "delta": {"content": header_delta}, "finish_reason": None}]
-                                }
-                                yield f"data: {json.dumps(header_chunk, ensure_ascii=False)}\n\n"
-                                
-                                # Stream each tool results
+                                # 1. Prepare next turn's history
+                                # Add the assistant message with the XML
+                                request.messages.append(ChatMessage(role="assistant", content=full_content))
+                                # Add tool results
                                 for res in tool_results:
-                                    res_delta = f"```\n{res['content']}\n```\n\n"
-                                    res_chunk = {
-                                        "id": f"tool-{uuid.uuid4().hex[:12]}",
+                                    request.messages.append(ChatMessage(**res))
+                                
+                                # 2. Start Turn N+1
+                                logger.info(f"[AGENT] Moving to Stream Turn {current_iteration + 1}")
+                                next_turn_gen = provider.chat_completion_stream(request, current_actual_id, timeout=probe_timeout)
+                                
+                                try:
+                                    next_first_chunk = await next_turn_gen.__anext__()
+                                    # Yield from the next iteration of final_gen
+                                    async for c in final_gen(next_turn_gen, current_actual_id, next_first_chunk, current_iteration + 1):
+                                        yield c
+                                    return # Exit recursion
+                                except Exception as e:
+                                    logger.error(f"[AGENT] Error starting next turn in stream: {e}")
+                                    error_status = {
+                                        "id": f"tool-err-{uuid.uuid4().hex[:12]}",
                                         "object": "chat.completion.chunk",
                                         "created": int(time.time()),
-                                        "model": actual_id,
-                                        "choices": [{"index": 0, "delta": {"content": res_delta}, "finish_reason": None}]
+                                        "model": current_actual_id,
+                                        "choices": [{"index": 0, "delta": {"content": f"\n\n[AGENT ERROR] 启动下一轮对话失败: {e}"}, "finish_reason": "error"}]
                                     }
-                                    yield f"data: {json.dumps(res_chunk, ensure_ascii=False)}\n\n"
-                                    await asyncio.sleep(0.05)
-                                
-                                # Send terminal tool stop chunk
-                                stop_chunk = {
-                                    "id": f"tool-{uuid.uuid4().hex[:12]}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": actual_id,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
-                                }
-                                yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
+                                    yield f"data: {json.dumps(error_status, ensure_ascii=False)}\n\n"
                         
-                        # Always end with DONE
+                        # End the stream
                         yield "data: [DONE]\n\n"
-                        
-                    except Exception as e:
-                        logger.error(f"[ERROR] Stream relay error for {p_name}/{actual_id}: {e}")
-                        try:
-                            await gen.aclose()
-                        except: pass
-                        raise
 
-                logger.info(f"[*] Returning StreamingResponse for {actual_id}")
-                return StreamingResponse(
-                    final_gen(), 
-                    media_type="text/event-stream",
-                    headers={
-                        "Content-Type": "text/event-stream",
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                        "Access-Control-Allow-Headers": "Content-Type, Authorization"
-                    }
-                )
-            else:
-                api_key, key_idx = p_cfg.get_next_key()
-                masked_key = f"{api_key[:6]}...{api_key[-4:]}" if api_key and len(api_key) > 10 else "no-key"
-                logger.info(f"[*] REQ: {model_name} | Model: {actual_id} | API Key: {masked_key} | Stream: {request.stream} | Provider: {p_name}")
-                
-                resp = await provider.chat_completion(request, actual_id, timeout=config.settings.unified_timeout or 30)
-                processed = _process_non_stream_response(resp)
-                logger.info(f"[RESP] {p_name}/{actual_id} success (Batch Mode)")
-                
-                # Check for tool calls in response
-                response_content = processed.choices[0].message.content if processed.choices and processed.choices[0].message else ""
-                tool_results = await _process_tool_calls(response_content, p_name, actual_id, request)
-                
-                if tool_results:
-                    # Tool calls were executed, return results
-                    tool_result_text = "\n\n工具执行结果:\n"
-                    for result in tool_results:
-                        tool_result_text += f"```\n{result['content']}\n```\n\n"
-                    
-                    # Update response with tool results (Append instead of Replace)
-                    if processed.choices[0].message.content:
-                        processed.choices[0].message.content += f"\n\n{tool_result_text}"
-                    else:
-                        processed.choices[0].message.content = tool_result_text
-                    processed.choices[0].finish_reason = "tool_calls"
-                
-                if request.stream:
-                    async def mock_gen():
-                        status_chunk = {
-                            "id": f"status-{uuid.uuid4().hex[:12]}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": actual_id,
-                            "choices": [{"index": 0, "delta": {"content": "\n\n[系统提示] 处理完成，正在返回结果...\n\n"}, "finish_reason": None}]
-                        }
-                        status_chunk_str = f"data: {json.dumps(status_chunk, ensure_ascii=False)}\n\n"
-                        yield status_chunk_str
-                        
-                        async for c in _mock_stream_from_response(processed):
-                            yield c
-                            await asyncio.sleep(0.05)
+                    logger.info(f"[*] Returning StreamingResponse for {actual_id}")
                     return StreamingResponse(
-                        mock_gen(), 
+                        final_gen(gen, actual_id, first_chunk, iteration), 
                         media_type="text/event-stream",
-                        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+                        headers={
+                            "Content-Type": "text/event-stream",
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        }
                     )
-                return JSONResponse(content=processed.model_dump(exclude_none=True))
 
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400:
-                logger.warning(f"Bad Request (400) from {p_name}: {e.response.text}")
-                return _make_error_response(f"Upstream Bad Request: {e.response.text}", 400, type="invalid_request_error")
-            last_err = f"HTTP {e.response.status_code}"
-            errors[p_name] = provider_attempt
-            platform_failures[p_name] = platform_failures.get(p_name, 0) + 1
-            logger.warning(f"[*] REQ: {model_name} | Attempt failed: {p_name}/{actual_id} -> {last_err}")
-            if platform_failures[p_name] >= platform_tracking[p_name]:
-                c_dur = config.settings.cooldown.provider_melt
-                logger.error(f"Platform {p_name} exhausted all models. Melting for {c_dur}s.")
-                p_cfg.record_platform_failure(c_dur)
-            continue
-        except (httpx.ConnectError, httpx.ConnectTimeout, asyncio.TimeoutError) as e:
-            logger.warning(f"[RETRY] Connection failed for {p_name}/{actual_id}: {e}. Allowing retry.")
-            last_err = str(e) or repr(e)
-            errors[p_name] = provider_attempt
-            platform_failures[p_name] = platform_failures.get(p_name, 0) + 1
-            logger.warning(f"[*] REQ: {model_name} | Attempt failed: {p_name}/{actual_id} -> {last_err}")
-            if platform_failures[p_name] >= platform_tracking[p_name]:
-                c_dur = config.settings.cooldown.provider_melt
-                logger.error(f"Platform {p_name} exhausted all models. Melting for {c_dur}s.")
-                p_cfg.record_platform_failure(c_dur)
-            continue
-        except Exception as e:
-            err_msg = str(e) or repr(e)
-            # Check for Bad Request errors that have been wrapped in Exception
-            if "Bad Request" in err_msg:
-                logger.warning(f"Bad Request from {p_name}: {err_msg}")
-                return _make_error_response(err_msg, 400, type="invalid_request_error")
-            logger.error(f"[ERROR] Request failed for {p_name}/{actual_id}: {err_msg}")
-            last_err = err_msg
-            errors[p_name] = provider_attempt
-            platform_failures[p_name] = platform_failures.get(p_name, 0) + 1
-            logger.warning(f"[*] REQ: {model_name} | Attempt failed: {p_name}/{actual_id} -> {last_err}")
-            if platform_failures[p_name] >= platform_tracking[p_name]:
-                c_dur = config.settings.cooldown.provider_melt
-                logger.error(f"Platform {p_name} exhausted all models. Melting for {c_dur}s.")
-                p_cfg.record_platform_failure(c_dur)
-            continue
+                else:
+                    api_key, _ = p_cfg.get_next_key()
+                    masked_key = f"{api_key[:6]}...{api_key[-4:]}" if api_key and len(api_key) > 10 else "no-key"
+                    logger.info(f"[*] REQ: {model_name} | Model: {actual_id} | API Key: {masked_key} | turn: {iteration}")
+                    
+                    resp = await provider.chat_completion(request, actual_id, timeout=config.settings.unified_timeout or 30)
+                    processed = _process_non_stream_response(resp)
+                    logger.info(f"[RESP] {p_name}/{actual_id} success (Batch Mode)")
+                    
+                    # Check for tool calls in response
+                    response_content = processed.choices[0].message.content or ""
+                    tool_results = await _process_tool_calls(response_content, p_name, actual_id, request)
+                    
+                    if tool_results and iteration < max_iterations:
+                        logger.info(f"[AGENT] Turn {iteration} produced tool results. Moving to next turn.")
+                        # Update history
+                        request.messages.append(processed.choices[0].message)
+                        for result_msg in tool_results:
+                            request.messages.append(ChatMessage(**result_msg))
+                        found_response = True
+                        break # Break from models_to_try loop to start next iteration wheel
+                    else:
+                        # Final natural language response or no more tools
+                        return JSONResponse(content=processed.model_dump(exclude_none=True))
+
+            except httpx.HTTPStatusError as e:
+                # Platform tracking and melting logic
+                last_err = f"HTTP {e.response.status_code}"
+                platform_failures[p_name] = platform_failures.get(p_name, 0) + 1
+                logger.warning(f"[*] Attempt failed: {p_name}/{actual_id} -> {last_err}")
+                if platform_failures[p_name] >= platform_tracking[p_name]:
+                    p_cfg.record_platform_failure(config.settings.cooldown.provider_melt)
+                continue
+            except Exception as e:
+                last_err = str(e)
+                platform_failures[p_name] = platform_failures.get(p_name, 0) + 1
+                logger.error(f"[ERROR] Request failed for {p_name}/{actual_id}: {last_err}")
+                if platform_failures[p_name] >= platform_tracking[p_name]:
+                    p_cfg.record_platform_failure(config.settings.cooldown.provider_melt)
+                continue
+
+        if not found_response:
+            # If all models failed or we gave up
+            break
 
     # Fallback response if everything failed
-    error_msg = "⚠️ 系统提示：服务由于连续错误已全部触发熔断冷却，请稍后再试（约5分钟）。"
+    error_msg = "⚠️ 系统提示：所有服务商均不可用或请求失败。请检查 API Key 或稍后尝试。"
+
     if not active_providers:
         error_msg = "⚠️ 系统提示：目前没有已配置可用的服务商 API Key。"
 

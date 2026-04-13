@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="API_KEY")
     api_keys: str = Field(default="", alias="API_KEYS")  # comma-separated string of valid keys
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
+    max_iterations: int = Field(default=3, alias="MAX_ITERATIONS")
     unified_timeout: Optional[float] = Field(default=None, alias="UNIFIED_TIMEOUT")
     cooldown: CooldownSettings = Field(default_factory=CooldownSettings)
     stream_probe: StreamProbeSettings = Field(default_factory=StreamProbeSettings)
@@ -294,6 +295,8 @@ class AppConfig:
                 s_data = raw["settings"]
                 if "max_retries" in s_data:
                     self.settings.max_retries = int(s_data["max_retries"])
+                if "max_iterations" in s_data:
+                    self.settings.max_iterations = int(s_data["max_iterations"])
                 if "unified_timeout" in s_data:
                     unified_timeout_val = s_data["unified_timeout"]
                     if unified_timeout_val is not None:
