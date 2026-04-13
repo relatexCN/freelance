@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import config
-from app.routers import chat
+from app.routers import chat, stats
 from app.scoring import rank_models
 
 # ----------------------------
@@ -213,6 +213,7 @@ async def logging_middleware(request: Request, call_next):
 # Dual routing support: Root path and /v1 for full OpenAI-compatibility
 app.include_router(chat.router, prefix="/v1")
 app.include_router(chat.router)
+app.include_router(stats.router)
 
 
 @app.get("/")
@@ -227,6 +228,7 @@ async def root():
             "chat_completions": "/chat/completions",
             "models": "/models",
             "health": "/health",
+            "stats": "/stats",
         },
     }
 
