@@ -4,7 +4,7 @@ import uuid
 import json
 import logging
 import httpx
-from typing import Optional, AsyncGenerator, Any
+from typing import Optional, AsyncGenerator, Any, List, Dict
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -23,9 +23,62 @@ from app.models import (
 )
 from app.config import config
 from app.providers import get_provider
+from app.utils.tool_converter import has_xml_tool_call, xml_to_tool_calls
+from app.utils.tool_executor import ToolExecutor, format_tool_result
 
 router = APIRouter()
 logger = logging.getLogger("freelance")
+
+async def _process_tool_calls(response_content: str, p_name: str, actual_id: str, request: ChatCompletionRequest) -> Any:
+    """Process tool calls in model response and execute them."""
+    # Check if response contains XML tool calls
+    if not has_xml_tool_call(response_content):
+        return None
+    
+    logger.info(f"[TOOL] Detected tool call in response from {p_name}/{actual_id}")
+    
+    # Parse XML tool calls to OpenAI format
+    tool_calls = xml_to_tool_calls(response_content)
+    if not tool_calls:
+        logger.warning("[TOOL] Failed to parse tool calls from response")
+        return None
+    
+    logger.info(f"[TOOL] Parsed {len(tool_calls)} tool call(s)")
+    
+    # Execute each tool call
+    executor = ToolExecutor()
+    tool_results = []
+    
+    for tool_call in tool_calls:
+        tool_name = tool_call["function"]["name"]
+        tool_call_id = tool_call["id"]
+        
+        try:
+            # Parse arguments
+            args = json.loads(tool_call["function"]["arguments"])
+            logger.info(f"[TOOL] Executing {tool_name} with args: {args}")
+            
+            # Execute tool
+            result = await executor.execute(tool_name, **args)
+            
+            # Format result
+            formatted_result = format_tool_result(tool_call_id, result)
+            tool_results.append(formatted_result)
+            
+            if result["success"]:
+                logger.info(f"[TOOL] {tool_name} executed successfully")
+            else:
+                logger.warning(f"[TOOL] {tool_name} failed: {result.get('error')}")
+                
+        except Exception as e:
+            logger.error(f"[TOOL] Error executing {tool_name}: {e}")
+            tool_results.append({
+                "tool_call_id": tool_call_id,
+                "role": "tool",
+                "content": json.dumps({"success": False, "error": str(e), "result": None}, ensure_ascii=False)
+            })
+    
+    return tool_results
 
 def _make_error_response(message: str, status_code: int = 500, type: str = "upstream_error", code: Optional[str] = None):
     return JSONResponse(
@@ -460,6 +513,20 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
                 resp = await provider.chat_completion(request, actual_id, timeout=config.settings.unified_timeout or 30)
                 processed = _process_non_stream_response(resp)
                 logger.info(f"[RESP] {p_name}/{actual_id} success (Batch Mode)")
+                
+                # Check for tool calls in response
+                response_content = processed.choices[0].message.content if processed.choices and processed.choices[0].message else ""
+                tool_results = await _process_tool_calls(response_content, p_name, actual_id, request)
+                
+                if tool_results:
+                    # Tool calls were executed, return results
+                    tool_result_text = "\n\n工具执行结果:\n"
+                    for result in tool_results:
+                        tool_result_text += f"```\n{result['content']}\n```\n\n"
+                    
+                    # Update response with tool results
+                    processed.choices[0].message.content = tool_result_text
+                    processed.choices[0].finish_reason = "tool_calls"
                 
                 if request.stream:
                     async def mock_gen():
