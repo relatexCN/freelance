@@ -158,7 +158,10 @@ class ProviderConfig:
                 status_parts.append(f"key[{idx}]=FATAL")
             elif idx in self.key_cooldowns:
                 remaining = self.key_cooldowns[idx] - now
-                status_parts.append(f"key[{idx}]=COOLDOWN({remaining:.0f}s)")
+                if remaining > 0:
+                    status_parts.append(f"key[{idx}]=COOLDOWN({remaining:.0f}s)")
+                else:
+                    status_parts.append(f"key[{idx}]=HEALTHY")
             else:
                 status_parts.append(f"key[{idx}]=HEALTHY")
         

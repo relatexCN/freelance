@@ -21,7 +21,7 @@ logger = logging.getLogger("link.tool_executor")
 # Security whitelist for commands
 ALLOWED_COMMANDS = {
     "ls", "cat", "echo", "pwd", "whoami", "date", "uptime",
-    "head", "tail", "wc", "du", "df", "ps", "top"
+    "head", "tail", "wc", "du", "df", "ps", "top", "openclaw"
 }
 
 # Security: Restrict file operations to specific base directories

@@ -108,10 +108,24 @@ def _process_non_stream_response(resp: Any) -> ChatCompletionResponse:
     # Fallback/Conversion for raw dicts
     return ChatCompletionResponse(**resp) if isinstance(resp, dict) else resp
 
+# Known model families that can't be identified by size suffix alone
+_KNOWN_MODEL_FAMILIES = {
+    "huge": ["deepseek-v3", "deepseek-r1:671b"],
+    "large": ["deepseek-r1", "qwen2.5:72b", "qwen2.5:32b", "llama3:70b", "llama3.1:70b", "llama3.2:70b"],
+    "medium": ["qwen2.5", "llama3:8b", "llama3.1:8b", "llama3.2:8b", "gemma2"],
+}
+
 def _get_model_size_level(model_id: str) -> str:
     """Determine model size level from model ID."""
     model_id_lower = model_id.lower()
     
+    # 1. Check known model families first (handles version-based names like deepseek-v3.2)
+    for size_level, patterns in _KNOWN_MODEL_FAMILIES.items():
+        for pattern in patterns:
+            if pattern in model_id_lower:
+                return size_level
+    
+    # 2. Pattern-based detection by parameter count suffix
     # Check for huge models (500B+) - e.g., 671b, 675b
     if any(x in model_id_lower for x in ["500b", "600b", "671b", "675b", "700b", "800b", "900b", "1t", "1000b"]):
         return "huge"
@@ -467,7 +481,17 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
                 
                 # Success: Return the stream wrapped in Standard SSE headers
                 async def final_gen():
+                    full_content = ""
                     logger.info(f"[*] Starting final stream for {actual_id}")
+                    
+                    # Process first chunk
+                    try:
+                        if first_chunk.startswith("data: ") and not first_chunk.strip() == "data: [DONE]":
+                            data = json.loads(first_chunk[6:])
+                            if "choices" in data and data["choices"] and "delta" in data["choices"][0]:
+                                full_content += data["choices"][0]["delta"].get("content", "")
+                    except: pass
+                    
                     logger.info(f"Sending first chunk: {first_chunk[:100]}..." if len(first_chunk) > 100 else f"Sending first chunk: {first_chunk}")
                     yield first_chunk
                     await asyncio.sleep(0.01)
@@ -482,8 +506,66 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
                                 except: pass
                                 break
                             
-                            yield chunk 
+                            # Accumulate content for tool detection
+                            if chunk.startswith("data: ") and not chunk.strip() == "data: [DONE]":
+                                try:
+                                    data = json.loads(chunk[6:])
+                                    if "choices" in data and data["choices"] and "delta" in data["choices"][0]:
+                                        full_content += data["choices"][0]["delta"].get("content", "")
+                                except: pass
+                                yield chunk
+                            elif chunk.strip() == "data: [DONE]":
+                                # Don't yield [DONE] yet if we might have tools
+                                pass
+                            else:
+                                # Heartbeats etc.
+                                yield chunk
+                                
                             await asyncio.sleep(0.01)
+                        
+                        # Post-stream tool check
+                        if has_xml_tool_call(full_content):
+                            logger.info(f"[TOOL] Detected tool call in stream for {p_name}/{actual_id}")
+                            tool_results = await _process_tool_calls(full_content, p_name, actual_id, request)
+                            
+                            if tool_results:
+                                # Stream results header
+                                header_delta = "\n\n工具执行结果:\n"
+                                header_chunk = {
+                                    "id": f"tool-{uuid.uuid4().hex[:12]}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": actual_id,
+                                    "choices": [{"index": 0, "delta": {"content": header_delta}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(header_chunk, ensure_ascii=False)}\n\n"
+                                
+                                # Stream each tool results
+                                for res in tool_results:
+                                    res_delta = f"```\n{res['content']}\n```\n\n"
+                                    res_chunk = {
+                                        "id": f"tool-{uuid.uuid4().hex[:12]}",
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": actual_id,
+                                        "choices": [{"index": 0, "delta": {"content": res_delta}, "finish_reason": None}]
+                                    }
+                                    yield f"data: {json.dumps(res_chunk, ensure_ascii=False)}\n\n"
+                                    await asyncio.sleep(0.05)
+                                
+                                # Send terminal tool stop chunk
+                                stop_chunk = {
+                                    "id": f"tool-{uuid.uuid4().hex[:12]}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": actual_id,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                                }
+                                yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
+                        
+                        # Always end with DONE
+                        yield "data: [DONE]\n\n"
+                        
                     except Exception as e:
                         logger.error(f"[ERROR] Stream relay error for {p_name}/{actual_id}: {e}")
                         try:
@@ -524,8 +606,11 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
                     for result in tool_results:
                         tool_result_text += f"```\n{result['content']}\n```\n\n"
                     
-                    # Update response with tool results
-                    processed.choices[0].message.content = tool_result_text
+                    # Update response with tool results (Append instead of Replace)
+                    if processed.choices[0].message.content:
+                        processed.choices[0].message.content += f"\n\n{tool_result_text}"
+                    else:
+                        processed.choices[0].message.content = tool_result_text
                     processed.choices[0].finish_reason = "tool_calls"
                 
                 if request.stream:

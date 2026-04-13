@@ -243,7 +243,12 @@ class OpenAICompatibleProvider(BaseProvider):
                     url, 
                     json=payload, 
                     headers=self._build_headers(api_key),
-                    timeout=effective_timeout
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=effective_timeout,
+                        write=20.0,
+                        pool=60.0
+                    )
                 ) as resp:
                     if resp.status_code == 200:
                         resp.raise_for_status()
