@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import config
 from app.routers import chat, stats
+from app.services.router import _providers, get_provider_instance
 from app.scoring import rank_models
 
 # ----------------------------
@@ -61,7 +62,7 @@ async def update_models_cache():
         logger.info("🔄 [CACHE] Updating semantic auto-routing models cache...")
         
         # Get all initialized providers
-        active_providers = list(chat._providers.items())
+        active_providers = list(_providers.items())
         if not active_providers:
             return
 
@@ -121,7 +122,7 @@ async def lifespan(app: FastAPI):
     for name, p_config in config.providers.items():
         # Always try to initialize local or defined providers. 
         # Some (like Ollama) don't require keys.
-        chat._get_provider(name)
+        get_provider_instance(name, force_create=True)
     
     # 2. Initial Hot Load: Ensure cache is ready BEFORE yielding
     logger.info("⚡ [STARTUP] Performing initial model cache hot load...")

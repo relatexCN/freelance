@@ -11,10 +11,23 @@ logger = logging.getLogger("freelance.router")
 # Cache for provider instances
 _providers = {name: get_provider(p_cfg) for name, p_cfg in config.providers.items() if p_cfg.api_keys}
 
-def get_provider_instance(name: str):
+def get_provider_instance(name: str, force_create: bool = False):
+    """Retrieve or optionally create a provider instance."""
+    if name not in _providers and force_create:
+        p_cfg = config.providers.get(name)
+        if p_cfg:
+            _providers[name] = get_provider(p_cfg)
     return _providers.get(name)
 
 class RouterService:
+    @staticmethod
+    def is_provider_available(p_name: str, actual_id: str) -> bool:
+        """Check if a provider/model is available (not melted)."""
+        p_cfg = config.providers.get(p_name)
+        if not p_cfg:
+            return False
+        return not (p_cfg.is_platform_melted() or p_cfg.is_model_melted(actual_id))
+
     @staticmethod
     async def get_models_to_try(model_name: str) -> List[Tuple[str, str]]:
         """Resolve a requested model name to a ranked list of (provider, actual_id)."""

@@ -46,28 +46,27 @@ fi
 
 # Check .env file and API_KEY for start command
 if [ $is_start_cmd -eq 1 ]; then
-    # Use Python script for consistent cross-platform checking
-    bash check_api_key.sh
+    # Determine Python path for the script
+    if [ -f "./.venv/bin/python" ]; then
+        VENV_PYTHON="./.venv/bin/python"
+    elif [ -f "./.venv/Scripts/python.exe" ]; then
+        VENV_PYTHON="./.venv/Scripts/python.exe"
+    else
+        VENV_PYTHON="python3"
+    fi
+    
+    $VENV_PYTHON scripts/check_gateway_key.py
     if [ $? -ne 0 ]; then
         exit 1
     fi
 fi
 
-# Determine freelance-api path based on OS
-if [ -f "./.venv/Scripts/freelance-api.exe" ]; then
-    FREELANCE_API="./.venv/Scripts/freelance-api.exe"
-elif [ -f "./.venv/bin/freelance-api" ]; then
-    FREELANCE_API="./.venv/bin/freelance-api"
-else
-    echo "[ERROR] freelance-api not found in virtual environment."
-    exit 1
-fi
-
-# Forward arguments to freelance-api
+# Forward arguments to app.cli
+export PYTHONPATH=$PYTHONPATH:.
 if [ -z "$1" ]; then
     # Default to start command when no arguments provided
-    $FREELANCE_API start
+    ./.venv/bin/python -m app.cli start
 else
     # Correctly forward all arguments
-    $FREELANCE_API "$@"
+    ./.venv/bin/python -m app.cli "$@"
 fi

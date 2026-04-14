@@ -33,9 +33,14 @@ set "is_start_cmd=0"
 if /i "%1"=="start" set "is_start_cmd=1"
 if "%1"=="" set "is_start_cmd=1"
 
-:: For start command, use the Python startup script that checks API_KEY
+:: For start command, check API_KEY
 if %is_start_cmd% equ 1 (
-    .venv\Scripts\python start_gateway.py %*
+    .venv\Scripts\python scripts\check_gateway_key.py
+    if %errorlevel% neq 0 (
+        exit /b 1
+    )
+    set "PYTHONPATH=%CD%"
+    .venv\Scripts\python -m app.cli %*
     ENDLOCAL
     exit /b %errorlevel%
 )
@@ -45,7 +50,9 @@ if "%1"=="" (
     echo [USAGE] freelance [command] [options]
     echo [EXAMPLE] freelance start -p 8000
     echo [EXAMPLE] freelance keygen
-    .venv\Scripts\freelance-api --help
+    set "PYTHONPATH=%CD%"
+    .venv\Scripts\python -m app.cli --help
 ) else (
-    .venv\Scripts\freelance-api %*
+    set "PYTHONPATH=%CD%"
+    .venv\Scripts\python -m app.cli %*
 )
