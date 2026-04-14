@@ -61,15 +61,20 @@ class AgentService:
             logger.info(f"[*] Agent Turn {iteration} for {model_name}")
             
             found_turn_response = False
+            tried_details = []
             last_err = None
             
             # Inner loop: Try each provider for the current turn
             for p_name, actual_id in models_to_try:
                 if not RouterService.is_provider_available(p_name, actual_id):
+                    status_msg = RouterService.get_provider_status_message(p_name, actual_id)
+                    tried_details.append(f"{status_msg} (Skipped)")
                     continue
                 
                 provider = get_provider_instance(p_name)
-                p_cfg = config.providers.get(p_name)
+                if not provider:
+                    tried_details.append(f"{p_name} instance not found")
+                    continue
                 
                 try:
                     if request.stream:
@@ -91,18 +96,28 @@ class AgentService:
                             found_turn_response = True
                             break
                         else:
+                            # OpenAI Compliance: Strip XML from final content
+                            if has_xml_tool_call(content):
+                                from app.utils.tool_converter import extract_xml_block
+                                text_before, _, text_after = extract_xml_block(content)
+                                final_content = (text_before or "") + (text_after or "")
+                                resp.choices[0].message.content = final_content.strip()
                             return JSONResponse(content=resp.model_dump(exclude_none=True))
                             
                 except Exception as e:
                     last_err = str(e)
+                    tried_details.append(f"{p_name}/{actual_id} error: {last_err}")
                     logger.warning(f"Turn {iteration} failed on {p_name}/{actual_id}: {e}")
                     RouterService.record_failure(p_name, actual_id, e)
                     continue
             
             if not found_turn_response:
-                break
+                # If we've exhausted all providers this turn, return a detailed error
+                details_str = "; ".join(tried_details)
+                err_msg = f"All providers failed for turn {iteration}. Details: {details_str}"
+                return make_error_response(err_msg, 503 if not last_err else 500)
                 
-        return make_error_response(f"Agent failed to produce response: {last_err}", 500)
+        return make_error_response(f"Agent exceeded max iterations ({max_iterations})", 500)
 
     async def _handle_stream(self, request, provider, p_name, actual_id, iteration, max_iterations):
         probe_timeout = StreamerService.get_probe_timeout(actual_id)
@@ -115,42 +130,112 @@ class AgentService:
 
         async def agent_gen(current_gen, current_id, current_first, current_iter):
             full_content = ""
+            is_suppressing = False
+            tag_start_str = "<function_calls"
+            tag_end_str = "</function_calls>"
             
-            # Helper to extract content from chunk
-            def extract(c):
-                if c.startswith("data: ") and not " [DONE]" in c:
+            # Metadata from provider (stable ID)
+            request_id = None
+            
+            def extract_info(c):
+                nonlocal request_id
+                if c.startswith("data: ") and not "[DONE]" in c:
                     try:
                         d = json.loads(c[6:])
-                        return d["choices"][0]["delta"].get("content", "")
-                    except: return ""
-                return ""
+                        if "error" in d:
+                            return "", False, True # Added is_error flag content, is_data, is_error
+                        if "id" in d: request_id = d["id"]
+                        content = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        return content, True, False
+                    except: return "", True, False
+                return "", False, False
 
-            full_content += extract(current_first)
-            yield current_first
+            def make_synthetic_chunk(text, original_chunk_str):
+                # If we must split/modify, try to preserve metadata from the original chunk
+                if not text: return ""
+                try:
+                    d = json.loads(original_chunk_str[6:])
+                    d["choices"][0]["delta"]["content"] = text
+                    return f"data: {json.dumps(d)}\n\n"
+                except:
+                    # Fallback to a plain but consistent chunk
+                    chunk_data = {
+                        "id": request_id or f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                    }
+                    return f"data: {json.dumps(chunk_data)}\n\n"
+
+            # 1. Process the very first chunk from the provider
+            delta, is_data, is_error = extract_info(current_first)
+            full_content += delta
             
+            if is_data and tag_start_str in delta:
+                # Rare: Tag in the first chunk. Enter suppression.
+                is_suppressing = True
+                pre_tag = delta.split(tag_start_str)[0]
+                if pre_tag:
+                    yield make_synthetic_chunk(pre_tag, current_first)
+            else:
+                # Normal: Relay first chunk as-is to establish ID/Role
+                yield current_first
+
+            # 2. Main relay loop
             async for chunk in StreamerService.stream_with_heartbeat(current_gen, p_name, current_id, self.fastapi_request):
                 if await self.fastapi_request.is_disconnected(): break
-                full_content += extract(chunk)
-                if not " [DONE]" in chunk:
+                
+                # Relay non-data pings immediately
+                if not chunk.startswith("data: ") or "[DONE]" in chunk:
                     yield chunk
+                    continue
+                
+                delta, is_data, is_error = extract_info(chunk)
+                if is_error:
+                    # CRITICAL: Relay error chunks directly so client knows why it failed
+                    yield chunk
+                    continue
+                
+                if not is_suppressing:
+                    potential_full = full_content + delta
+                    if tag_start_str in potential_full:
+                        # TAG DETECTED!
+                        is_suppressing = True
+                        
+                        # Find where the tag actually started relative to current chunk
+                        # This handles cases where the tag is split across previous/current chunk
+                        tag_start_in_full = potential_full.find(tag_start_str)
+                        len_before_this_delta = len(full_content)
+                        
+                        if tag_start_in_full > len_before_this_delta:
+                            # Part of this delta is SAFE (before the tag)
+                            safe_text = potential_full[len_before_this_delta:tag_start_in_full]
+                            if safe_text:
+                                yield make_synthetic_chunk(safe_text, chunk)
+                        
+                        full_content = potential_full
+                    else:
+                        # SAFE: Just relay the original high-fidelity chunk
+                        full_content = potential_full
+                        yield chunk
+                else:
+                    # SUPPRESSING: Just accumulate for internal agent logic
+                    full_content += delta
+                    if tag_end_str in full_content:
+                        # Resume mode? (rare in turn 1 but possible)
+                        is_suppressing = False
+                        tag_end_idx = full_content.find(tag_end_str) + len(tag_end_str)
+                        post_tag_text = full_content[tag_end_idx:]
+                        if post_tag_text:
+                            yield make_synthetic_chunk(post_tag_text, chunk)
             
             # Turn continuation check
             if has_xml_tool_call(full_content) and current_iter < max_iterations:
-                # yield status
-                status = {
-                    "id": f"agent-{uuid.uuid4().hex[:8]}",
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": "\n\n> [系统] 正在处理工具指令...\n"}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(status)}\n\n"
-                
                 tool_results = await self._process_tool_calls(full_content)
                 if tool_results:
                     request.messages.append(ChatMessage(role="assistant", content=full_content))
                     for tr in tool_results:
                         request.messages.append(ChatMessage(**tr))
                     
-                    # Next turn stream
                     next_gen = provider.chat_completion_stream(request, current_id, timeout=probe_timeout)
                     try:
                         next_first = await next_gen.__anext__()

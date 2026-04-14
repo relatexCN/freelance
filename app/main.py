@@ -111,18 +111,21 @@ async def background_cache_updater():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
-    logger.info("=" * 60)
-    logger.info("  Freelance API Gateway starting up")
-    logger.info(f"  Providers: {list(config.providers.keys())}")
-    logger.info(f"  Model routes: {len(config.model_routes)}")
-    logger.info(f"  Default provider: {config.default_provider}")
-    logger.info("=" * 60)
-    
-    # 1. Initialize providers eagerly
+    # 0. Gateway Key Validation
+    has_gw_key = bool(config.settings.api_key or (config.settings.api_keys and config.settings.api_keys.strip()))
+    if not has_gw_key:
+        logger.warning("⚠️  [SECURITY] No GATEWAY API Key (API_KEY/API_KEYS) found. Anyone can use this gateway!")
+    elif config.settings.api_key and not config.settings.api_key.startswith("sk-freelance-"):
+        logger.warning("⚠️  [SECURITY] Unusual Gateway API Key format. (Expected prefix 'sk-freelance-')")
+    else:
+        logger.info("✅ [SECURITY] Gateway API Key(s) validated.")
+
+    # 1. Initialize providers eagerly (Only those with API keys)
     for name, p_config in config.providers.items():
-        # Always try to initialize local or defined providers. 
-        # Some (like Ollama) don't require keys.
-        get_provider_instance(name, force_create=True)
+        if p_config.api_keys:
+            get_provider_instance(name, force_create=True)
+        else:
+            logger.info(f"ℹ️  [STARTUP] Skipping provider '{name}': No API keys configured.")
     
     # 2. Initial Hot Load: Ensure cache is ready BEFORE yielding
     logger.info("⚡ [STARTUP] Performing initial model cache hot load...")

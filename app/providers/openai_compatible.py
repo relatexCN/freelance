@@ -301,27 +301,32 @@ class OpenAICompatibleProvider(BaseProvider):
                         return # Success
 
                     elif resp.status_code == 429:
+                        await resp.aread()
                         c_dur = config.settings.cooldown.rate_limit_429
                         logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] hit 429. Cooling down {c_dur}s.")
                         self.config.record_key_failure(key_idx, c_dur)
                         last_error = f"Rate Limit (429) on key {key_idx}"
                     elif resp.status_code == 401:
+                        await resp.aread()
                         c_dur = config.settings.cooldown.auth_error_401
                         logger.error(f"[{self.config.name}] Stream Key[{key_idx}] returned 401. Cooling down {c_dur}s.")
                         self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
                         last_error = f"HTTP 401"
                     elif resp.status_code == 403:
+                        await resp.aread()
                         c_dur = config.settings.cooldown.forbidden_403
                         logger.error(f"[{self.config.name}] Stream Key[{key_idx}] returned 403. Cooling down {c_dur}s.")
                         self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
                         last_error = f"HTTP 403"
                     elif resp.status_code == 404:
+                        await resp.aread()
                         c_dur = config.settings.cooldown.other_error
                         logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] returned 404 for {actual_model}. Disabling model for {c_dur}s.")
                         self.config.record_model_failure(actual_model, c_dur)
                         last_error = f"HTTP 404 (Model Not Found)"
                     elif resp.status_code == 400:
                         # Bad Request - return error message to client
+                        await resp.aread()
                         try:
                             error_detail = resp.json()
                             error_msg = error_detail.get("error", {}).get("message", str(resp.status_code))
@@ -330,6 +335,7 @@ class OpenAICompatibleProvider(BaseProvider):
                         logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] returned 400: {error_msg}")
                         raise Exception(f"Bad Request: {error_msg}")
                     else:
+                        await resp.aread()
                         resp.raise_for_status()
                         
             except (httpx.HTTPStatusError, httpx.RequestError, asyncio.TimeoutError, Exception) as e:

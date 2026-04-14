@@ -72,3 +72,31 @@ class RouterService:
         c_dur = config.settings.cooldown.provider_melt
         logger.warning(f"Recording failure for {p_name}/{actual_id}: {err_str}")
         p_cfg.record_platform_failure(c_dur)
+
+    @staticmethod
+    def get_provider_status_message(p_name: str, actual_id: str) -> str:
+        """Get a human-readable status message for a provider/model."""
+        p_cfg = config.providers.get(p_name)
+        if not p_cfg:
+            return f"Provider '{p_name}' not found"
+            
+        now = time.time()
+        if p_cfg.is_platform_melted():
+            rem = int(p_cfg.melted_until - now)
+            return f"{p_name} platform melted ({rem}s remaining)"
+            
+        if p_cfg.is_model_melted(actual_id):
+            rem = int(p_cfg.model_cooldowns.get(actual_id, 0) - now)
+            return f"{p_name}/{actual_id} model melted ({rem}s remaining)"
+            
+        # Check if all keys are fatal/cooldown
+        num_keys = len(p_cfg.api_keys)
+        if num_keys > 0:
+            usable_keys = 0
+            for idx in range(num_keys):
+                if idx not in p_cfg.fatal_keys and (idx not in p_cfg.key_cooldowns or now >= p_cfg.key_cooldowns[idx]):
+                    usable_keys += 1
+            if usable_keys == 0:
+                return f"{p_name} has no usable API keys (all in cooldown or fatal)"
+                
+        return f"{p_name}/{actual_id} is healthy"

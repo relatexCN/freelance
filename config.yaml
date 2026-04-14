@@ -131,7 +131,7 @@ settings:
     defunct_model_timeout: 60    # 无法识别级别的模型首包超时
     huge_model_read_timeout: 180  # 超大模型(500B+)读取超时
     ping_interval: 3              # 心跳间隔 (秒)
-    read_timeout: 30             # 读取超时 - 数据块之间的最大间隔时间(秒)
+    read_timeout: 120            # 读取超时 - 数据块之间的最大间隔时间(秒)
   
   # HTTP 连接池物理隔离设置
   connection_pool:
