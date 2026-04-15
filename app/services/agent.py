@@ -181,6 +181,7 @@ class AgentService:
                 yield current_first
 
             # 2. Main relay loop
+            pending_buffer = ""
             async for chunk in StreamerService.stream_with_heartbeat(current_gen, p_name, current_id, self.fastapi_request):
                 if await self.fastapi_request.is_disconnected(): break
                 
@@ -196,37 +197,46 @@ class AgentService:
                     continue
                 
                 if not is_suppressing:
-                    potential_full = full_content + delta
-                    if tag_start_str in potential_full:
+                    # Lookahead logic: Check if current stream is heading towards a tag
+                    potential_new = pending_buffer + delta
+                    
+                    if tag_start_str in potential_new:
                         # TAG DETECTED!
                         is_suppressing = True
+                        tag_start_idx = potential_new.find(tag_start_str)
                         
-                        # Find where the tag actually started relative to current chunk
-                        # This handles cases where the tag is split across previous/current chunk
-                        tag_start_in_full = potential_full.find(tag_start_str)
-                        len_before_this_delta = len(full_content)
+                        # Yield everything before the tag
+                        pre_tag_text = potential_new[:tag_start_idx]
+                        if pre_tag_text:
+                            yield make_synthetic_chunk(pre_tag_text, chunk)
                         
-                        if tag_start_in_full > len_before_this_delta:
-                            # Part of this delta is SAFE (before the tag)
-                            safe_text = potential_full[len_before_this_delta:tag_start_in_full]
-                            if safe_text:
-                                yield make_synthetic_chunk(safe_text, chunk)
-                        
-                        full_content = potential_full
+                        # Full content keeps the tag for internal processing
+                        full_content += delta
+                        pending_buffer = "" # Clear buffer as we've entered suppression mode
+                    elif any(tag_start_str.startswith(potential_new[i:]) for i in range(len(potential_new))):
+                        # POTENTIAL TAG START: Keep in buffer, don't yield yet
+                        pending_buffer = potential_new
                     else:
-                        # SAFE: Just relay the original high-fidelity chunk
-                        full_content = potential_full
+                        # SAFE: No tag detected or possible. Flush buffer + current delta.
+                        if pending_buffer:
+                            yield make_synthetic_chunk(pending_buffer, chunk)
+                            pending_buffer = ""
                         yield chunk
+                        full_content += delta
                 else:
                     # SUPPRESSING: Just accumulate for internal agent logic
                     full_content += delta
                     if tag_end_str in full_content:
-                        # Resume mode? (rare in turn 1 but possible)
                         is_suppressing = False
                         tag_end_idx = full_content.find(tag_end_str) + len(tag_end_str)
-                        post_tag_text = full_content[tag_end_idx:]
-                        if post_tag_text:
-                            yield make_synthetic_chunk(post_tag_text, chunk)
+                        # Note: We don't yield post-tag content here immediately as it might 
+                        # contain ANOTHER tag start. The next iteration will handle it.
+                        # For now, just reset is_suppressing and let the next chunk flush.
+            
+            # 3. Final flush of any pending text that wasn't part of a tag
+            if not is_suppressing and pending_buffer:
+                yield make_synthetic_chunk(pending_buffer, current_first)
+                full_content += pending_buffer
             
             # Turn continuation check
             if has_xml_tool_call(full_content) and current_iter < max_iterations:

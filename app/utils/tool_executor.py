@@ -130,7 +130,7 @@ def register_tool(name: str, description: str):
 # === Built-in Tools ===
 
 @register_tool("exec", "Execute a shell command (only whitelisted commands allowed)")
-async def exec_command(command: str) -> Dict[str, Any]:
+async def exec_command(command: str, timeout: int = 30, **kwargs) -> Dict[str, Any]:
     """Execute a shell command with security restrictions."""
     
     # Parse command
@@ -151,7 +151,7 @@ async def exec_command(command: str) -> Dict[str, Any]:
             shell=True,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=timeout
         )
         
         return {
