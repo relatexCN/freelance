@@ -24,10 +24,12 @@ class AgentService:
 
     async def _process_tool_calls(self, content: str) -> List[dict]:
         if not has_xml_tool_call(content):
+            logger.debug(f'[TOOL CALL] No XML tool call detected')
             return []
         
         tool_calls = xml_to_tool_calls(content)
         if not tool_calls:
+            logger.debug(f'[TOOL CALL] XML detected but no tool calls parsed')
             return []
         
         results = []
@@ -234,6 +236,8 @@ class AgentService:
                         # For now, just reset is_suppressing and let the next chunk flush.
             
             # 3. Final flush of any pending text that wasn't part of a tag
+            if is_suppressing:
+                logger.warning(f'[STREAM] Stream ended while still in suppression mode!')
             if not is_suppressing and pending_buffer:
                 yield make_synthetic_chunk(pending_buffer, current_first)
                 full_content += pending_buffer
@@ -252,7 +256,8 @@ class AgentService:
                         async for c in agent_gen(next_gen, current_id, next_first, current_iter + 1):
                             yield c
                         return
-                    except: pass
+                    except Exception as e:
+                        logger.error(f'[STREAM] Failed to continue stream after tool call: {e}')
             
             yield "data: [DONE]\n\n"
 
