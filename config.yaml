@@ -8,7 +8,7 @@ providers:
     base_url: https://ollama.com/v1
     api_key: ${OLLAMA_API_KEY:}
     timeout: 120
-    default_model: deepseek-v3.2  # Auto模式下使用的默认模型
+    default_model: minimax-m2.7:cloud  # Auto模式下使用的默认模型
 
   openrouter:
     type: openai

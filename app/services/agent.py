@@ -147,8 +147,11 @@ class AgentService:
                         if "error" in d:
                             return "", False, True # Added is_error flag content, is_data, is_error
                         if "id" in d: request_id = d["id"]
-                        content = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        return content, True, False
+                        choices = d.get("choices")
+                        if choices and isinstance(choices, list) and len(choices) > 0:
+                            content = choices[0].get("delta", {}).get("content", "")
+                            return content if content is not None else "", True, False
+                        return "", True, False
                     except: return "", True, False
                 return "", False, False
 
