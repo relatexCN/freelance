@@ -64,13 +64,23 @@ class AgentService:
             
             found_turn_response = False
             tried_details = []
+            skipped_platforms = set()
             last_err = None
             
             # Inner loop: Try each provider for the current turn
             for p_name, actual_id in models_to_try:
                 if not RouterService.is_provider_available(p_name, actual_id):
+                    # Skip silent if platform is already known to be melted this turn
+                    if p_name in skipped_platforms:
+                        continue
+                        
                     status_msg = RouterService.get_provider_status_message(p_name, actual_id)
                     tried_details.append(f"{status_msg} (Skipped)")
+                    
+                    # If the whole platform is melted, mark it to avoid repetitive entries for other models
+                    p_cfg = config.providers.get(p_name)
+                    if p_cfg and p_cfg.is_platform_melted():
+                        skipped_platforms.add(p_name)
                     continue
                 
                 provider = get_provider_instance(p_name)
@@ -114,8 +124,15 @@ class AgentService:
                     continue
             
             if not found_turn_response:
-                # If we've exhausted all providers this turn, return a detailed error
-                details_str = "; ".join(tried_details)
+                # Deduplicate details to avoid massive repetitive messages (backup check)
+                unique_details = []
+                seen_details = set()
+                for d in tried_details:
+                    if d not in seen_details:
+                        unique_details.append(d)
+                        seen_details.add(d)
+                
+                details_str = "; ".join(unique_details)
                 err_msg = f"All providers failed for turn {iteration}. Details: {details_str}"
                 return make_error_response(err_msg, 503 if not last_err else 500)
                 
@@ -128,6 +145,9 @@ class AgentService:
         try:
             first_chunk = await gen.__anext__()
         except Exception as e:
+            # Explicitly close the generator to ensure the upstream connection is severed
+            if hasattr(gen, 'aclose'):
+                await gen.aclose()
             raise Exception(f"Failed to get first chunk: {e}")
 
         async def agent_gen(current_gen, current_id, current_first, current_iter):
@@ -135,6 +155,7 @@ class AgentService:
             is_suppressing = False
             tag_start_str = "<function_calls"
             tag_end_str = "</function_calls>"
+            pending_buffer = ""
             
             # Metadata from provider (stable ID)
             request_id = None
@@ -171,74 +192,80 @@ class AgentService:
                     }
                     return f"data: {json.dumps(chunk_data)}\n\n"
 
-            # 1. Process the very first chunk from the provider
-            delta, is_data, is_error = extract_info(current_first)
-            full_content += delta
-            
-            if is_data and tag_start_str in delta:
-                # Rare: Tag in the first chunk. Enter suppression.
-                is_suppressing = True
-                pre_tag = delta.split(tag_start_str)[0]
-                if pre_tag:
-                    yield make_synthetic_chunk(pre_tag, current_first)
-            else:
-                # Normal: Relay first chunk as-is to establish ID/Role
-                yield current_first
+            async def process_chunk(chunk_str):
+                nonlocal full_content, is_suppressing, pending_buffer, request_id
+                
+                # Skip non-data pings or end-of-stream markers
+                if not chunk_str.startswith("data: ") or "[DONE]" in chunk_str:
+                    yield chunk_str
+                    return
+                
+                delta, is_data, is_error = extract_info(chunk_str)
+                if is_error:
+                    yield chunk_str
+                    return
+                
+                # Accumulate RAW content for the model history and internal parsing
+                full_content += delta
+                
+                # Process text with lookahead for tags
+                active_text = pending_buffer + delta
+                pending_buffer = ""
+                
+                while active_text:
+                    if not is_suppressing:
+                        tag_start_idx = active_text.find(tag_start_str)
+                        if tag_start_idx != -1:
+                            # Start tag located
+                            pre_tag = active_text[:tag_start_idx]
+                            if pre_tag:
+                                yield make_synthetic_chunk(pre_tag, chunk_str)
+                            is_suppressing = True
+                            active_text = active_text[tag_start_idx:]
+                        else:
+                            # No full tag start. Check for partial tag start at the tail.
+                            found_partial_idx = -1
+                            for i in range(len(tag_start_str) - 1, 0, -1):
+                                suffix = tag_start_str[:i]
+                                if active_text.endswith(suffix):
+                                    found_partial_idx = len(active_text) - i
+                                    break
+                            
+                            if found_partial_idx != -1:
+                                pending_buffer = active_text[found_partial_idx:]
+                                safe_text = active_text[:found_partial_idx]
+                                if safe_text:
+                                    yield make_synthetic_chunk(safe_text, chunk_str)
+                                active_text = "" # Consumed into buffer
+                            else:
+                                # Entire chunk is safe text
+                                if delta == active_text:
+                                    yield chunk_str
+                                else:
+                                    yield make_synthetic_chunk(active_text, chunk_str)
+                                active_text = ""
+                    else:
+                        # Suppression mode active: Look for closing tag
+                        tag_end_idx = active_text.find(tag_end_str)
+                        if tag_end_idx != -1:
+                            is_suppressing = False
+                            # Continue processing anything AFTER the closing tag
+                            active_text = active_text[tag_end_idx + len(tag_end_str):]
+                        else:
+                            # Entire chunk is within a suppressed block
+                            active_text = ""
+
+            # 1. Process the very first chunk from the provider through the same logic
+            async for c in process_chunk(current_first):
+                yield c
 
             # 2. Main relay loop
-            pending_buffer = ""
             async for chunk in StreamerService.stream_with_heartbeat(current_gen, p_name, current_id, self.fastapi_request):
                 if await self.fastapi_request.is_disconnected(): break
-                
-                # Relay non-data pings immediately
-                if not chunk.startswith("data: ") or "[DONE]" in chunk:
-                    yield chunk
-                    continue
-                
-                delta, is_data, is_error = extract_info(chunk)
-                if is_error:
-                    # CRITICAL: Relay error chunks directly so client knows why it failed
-                    yield chunk
-                    continue
-                
-                if not is_suppressing:
-                    # Lookahead logic: Check if current stream is heading towards a tag
-                    potential_new = pending_buffer + delta
-                    
-                    if tag_start_str in potential_new:
-                        # TAG DETECTED!
-                        is_suppressing = True
-                        tag_start_idx = potential_new.find(tag_start_str)
-                        
-                        # Yield everything before the tag
-                        pre_tag_text = potential_new[:tag_start_idx]
-                        if pre_tag_text:
-                            yield make_synthetic_chunk(pre_tag_text, chunk)
-                        
-                        # Full content keeps the tag for internal processing
-                        full_content += delta
-                        pending_buffer = "" # Clear buffer as we've entered suppression mode
-                    elif any(tag_start_str.startswith(potential_new[i:]) for i in range(len(potential_new))):
-                        # POTENTIAL TAG START: Keep in buffer, don't yield yet
-                        pending_buffer = potential_new
-                    else:
-                        # SAFE: No tag detected or possible. Flush buffer + current delta.
-                        if pending_buffer:
-                            yield make_synthetic_chunk(pending_buffer, chunk)
-                            pending_buffer = ""
-                        yield chunk
-                        full_content += delta
-                else:
-                    # SUPPRESSING: Just accumulate for internal agent logic
-                    full_content += delta
-                    if tag_end_str in full_content:
-                        is_suppressing = False
-                        tag_end_idx = full_content.find(tag_end_str) + len(tag_end_str)
-                        # Note: We don't yield post-tag content here immediately as it might 
-                        # contain ANOTHER tag start. The next iteration will handle it.
-                        # For now, just reset is_suppressing and let the next chunk flush.
+                async for c in process_chunk(chunk):
+                    yield c
             
-            # 3. Final flush of any pending text that wasn't part of a tag
+            # 3. Final flush
             if is_suppressing:
                 logger.warning(f'[STREAM] Stream ended while still in suppression mode!')
             if not is_suppressing and pending_buffer:
@@ -260,6 +287,8 @@ class AgentService:
                             yield c
                         return
                     except Exception as e:
+                        if hasattr(next_gen, 'aclose'):
+                            await next_gen.aclose()
                         logger.error(f'[STREAM] Failed to continue stream after tool call: {e}')
             
             yield "data: [DONE]\n\n"

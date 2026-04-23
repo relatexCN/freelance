@@ -256,6 +256,12 @@ async def write_file(path: str, content: str, append: bool = False) -> Dict[str,
         return {"error": str(e), "success": False}
 
 
+@register_tool("edit", "Edit a file (write content to path)")
+async def edit_file(path: str, content: str) -> Dict[str, Any]:
+    """Alias for write_file to support 'edit' tool calls."""
+    return await write_file(path, content)
+
+
 @register_tool("create_dir", "Create a directory")
 async def create_dir(path: str) -> Dict[str, Any]:
     """Create a directory with path validation."""
