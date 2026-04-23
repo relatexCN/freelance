@@ -30,12 +30,6 @@ providers:
     api_key: ${CEREBRAS_API_KEY:}
     timeout: 60
 
-  github:
-    type: openai
-    base_url: https://models.inference.ai.azure.com
-    api_key: ${GITHUB_TOKEN:}
-    timeout: 60
-
   sambanova:
     type: openai
     base_url: https://api.sambanova.ai/v1
@@ -102,7 +96,7 @@ models:
   "deepseek-chat": { provider: "openrouter", model: "deepseek/deepseek-chat" }
 
 # Default provider when model is not found in routing table
-default_provider: "ollama"
+default_provider: "openrouter"
 
 # Global settings
 settings:
@@ -120,8 +114,8 @@ settings:
     quota_exceeded: 3600      # 1小时
     timeout_network: 3600     # 1小时
     stream_failure_fallback: 3600 # 1小时 (流式失败但非流式成功时禁用流式的时长)
-    other_error: 10800        # 3小时
-    provider_melt: 10800      # 3小时
+    other_error: 3600        # 1小时
+    provider_melt: 3600      # 1小时
 
   # SSE 探测与优化设置
   stream_probe:

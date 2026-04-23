@@ -44,14 +44,23 @@ class RouterService:
             if not config.auto_models_cache:
                 return []
 
-            # Check provider defaults first
-            providers_with_default = [n for n, p in config.providers.items() if p.default_model]
-            if providers_with_default:
-                for p_name in providers_with_default:
-                    models_to_try.append((p_name, config.providers[p_name].default_model))
-            else:
-                for m in config.auto_models_cache:
-                    models_to_try.append((m.get("_gateway_provider", config.default_provider), m["id"]))
+            # 1. Start with dedicated defaults (Explicitly prioritized by user in config)
+            seen = set()
+            for p_name, p_cfg in config.providers.items():
+                if p_cfg.default_model:
+                    pair = (p_name, p_cfg.default_model)
+                    if pair not in seen:
+                        models_to_try.append(pair)
+                        seen.add(pair)
+
+            # 2. Add remaining models from cache (Already ranked by score global evaluation)
+            # This ensures even providers without defaults are used if their models rank well
+            for m in config.auto_models_cache:
+                p_name = m.get("_gateway_provider", config.default_provider)
+                pair = (p_name, m["id"])
+                if pair not in seen:
+                    models_to_try.append(pair)
+                    seen.add(pair)
         else:
             p_cfg, actual = config.resolve_model(model_name)
             if p_cfg:
