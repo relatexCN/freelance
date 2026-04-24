@@ -109,7 +109,6 @@ class AgentService:
                 except Exception as e:
                     last_err = str(e)
                     tried_details.append(f"{p_name}/{actual_id} error: {last_err}")
-                    logger.warning(f"Turn {iteration} failed on {p_name}/{actual_id}: {e}")
                     RouterService.record_failure(p_name, actual_id, e)
                     continue
             

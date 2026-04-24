@@ -9,6 +9,7 @@ from app.providers import get_provider
 logger = logging.getLogger("freelance.router")
 
 # Cache for provider instances
+# Only instantiate providers that have API keys configured
 _providers = {name: get_provider(p_cfg) for name, p_cfg in config.providers.items() if p_cfg.api_keys}
 
 def get_provider_instance(name: str, force_create: bool = False):
