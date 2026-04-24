@@ -7,7 +7,7 @@ from fastapi import Request
 
 from app.config import config
 
-logger = logging.getLogger("freelance.streamer")
+logger = logging.getLogger("freelance")
 
 # Known model families that can't be identified by size suffix alone
 _KNOWN_MODEL_FAMILIES = {
@@ -81,11 +81,12 @@ class StreamerService:
             try:
                 while not stop_event.is_set():
                     if await request.is_disconnected():
+                        logger.warning(f"[CLIENT_DISCONNECT] Client disconnected for {model_id}")
                         break
                     current_time = time.time()
                     time_since_activity = current_time - last_activity_time
                     if time_since_activity >= read_timeout:
-                        logger.warning(f"[TIMEOUT] Read timeout detected for {model_id}")
+                        logger.warning(f"[TIMEOUT] Read timeout detected for {model_id} (inactivity: {time_since_activity:.1f}s)")
                         timeout_event.set()
                         break
                     if time_since_activity >= ping_interval:
@@ -102,15 +103,20 @@ class StreamerService:
             try:
                 async for chunk in gen:
                     if timeout_event.is_set() or await request.is_disconnected():
+                        logger.info(f"[STREAM] Stopping business task - timeout={timeout_event.is_set()}, disconnected={await request.is_disconnected()}")
                         break
                     last_activity_time = time.time()
+                    chunk_len = len(chunk) if chunk else 0
                     if chunks_sent == 0:
                         ttft = (time.time() - start_time) * 1000
-                        logger.info(f"First chunk for {model_id} at +{ttft:.2f}ms")
+                        logger.info(f"First chunk for {model_id} at +{ttft:.2f}ms (len={chunk_len})")
                         # RECORD TTFT and success start
                         stats_service.record_request(p_name, model_id, ttft_ms=ttft)
+                    else:
+                        logger.debug(f"[STREAM] Received chunk {chunks_sent+1} for {model_id} (len={chunk_len})")
                     await message_queue.put(("business", chunk))
                     chunks_sent += 1
+                logger.info(f"[STREAM] Business task completed, total chunks: {chunks_sent}")
             except Exception as e:
                 if not isinstance(e, asyncio.CancelledError):
                     logger.error(f"Stream interrupted: {e}")
@@ -123,8 +129,22 @@ class StreamerService:
         
         try:
             while True:
-                msg_type, data = await message_queue.get()
-                if msg_type == "end" or timeout_event.is_set() or await request.is_disconnected():
+                # Check for exit conditions before waiting
+                if timeout_event.is_set():
+                    logger.warning(f"[STREAM] Timeout event set, exiting loop")
+                    break
+                if await request.is_disconnected():
+                    logger.warning(f"[STREAM] Client disconnected, exiting loop")
+                    break
+                
+                # Use timeout to allow periodic checks
+                try:
+                    msg_type, data = await asyncio.wait_for(message_queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                    
+                if msg_type == "end":
+                    logger.info(f"[STREAM] Received end signal")
                     break
                 yield data
                 message_queue.task_done()

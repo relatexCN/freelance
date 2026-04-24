@@ -17,7 +17,7 @@ from app.scoring import rank_models
 # LOGGING UNIFICATION
 # ----------------------------
 fl_logger = logging.getLogger("freelance")
-fl_logger.setLevel(logging.INFO)
+fl_logger.setLevel(logging.DEBUG)
 fl_logger.propagate = False  # Avoid duplicates from root
 
 # Clear ALL existing handlers to enable idempotent configuration
