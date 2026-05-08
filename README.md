@@ -495,6 +495,16 @@ freelance->平台C->api key4
 
 ***
 
+***
+
+1. groq/llama-3.3-70b        (score: 0.85)  ← groq 无 default_model → ✅ 可调用
+2. openrouter/nemotron-3     (score: 0.82)  ← openrouter 有 default_model 但不是这个 → ❌ 跳过
+3. openrouter/gpt-4o-mini    (score: 0.78)  ← openrouter 有 default_model 但不是这个 → ❌ 跳过
+4. nvidia/llama-3-nemotron   (score: 0.75)  ← nvidia 无 default_model → ✅ 可调用
+5. openrouter/nemotron-3     (score: 0.82)  ← 这是 openrouter 的 default_model → ✅ 可调用
+
+***
+
 ## 📜 开源协议
 
 基于 MIT License 开源。请勿将其用于任何破坏厂家免费额度的恶意滥用。

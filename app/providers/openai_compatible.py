@@ -400,6 +400,8 @@ class OpenAICompatibleProvider(BaseProvider):
                     if k not in model_dict:
                         model_dict[k] = v
                 models.append(model_dict)
+            logger.info(f"[{self.config.name}] list_models: fetched {len(models)} models")
             return models
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[{self.config.name}] list_models failed: {e}")
             return []

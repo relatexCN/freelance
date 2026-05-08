@@ -114,7 +114,26 @@ class AgentService:
             
             if not found_turn_response:
                 # If we've exhausted all providers this turn, return a detailed error
-                details_str = "; ".join(tried_details)
+                # Deduplicate similar errors to avoid verbose messages
+                error_counts = {}
+                for detail in tried_details:
+                    # Normalize error: extract the key pattern (provider + error type)
+                    if " (Skipped)" in detail:
+                        # Group skipped errors by provider
+                        key = detail.split(" (Skipped)")[0].strip()
+                    else:
+                        # Group other errors by provider + error type
+                        key = detail.split(" error: ")[0].strip() if " error: " in detail else detail[:80]
+                    error_counts[key] = error_counts.get(key, 0) + 1
+                
+                deduped_details = []
+                for key, count in error_counts.items():
+                    if count > 1:
+                        deduped_details.append(f"{key} ({count}x)")
+                    else:
+                        deduped_details.append(key)
+                
+                details_str = "; ".join(deduped_details)
                 err_msg = f"All providers failed for turn {iteration}. Details: {details_str}"
                 return make_error_response(err_msg, 503 if not last_err else 500)
                 

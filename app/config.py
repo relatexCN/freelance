@@ -273,6 +273,7 @@ class AppConfig:
         self.default_provider: str = "ollama"
         self.auto_models_cache: list[dict] = []  # Ranked list of available models
         self.auto_models_last_update: float = 0.0
+        self.providers_with_models_in_cache: set = set()  # Providers that successfully returned models
         self._load_yaml_config()
 
     def _load_yaml_config(self):

@@ -84,7 +84,12 @@ async def update_models_cache():
         )
         
         all_models = []
+        # Track which providers failed to return models
+        providers_with_models = set()
         for res in results:
+            if res:
+                p_name = res[0].get("_gateway_provider", "unknown")
+                providers_with_models.add(p_name)
             all_models.extend(res)
 
         if all_models:
@@ -92,7 +97,9 @@ async def update_models_cache():
             ranked = rank_models(all_models, only_free=False)
             config.auto_models_cache = ranked
             config.auto_models_last_update = time.time()
-            logger.info(f"✅ [CACHE] Auto-routing cache updated with {len(ranked)} models")
+            # Store which providers have models in cache (for fallback logic)
+            config.providers_with_models_in_cache = providers_with_models
+            logger.info(f"✅ [CACHE] Auto-routing cache updated with {len(ranked)} models from {len(providers_with_models)} providers")
         else:
             logger.warning("⚠️ [CACHE] No models found or ranked. Cache is empty.")
             

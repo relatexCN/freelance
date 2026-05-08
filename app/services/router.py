@@ -45,23 +45,49 @@ class RouterService:
             if not config.auto_models_cache:
                 return []
 
-            # 1. Start with dedicated defaults (Explicitly prioritized by user in config)
-            seen = set()
-            for p_name, p_cfg in config.providers.items():
-                if p_cfg.default_model:
-                    pair = (p_name, p_cfg.default_model)
-                    if pair not in seen:
-                        models_to_try.append(pair)
-                        seen.add(pair)
+            # Build a set of providers that have a default_model configured
+            providers_with_default = {
+                p_name for p_name, p_cfg in config.providers.items()
+                if p_cfg.default_model
+            }
 
-            # 2. Add remaining models from cache (Already ranked by score global evaluation)
-            # This ensures even providers without defaults are used if their models rank well
+            # Iterate cache (already ranked by score) and apply filtering rules:
+            # - Provider WITHOUT default_model: include all its models
+            # - Provider WITH default_model: only include its default_model, skip others
+            seen = set()
             for m in config.auto_models_cache:
                 p_name = m.get("_gateway_provider", config.default_provider)
-                pair = (p_name, m["id"])
-                if pair not in seen:
+                model_id = m["id"]
+                pair = (p_name, model_id)
+
+                if pair in seen:
+                    continue
+                seen.add(pair)
+
+                p_cfg = config.providers.get(p_name)
+                if not p_cfg:
+                    continue
+
+                if p_name in providers_with_default:
+                    # Provider has a default_model: only allow the default_model itself
+                    if model_id == p_cfg.default_model:
+                        models_to_try.append(pair)
+                    # else: skip non-default models from this provider
+                else:
+                    # Provider has NO default_model: allow all its models (score-ranked)
                     models_to_try.append(pair)
-                    seen.add(pair)
+
+            # Fallback: for providers with default_model whose models are NOT in cache
+            # (e.g., list_models failed due to 403), add their default_model as fallback
+            # Only for providers that have API keys configured AND failed to return models
+            for p_name, p_cfg in config.providers.items():
+                if p_name in providers_with_default and p_cfg.default_model and p_cfg.api_keys:
+                    # Only fallback if provider failed to return models (not in cache)
+                    if p_name not in config.providers_with_models_in_cache:
+                        pair = (p_name, p_cfg.default_model)
+                        if pair not in seen:
+                            logger.info(f"[router] Adding fallback default_model for {p_name}: {p_cfg.default_model}")
+                            models_to_try.append(pair)
         else:
             p_cfg, actual = config.resolve_model(model_name)
             if p_cfg:

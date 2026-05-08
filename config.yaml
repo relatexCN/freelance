@@ -23,6 +23,7 @@ providers:
     api_key: ${GROQ_API_KEY:}
     timeout: 60
     score_offset: 0.5  # Boost Groq models due to extreme low latency
+    default_model: groq/compound
 
   cerebras:
     type: openai
@@ -40,7 +41,8 @@ providers:
     type: openai
     base_url: https://integrate.api.nvidia.com/v1
     api_key: ${NVIDIA_API_KEY:}
-    timeout: 60
+    timeout: 250
+    default_model: minimaxai/minimax-m2.7
 
   mistral:
     type: openai
@@ -96,7 +98,7 @@ models:
   "deepseek-chat": { provider: "openrouter", model: "deepseek/deepseek-chat" }
 
 # Default provider when model is not found in routing table
-default_provider: "ollama"
+# default_provider: "ollama"
 
 # Global settings
 settings:
