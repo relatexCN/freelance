@@ -77,17 +77,15 @@ class RouterService:
                     # Provider has NO default_model: allow all its models (score-ranked)
                     models_to_try.append(pair)
 
-            # Fallback: for providers with default_model whose models are NOT in cache
-            # (e.g., list_models failed due to 403), add their default_model as fallback
-            # Only for providers that have API keys configured AND failed to return models
+            # Fallback: for providers with default_model, always ensure their
+            # default_model is tried (handles both list_models failure and
+            # default_model not being in the returned model list)
             for p_name, p_cfg in config.providers.items():
                 if p_name in providers_with_default and p_cfg.default_model and p_cfg.api_keys:
-                    # Only fallback if provider failed to return models (not in cache)
-                    if p_name not in config.providers_with_models_in_cache:
-                        pair = (p_name, p_cfg.default_model)
-                        if pair not in seen:
-                            logger.info(f"[router] Adding fallback default_model for {p_name}: {p_cfg.default_model}")
-                            models_to_try.append(pair)
+                    pair = (p_name, p_cfg.default_model)
+                    if pair not in seen:
+                        logger.info(f"[router] Adding fallback default_model for {p_name}: {p_cfg.default_model}")
+                        models_to_try.append(pair)
         else:
             p_cfg, actual = config.resolve_model(model_name)
             if p_cfg:
