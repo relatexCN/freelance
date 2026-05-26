@@ -122,6 +122,7 @@ class ProviderConfig:
         self.model_cooldowns: dict[str, float] = {} # model_id -> melted_until timestamp
         self.stream_melted_until: dict[str, float] = {} # model_id -> melted_until timestamp
         self.melted_until = 0 # Platform-level circuit breaker
+        self.consecutive_failures: int = 0      # consecutive failure counter
         self.set_api_key(api_key)
 
     def set_api_key(self, api_key: str):
@@ -217,8 +218,21 @@ class ProviderConfig:
         self.model_cooldowns[model_id] = time.time() + cooldown
 
     def record_platform_failure(self, cooldown: int = 10800):
-        """Mark the entire provider as melted for a period of time."""
-        self.melted_until = time.time() + cooldown
+        """Mark the entire provider as melted for a period of time.
+        Only melts after consecutive failures exceed max_retries from config.yaml."""
+        threshold = config.settings.max_retries
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= threshold:
+            self.melted_until = time.time() + cooldown
+            logger.warning(f"[{self.name}] Platform melted after {self.consecutive_failures} consecutive failures ({cooldown}s)")
+        else:
+            logger.info(f"[{self.name}] Failure {self.consecutive_failures}/{threshold}, not melting yet")
+
+    def reset_consecutive_failures(self):
+        """Reset the consecutive failure counter after a successful request."""
+        if self.consecutive_failures > 0:
+            logger.info(f"[{self.name}] Resetting consecutive failure counter (was {self.consecutive_failures})")
+            self.consecutive_failures = 0
 
     def is_model_melted(self, model_id: str) -> bool:
         """Check if a specific model is cooling down."""

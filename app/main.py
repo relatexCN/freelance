@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,6 +57,73 @@ else:
 logger = fl_logger
 # ----------------------------
 
+LATEST_MODELS_LOG = "latest_models.log"
+
+
+def _write_latest_models_log(ranked_models: list, providers_with_models: set):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"=== Latest Models ({ts}) ===\n"]
+
+    configured_providers = {name: p_cfg for name, p_cfg in config.providers.items() if p_cfg.api_keys}
+
+    lines.append("--- A: Theoretical Ranking (by score, grouped by provider) ---\n")
+    provider_models: dict[str, list] = {}
+    for m in ranked_models:
+        p_name = m.get("_gateway_provider", "unknown")
+        if p_name not in provider_models:
+            provider_models[p_name] = []
+        provider_models[p_name].append(m)
+
+    provider_order = [p for p in configured_providers if p in provider_models] + \
+                     [p for p in provider_models if p not in configured_providers]
+    global_idx = 0
+    for p_name in provider_order:
+        models = provider_models[p_name]
+        has_keys = p_name in configured_providers
+        key_info = f"[{len(configured_providers[p_name].api_keys)} keys]" if has_keys else "[no keys]"
+        lines.append(f"\n  >>> {p_name} {key_info} ({len(models)} models) >>>\n")
+        for m in models[:20]:
+            global_idx += 1
+            model_id = m.get("id", "unknown")
+            score = m.get("_score", 0)
+            lines.append(f"    {global_idx:4d}. {model_id:54s}  score={score:.4f}\n")
+        if len(models) > 20:
+            lines.append(f"    ... ({len(models) - 20} more models omitted)\n")
+
+    missing_providers = [p for p in configured_providers if p not in provider_models]
+    if missing_providers:
+        lines.append(f"\n  --- Providers with no models in cache ---\n")
+        for p_name in missing_providers:
+            p_cfg = configured_providers[p_name]
+            lines.append(f"    {p_name} [{len(p_cfg.api_keys)} keys]: list_models returned empty or failed\n")
+
+    lines.append(f"\n--- B: Actual Routing (by provider, reflecting default_model strategy) ---\n")
+    actual_idx = 0
+    for p_name, p_cfg in configured_providers.items():
+        if p_cfg.default_model:
+            actual_idx += 1
+            in_cache = any(
+                m.get("_gateway_provider") == p_name and m.get("id") == p_cfg.default_model
+                for m in ranked_models
+            )
+            cache_note = "" if in_cache else " (not in cache, used as fallback)"
+            lines.append(f"    {actual_idx:4d}. [{p_name:16s}] {p_cfg.default_model}{cache_note}\n")
+        else:
+            provider_specific = [m for m in ranked_models if m.get("_gateway_provider") == p_name]
+            if provider_specific:
+                for m in provider_specific:
+                    actual_idx += 1
+                    lines.append(f"    {actual_idx:4d}. [{p_name:16s}] {m.get('id', 'unknown')}\n")
+            else:
+                lines.append(f"         [{p_name:16s}] (no models in cache, provider skipped)\n")
+
+    try:
+        with open(LATEST_MODELS_LOG, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        logger.error(f"Failed to write latest_models.log: {e}")
+
+
 async def update_models_cache():
     """Fetch and score models from all providers in parallel."""
     try:
@@ -100,6 +168,8 @@ async def update_models_cache():
             # Store which providers have models in cache (for fallback logic)
             config.providers_with_models_in_cache = providers_with_models
             logger.info(f"✅ [CACHE] Auto-routing cache updated with {len(ranked)} models from {len(providers_with_models)} providers")
+            
+            _write_latest_models_log(ranked, providers_with_models)
         else:
             logger.warning("⚠️ [CACHE] No models found or ranked. Cache is empty.")
             
@@ -248,3 +318,29 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": int(time.time())}
+
+
+@app.get("/health/providers")
+async def provider_health():
+    """Provider health status endpoint."""
+    now = time.time()
+    providers_status = {}
+    for name, p_cfg in config.providers.items():
+        is_melted = p_cfg.is_platform_melted()
+        remaining = int(p_cfg.melted_until - now) if is_melted else 0
+        usable_keys = 0
+        for idx in range(len(p_cfg.api_keys)):
+            if idx not in p_cfg.fatal_keys:
+                if idx not in p_cfg.key_cooldowns or now >= p_cfg.key_cooldowns[idx]:
+                    usable_keys += 1
+        providers_status[name] = {
+            "melted": is_melted,
+            "melted_remaining_s": remaining,
+            "consecutive_failures": p_cfg.consecutive_failures,
+            "max_retries_threshold": config.settings.max_retries,
+            "fatal_keys": len(p_cfg.fatal_keys),
+            "total_keys": len(p_cfg.api_keys),
+            "usable_keys": usable_keys,
+            "default_model": p_cfg.default_model or None,
+        }
+    return {"status": "ok", "timestamp": int(now), "providers": providers_status}

@@ -19,7 +19,7 @@ providers:
 
   groq:
     type: openai
-    base_url: https://api.groq.com/openai/v1
+    base_url: https://api.groq.com/openai/v1/responses
     api_key: ${GROQ_API_KEY:}
     timeout: 60
     score_offset: 0.5  # Boost Groq models due to extreme low latency

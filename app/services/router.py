@@ -1,12 +1,16 @@
 import asyncio
+import os
 import time
 import logging
+from datetime import datetime
 from typing import List, Tuple, Optional, Any
 
 from app.config import config
 from app.providers import get_provider
 
 logger = logging.getLogger("freelance.router")
+
+ERROR_MODELS_LOG = "error_models.log"
 
 # Cache for provider instances
 # Only instantiate providers that have API keys configured
@@ -103,9 +107,44 @@ class RouterService:
         err_str = str(error)
         stats_service.record_request(p_name, actual_id, error=err_str)
         
-        c_dur = config.settings.cooldown.provider_melt
-        logger.warning(f"Recording failure for {p_name}/{actual_id}: {err_str}")
+        lower_err = err_str.lower()
+        if "first chunk" in lower_err or "stream" in lower_err:
+            c_dur = config.settings.cooldown.stream_failure_fallback
+            err_type = "StreamFailure"
+        elif "timeout" in lower_err or "readtimeout" in lower_err:
+            c_dur = config.settings.cooldown.timeout_network
+            err_type = "Timeout"
+        else:
+            c_dur = config.settings.cooldown.provider_melt
+            err_type = "General"
+        
+        logger.warning(f"Recording {err_type} failure for {p_name}/{actual_id}: {err_str}")
         p_cfg.record_platform_failure(c_dur)
+        
+        RouterService._write_error_log(p_name, actual_id, err_type, err_str)
+
+    @staticmethod
+    def _write_error_log(p_name: str, actual_id: str, err_type: str, err_str: str):
+        today = datetime.now().strftime("%Y-%m-%d")
+        time_str = datetime.now().strftime("%H:%M:%S")
+        
+        header = f"=== {today} ==="
+        entry = f"{time_str} | {err_type} | {err_str} | {p_name}:{actual_id}"
+        
+        try:
+            need_header = True
+            if os.path.exists(ERROR_MODELS_LOG):
+                with open(ERROR_MODELS_LOG, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if header in content:
+                        need_header = False
+            
+            with open(ERROR_MODELS_LOG, "a", encoding="utf-8") as f:
+                if need_header:
+                    f.write(f"\n{header}\n")
+                f.write(f"{entry}\n")
+        except Exception as e:
+            logger.error(f"Failed to write error_models.log: {e}")
 
     @staticmethod
     def get_provider_status_message(p_name: str, actual_id: str) -> str:

@@ -68,6 +68,7 @@ class StreamerService:
         """
         start_time = time.time()
         chunks_sent = 0
+        total_bytes = 0
         last_activity_time = time.time()
         ping_interval = config.settings.stream_probe.ping_interval
         read_timeout = StreamerService.get_read_timeout(model_id)
@@ -100,6 +101,7 @@ class StreamerService:
             from app.services.stats_service import stats_service
             nonlocal last_activity_time
             nonlocal chunks_sent
+            nonlocal total_bytes
             try:
                 async for chunk in gen:
                     if timeout_event.is_set() or await request.is_disconnected():
@@ -107,6 +109,7 @@ class StreamerService:
                         break
                     last_activity_time = time.time()
                     chunk_len = len(chunk) if chunk else 0
+                    total_bytes += chunk_len
                     if chunks_sent == 0:
                         ttft = (time.time() - start_time) * 1000
                         logger.info(f"First chunk for {model_id} at +{ttft:.2f}ms (len={chunk_len})")
@@ -152,4 +155,4 @@ class StreamerService:
             stop_event.set()
             h_task.cancel()
             b_task.cancel()
-            logger.info(f"--- [STREAM FINISHED] ({chunks_sent} chunks relayed) ---")
+            logger.info(f"--- [STREAM FINISHED] ({chunks_sent} chunks, {total_bytes} bytes relayed) ---")

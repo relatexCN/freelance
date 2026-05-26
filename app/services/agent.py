@@ -87,6 +87,9 @@ class AgentService:
                         resp = await provider.chat_completion(request, actual_id, timeout=config.settings.unified_timeout or 30)
                         latency = (time.time() - start_time) * 1000
                         stats_service.record_request(p_name, actual_id, latency_ms=latency)
+                        p_cfg = config.providers.get(p_name)
+                        if p_cfg:
+                            p_cfg.reset_consecutive_failures()
                         
                         content = resp.choices[0].message.content or ""
                         tool_results = await self._process_tool_calls(content)
@@ -147,6 +150,10 @@ class AgentService:
             first_chunk = await gen.__anext__()
         except Exception as e:
             raise Exception(f"Failed to get first chunk: {e}")
+
+        p_cfg = config.providers.get(p_name)
+        if p_cfg:
+            p_cfg.reset_consecutive_failures()
 
         async def agent_gen(current_gen, current_id, current_first, current_iter):
             full_content = ""
@@ -280,6 +287,7 @@ class AgentService:
                     except Exception as e:
                         logger.error(f'[STREAM] Failed to continue stream after tool call: {e}')
             
+            yield f"event: stream_end\ndata: {{\"content_length\": {len(full_content)}}}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
