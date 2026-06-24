@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional, Any
 
 from app.config import config
 from app.providers import get_provider
+from app.services.gateway_errors import GatewayError
 
 logger = logging.getLogger("freelance.router")
 
@@ -104,32 +105,58 @@ class RouterService:
         if not p_cfg:
             return
             
-        err_str = str(error)
+        gw_error = GatewayError.from_exception(error, provider=p_name, model=actual_id)
+        err_str = str(gw_error)
         stats_service.record_request(p_name, actual_id, error=err_str)
-        
-        lower_err = err_str.lower()
-        if "first chunk" in lower_err or "stream" in lower_err:
-            c_dur = config.settings.cooldown.stream_failure_fallback
-            err_type = "StreamFailure"
-        elif "timeout" in lower_err or "readtimeout" in lower_err:
-            c_dur = config.settings.cooldown.timeout_network
-            err_type = "Timeout"
+
+        if isinstance(error, GatewayError):
+            err_type = error.error_type
+            c_dur = error.cooldown or config.settings.cooldown.provider_melt
+            if error.disable_provider:
+                logger.warning(f"Recording provider failure for {p_name}/{actual_id}: {err_str}")
+                p_cfg.record_platform_failure(c_dur)
+            else:
+                logger.warning(f"Recording non-provider failure for {p_name}/{actual_id}: {err_str}")
         else:
-            c_dur = config.settings.cooldown.provider_melt
-            err_type = "General"
+            lower_err = err_str.lower()
+            if "first chunk" in lower_err or "stream" in lower_err:
+                c_dur = config.settings.cooldown.stream_failure_fallback
+                err_type = "StreamFailure"
+            elif "timeout" in lower_err or "readtimeout" in lower_err:
+                c_dur = config.settings.cooldown.timeout_network
+                err_type = "Timeout"
+            else:
+                c_dur = config.settings.cooldown.provider_melt
+                err_type = "General"
+
+            logger.warning(f"Recording legacy {err_type} failure for {p_name}/{actual_id}: {err_str}")
+            p_cfg.record_platform_failure(c_dur)
         
-        logger.warning(f"Recording {err_type} failure for {p_name}/{actual_id}: {err_str}")
-        p_cfg.record_platform_failure(c_dur)
-        
-        RouterService._write_error_log(p_name, actual_id, err_type, err_str)
+        RouterService._write_error_log(p_name, actual_id, err_type, err_str, gw_error)
 
     @staticmethod
-    def _write_error_log(p_name: str, actual_id: str, err_type: str, err_str: str):
+    def _write_error_log(p_name: str, actual_id: str, err_type: str, err_str: str, error: Optional[GatewayError] = None):
         today = datetime.now().strftime("%Y-%m-%d")
         time_str = datetime.now().strftime("%H:%M:%S")
         
         header = f"=== {today} ==="
-        entry = f"{time_str} | {err_type} | {err_str} | {p_name}:{actual_id}"
+        if error:
+            status = error.status_code if error.status_code is not None else "-"
+            retryable = "retryable" if error.retryable else "skip-retry"
+            actions = []
+            if error.disable_key:
+                actions.append("key")
+            if error.disable_model:
+                actions.append("model")
+            if error.disable_provider:
+                actions.append("provider")
+            action_str = ",".join(actions) if actions else "none"
+            entry = (
+                f"{time_str} | {err_type} | status={status} | {retryable} | "
+                f"cooldown={action_str} | {err_str} | {p_name}:{actual_id}"
+            )
+        else:
+            entry = f"{time_str} | {err_type} | {err_str} | {p_name}:{actual_id}"
         
         try:
             need_header = True

@@ -119,6 +119,15 @@ settings:
     other_error: 3600        # 1小时
     provider_melt: 3600      # 1小时
 
+  # 上游错误策略：用 HTTP 状态码范围控制重试和冷却粒度
+  # 范围示例: "429,500-503,505-599"
+  error_policy:
+    retry_status_codes: "401-407,409-499,500-503,505-599"
+    skip_retry_status_codes: "400,408,422,504,524"
+    disable_key_status_codes: "401,403"
+    disable_model_status_codes: "404"
+    disable_provider_status_codes: ""
+
   # SSE 探测与优化设置
   stream_probe:
     small_model_timeout: 120       # 8B 级别首包超时

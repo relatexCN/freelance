@@ -14,6 +14,7 @@ from app.utils.tool_executor import ToolExecutor, format_tool_result
 from app.utils.responses import make_error_response
 from app.services.router import RouterService, get_provider_instance
 from app.services.streamer import StreamerService
+from app.services.gateway_errors import GatewayError
 
 logger = logging.getLogger("freelance.agent")
 
@@ -113,6 +114,14 @@ class AgentService:
                     last_err = str(e)
                     tried_details.append(f"{p_name}/{actual_id} error: {last_err}")
                     RouterService.record_failure(p_name, actual_id, e)
+                    if isinstance(e, GatewayError) and e.skip_retry:
+                        status_code = e.status_code if e.status_code is not None else 500
+                        return make_error_response(
+                            last_err,
+                            status_code=status_code,
+                            type=e.error_type,
+                            code=e.error_code,
+                        )
                     continue
             
             if not found_turn_response:

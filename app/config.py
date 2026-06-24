@@ -14,6 +14,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import Field, BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from app.services.gateway_errors import matches_status, parse_status_code_ranges
 
 # --- Advanced Path Resolution ---
 # 1. First, check the Current Working Directory (where the user is running the command)
@@ -73,6 +74,28 @@ class PoolSettings(BaseModel):
     stream: ConnectionPoolConfig = Field(default_factory=lambda: ConnectionPoolConfig(max_connections=100, max_keepalive=50, keepalive_expiry=600))
     batch: ConnectionPoolConfig = Field(default_factory=lambda: ConnectionPoolConfig(max_connections=200, max_keepalive=100, keepalive_expiry=60))
 
+class ErrorPolicySettings(BaseModel):
+    """Status-code based retry and cooldown policy."""
+    retry_status_codes: str = "401-407,409-499,500-503,505-599"
+    skip_retry_status_codes: str = "400,408,422,504,524"
+    disable_key_status_codes: str = "401,403"
+    disable_model_status_codes: str = "404"
+    disable_provider_status_codes: str = ""
+
+    def should_retry(self, status_code: Optional[int]) -> bool:
+        if matches_status(status_code, parse_status_code_ranges(self.skip_retry_status_codes)):
+            return False
+        return matches_status(status_code, parse_status_code_ranges(self.retry_status_codes))
+
+    def should_disable_key(self, status_code: Optional[int]) -> bool:
+        return matches_status(status_code, parse_status_code_ranges(self.disable_key_status_codes))
+
+    def should_disable_model(self, status_code: Optional[int]) -> bool:
+        return matches_status(status_code, parse_status_code_ranges(self.disable_model_status_codes))
+
+    def should_disable_provider(self, status_code: Optional[int]) -> bool:
+        return matches_status(status_code, parse_status_code_ranges(self.disable_provider_status_codes))
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -86,6 +109,7 @@ class Settings(BaseSettings):
     cooldown: CooldownSettings = Field(default_factory=CooldownSettings)
     stream_probe: StreamProbeSettings = Field(default_factory=StreamProbeSettings)
     connection_pool: PoolSettings = Field(default_factory=PoolSettings)
+    error_policy: ErrorPolicySettings = Field(default_factory=ErrorPolicySettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -343,6 +367,16 @@ class AppConfig:
                         for key, val in cp_data["batch"].items():
                             if hasattr(self.settings.connection_pool.batch, key):
                                 setattr(self.settings.connection_pool.batch, key, int(val))
+
+                if "error_policy" in s_data:
+                    ep_data = s_data["error_policy"]
+                    for key, val in ep_data.items():
+                        if hasattr(self.settings.error_policy, key):
+                            # Validate early so invalid rules fail at startup, not mid-request.
+                            parse_status_code_ranges(val)
+                            if isinstance(val, list):
+                                val = ",".join(str(item) for item in val)
+                            setattr(self.settings.error_policy, key, str(val))
 
             # Load providers
             provider_count = 0

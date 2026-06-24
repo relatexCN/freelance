@@ -24,6 +24,7 @@ from app.models.response import (
     UsageInfo,
 )
 from app.providers.base import BaseProvider
+from app.services.gateway_errors import GatewayError
 
 
 logger = logging.getLogger("freelance.provider")
@@ -78,6 +79,139 @@ class OpenAICompatibleProvider(BaseProvider):
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
+    def _extract_error_message(self, resp: httpx.Response) -> str:
+        try:
+            data = resp.json()
+            err = data.get("error")
+            if isinstance(err, dict):
+                return str(err.get("message") or err.get("code") or data)
+            if err:
+                return str(err)
+            return resp.text[:500]
+        except Exception:
+            return resp.text[:500]
+
+    def _classify_http_error(self, status_code: int, message: str, key_idx: int, actual_model: str) -> GatewayError:
+        policy = config.settings.error_policy
+        lower_msg = (message or "").lower()
+
+        error_type = "HTTPError"
+        error_code = f"http_{status_code}"
+        cooldown = config.settings.cooldown.other_error
+        disable_key = policy.should_disable_key(status_code)
+        key_fatal = disable_key
+        disable_model = policy.should_disable_model(status_code)
+        disable_provider = policy.should_disable_provider(status_code)
+
+        if status_code == 429:
+            error_type = "RateLimit"
+            cooldown = config.settings.cooldown.rate_limit_429
+            disable_key = True
+            key_fatal = False
+        elif status_code == 401:
+            error_type = "AuthError"
+            cooldown = config.settings.cooldown.auth_error_401
+        elif status_code == 403:
+            error_type = "Forbidden"
+            cooldown = config.settings.cooldown.forbidden_403
+        elif status_code == 404:
+            error_type = "ModelNotFound"
+            cooldown = config.settings.cooldown.other_error
+        elif 500 <= status_code <= 599:
+            error_type = "ServerError"
+            cooldown = config.settings.cooldown.provider_melt
+
+        if any(k in lower_msg for k in ["quota", "insufficient_quota", "credit", "balance", "insufficient balance"]):
+            error_type = "QuotaExceeded"
+            error_code = "quota_exceeded"
+            cooldown = config.settings.cooldown.quota_exceeded
+            disable_key = True
+            key_fatal = True
+
+        retryable = policy.should_retry(status_code)
+        return GatewayError(
+            message=message or f"HTTP {status_code}",
+            error_type=error_type,
+            status_code=status_code,
+            error_code=error_code,
+            retryable=retryable,
+            skip_retry=not retryable,
+            key_index=key_idx,
+            disable_key=disable_key,
+            key_fatal=key_fatal,
+            disable_model=disable_model,
+            disable_provider=disable_provider,
+            cooldown=cooldown,
+            provider=self.config.name,
+            model=actual_model,
+        )
+
+    def _classify_exception(self, exc: Exception, key_idx: int, actual_model: str) -> GatewayError:
+        if isinstance(exc, GatewayError):
+            return exc
+
+        err_msg = str(exc) or repr(exc)
+        lower_msg = err_msg.lower()
+        error_type = type(exc).__name__
+        error_code = "exception"
+        cooldown = 120
+        disable_key = False
+        key_fatal = False
+        disable_provider = False
+
+        if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, asyncio.TimeoutError)):
+            error_type = "Timeout" if "timeout" in lower_msg or isinstance(exc, asyncio.TimeoutError) else "NetworkError"
+            error_code = "timeout_network"
+            cooldown = min(config.settings.cooldown.timeout_network, 60)
+            disable_key = True
+            disable_provider = True
+        elif any(k in lower_msg for k in ["quota", "insufficient_quota", "credit", "balance", "insufficient balance"]):
+            error_type = "QuotaExceeded"
+            error_code = "quota_exceeded"
+            cooldown = config.settings.cooldown.quota_exceeded
+            disable_key = True
+            key_fatal = True
+
+        return GatewayError(
+            message=err_msg,
+            error_type=error_type,
+            error_code=error_code,
+            retryable=True,
+            key_index=key_idx,
+            disable_key=disable_key,
+            key_fatal=key_fatal,
+            disable_provider=disable_provider,
+            cooldown=cooldown,
+            provider=self.config.name,
+            model=actual_model,
+        )
+
+    def _record_gateway_error(self, err: GatewayError, actual_model: str):
+        cooldown = err.cooldown or config.settings.cooldown.other_error
+        if err.disable_key and err.key_index >= 0:
+            self.config.record_key_failure(err.key_index, cooldown, is_fatal=err.key_fatal)
+        if err.disable_model:
+            self.config.record_model_failure(actual_model, cooldown)
+
+    def _raise_exhausted(self, actual_model: str, last_error: Any):
+        err = GatewayError.from_exception(last_error, provider=self.config.name, model=actual_model)
+        raise GatewayError(
+            message=f"[{self.config.name}] Exhausted all keys for {actual_model}. Last Error: {err.message}",
+            error_type=err.error_type,
+            status_code=err.status_code,
+            error_code=err.error_code,
+            retryable=err.retryable,
+            skip_retry=err.skip_retry,
+            key_index=err.key_index,
+            disable_key=err.disable_key,
+            key_fatal=err.key_fatal,
+            disable_model=err.disable_model,
+            disable_provider=err.disable_provider,
+            cooldown=err.cooldown,
+            provider=self.config.name,
+            model=actual_model,
+        )
+
     async def chat_completion(
         self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
     ) -> ChatCompletionResponse:
@@ -120,58 +254,30 @@ class OpenAICompatibleProvider(BaseProvider):
                     
                     return self._parse_response(data, request.model)
                 
-                elif resp.status_code == 429:
-                    c_dur = config.settings.cooldown.rate_limit_429
-                    logger.warning(f"[{self.config.name}] Key[{key_idx}] hit 429 Rate Limit. Cooling down for {c_dur}s.")
-                    self.config.record_key_failure(key_idx, c_dur)
-                    last_error = f"Rate Limit (429) on key {key_idx}"
-                elif resp.status_code == 401:
-                    c_dur = config.settings.cooldown.auth_error_401
-                    logger.error(f"[{self.config.name}] Key[{key_idx}] returned 401 (Unauthorized). Cooling down for {c_dur}s.")
-                    self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
-                    last_error = f"HTTP 401 on key {key_idx}"
-                elif resp.status_code == 403:
-                    c_dur = config.settings.cooldown.forbidden_403
-                    logger.error(f"[{self.config.name}] Key[{key_idx}] returned 403 (Forbidden). Cooling down for {c_dur}s.")
-                    self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
-                    last_error = f"HTTP 403 on key {key_idx}"
-                elif resp.status_code == 404:
-                    c_dur = config.settings.cooldown.other_error # Fallback to other_error or 401? User asked for 3h
-                    logger.warning(f"[{self.config.name}] Key[{key_idx}] returned 404. Model {actual_model} likely unavailable. Cooling down for {c_dur}s.")
-                    self.config.record_model_failure(actual_model, c_dur)
-                    last_error = f"HTTP 404 (Model Not Found) on key {key_idx}"
-                elif resp.status_code == 400:
-                    # Pass-through 400 Bad Request directly to client without melting
-                    resp.raise_for_status()
                 else:
-                    resp.raise_for_status()
+                    err = self._classify_http_error(
+                        resp.status_code,
+                        self._extract_error_message(resp),
+                        key_idx,
+                        actual_model,
+                    )
+                    logger.warning(f"[{self.config.name}] {actual_model} failed: {err}")
+                    self._record_gateway_error(err, actual_model)
+                    last_error = err
+                    if err.skip_retry or err.disable_model:
+                        raise err
                 
-            except (httpx.HTTPStatusError, httpx.RequestError, asyncio.TimeoutError, Exception) as e:
-                err_msg = str(e) or repr(e)
-                last_error = err_msg
-                
-                # Check for Quota Exceeded in the error message
-                lower_err = err_msg.lower()
-                if any(k in lower_err for k in ["quota", "insufficient_quota", "credit", "balance", "insufficient balance"]):
-                    c_dur = config.settings.cooldown.quota_exceeded
-                    logger.error(f"[{self.config.name}] Key[{key_idx}] quota exceeded: {err_msg}. Cooling down for {c_dur}s.")
-                    self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
-                    # For total failure, re-raise or raise a specific error to allow router fallback
-                    raise Exception(f"Quota Exceeded: {err_msg}")
-
-                # If it's a 400, re-raise to exit provider loop and stop melting
-                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
-                    raise e
-
-                # Connection/Timeout handling
-                cooldown = 120 # Default
-                if isinstance(e, (httpx.ConnectError, httpx.TimeoutException, asyncio.TimeoutError)):
-                    cooldown = 60 # Shorter cooldown for network blips
-                    logger.warning(f"[{self.config.name}] Key[{key_idx}] network/timeout error: {type(e).__name__}. Cooldown {cooldown}s.")
-                else:
-                    logger.warning(f"[{self.config.name}] Key[{key_idx}] failed: {err_msg}. Cooldown {cooldown}s.")
-                
-                self.config.record_key_failure(key_idx, cooldown)
+            except GatewayError as e:
+                last_error = e
+                if e.skip_retry or e.disable_model:
+                    raise
+            except Exception as e:
+                err = self._classify_exception(e, key_idx, actual_model)
+                last_error = err
+                logger.warning(f"[{self.config.name}] Key[{key_idx}] failed: {err}")
+                self._record_gateway_error(err, actual_model)
+                if err.skip_retry or err.disable_model:
+                    raise err
                 
             if attempt < num_keys - 1:
                 logger.info(f"[{self.config.name}] Attempt {attempt+1} failed ({last_error}), trying next key...")
@@ -181,7 +287,7 @@ class OpenAICompatibleProvider(BaseProvider):
         if "Timeout" in str(last_error) or "timeout" in str(last_error):
             logger.warning(f"[{self.config.name}] All keys timed out for {actual_model}. Letting router decide melting strategy.")
 
-        raise Exception(f"[{self.config.name}] Exhausted all keys for {actual_model}. Last Error: {last_error}")
+        self._raise_exhausted(actual_model, last_error)
 
     def _parse_response(self, data: dict, model_alias: str) -> ChatCompletionResponse:
         """Helper to parse OpenAI JSON into ChatCompletionResponse."""
@@ -267,9 +373,21 @@ class OpenAICompatibleProvider(BaseProvider):
                         try:
                             first_chunk = await asyncio.wait_for(lines_iter.__anext__(), timeout=effective_timeout)
                         except asyncio.TimeoutError:
-                            logger.error(f"[{self.config.name}] First chunk timeout for {actual_model} using key[{key_idx}] ({effective_timeout}s)")
-                            self.config.record_key_failure(key_idx, 60)  # Short cooldown for timeout
-                            last_error = f"First chunk timeout ({effective_timeout}s)"
+                            err = GatewayError(
+                                message=f"First chunk timeout ({effective_timeout}s)",
+                                error_type="StreamFirstChunkTimeout",
+                                error_code="first_chunk_timeout",
+                                retryable=True,
+                                key_index=key_idx,
+                                disable_key=True,
+                                disable_provider=True,
+                                cooldown=min(config.settings.cooldown.timeout_network, 60),
+                                provider=self.config.name,
+                                model=actual_model,
+                            )
+                            logger.error(f"[{self.config.name}] {err}")
+                            self._record_gateway_error(err, actual_model)
+                            last_error = err
                             continue  # Try next key
                         
                         # Process first chunk
@@ -300,71 +418,31 @@ class OpenAICompatibleProvider(BaseProvider):
                         
                         return # Success
 
-                    elif resp.status_code == 429:
-                        await resp.aread()
-                        c_dur = config.settings.cooldown.rate_limit_429
-                        logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] hit 429. Cooling down {c_dur}s.")
-                        self.config.record_key_failure(key_idx, c_dur)
-                        last_error = f"Rate Limit (429) on key {key_idx}"
-                    elif resp.status_code == 401:
-                        await resp.aread()
-                        c_dur = config.settings.cooldown.auth_error_401
-                        logger.error(f"[{self.config.name}] Stream Key[{key_idx}] returned 401. Cooling down {c_dur}s.")
-                        self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
-                        last_error = f"HTTP 401"
-                    elif resp.status_code == 403:
-                        await resp.aread()
-                        c_dur = config.settings.cooldown.forbidden_403
-                        logger.error(f"[{self.config.name}] Stream Key[{key_idx}] returned 403. Cooling down {c_dur}s.")
-                        self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
-                        last_error = f"HTTP 403"
-                    elif resp.status_code == 404:
-                        await resp.aread()
-                        c_dur = config.settings.cooldown.other_error
-                        logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] returned 404 for {actual_model}. Disabling model for {c_dur}s.")
-                        self.config.record_model_failure(actual_model, c_dur)
-                        last_error = f"HTTP 404 (Model Not Found)"
-                    elif resp.status_code == 400:
-                        # Bad Request - return error message to client
-                        await resp.aread()
-                        try:
-                            error_detail = resp.json()
-                            error_msg = error_detail.get("error", {}).get("message", str(resp.status_code))
-                        except:
-                            error_msg = f"Bad Request: {resp.text[:200]}"
-                        logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] returned 400: {error_msg}")
-                        raise Exception(f"Bad Request: {error_msg}")
                     else:
                         await resp.aread()
-                        resp.raise_for_status()
+                        err = self._classify_http_error(
+                            resp.status_code,
+                            self._extract_error_message(resp),
+                            key_idx,
+                            actual_model,
+                        )
+                        logger.warning(f"[{self.config.name}] Streaming {actual_model} failed: {err}")
+                        self._record_gateway_error(err, actual_model)
+                        last_error = err
+                        if err.skip_retry or err.disable_model:
+                            raise err
                         
-            except (httpx.HTTPStatusError, httpx.RequestError, asyncio.TimeoutError, Exception) as e:
-                err_msg = str(e) or repr(e)
-                last_error = err_msg
-                
-                # Check for Quota Exceeded in the error message
-                lower_err = err_msg.lower()
-                if any(k in lower_err for k in ["quota", "insufficient_quota", "credit", "balance"]):
-                    c_dur = config.settings.cooldown.quota_exceeded
-                    logger.error(f"[{self.config.name}] Stream Key[{key_idx}] quota exceeded: {err_msg}. Cooling down for {c_dur}s.")
-                    self.config.record_key_failure(key_idx, c_dur, is_fatal=True)
-                    raise Exception(f"Quota Exceeded")
-
-                # Handle 400 Bad Request separately - don't retry, return error to client
-                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
-                    try:
-                        error_detail = e.response.json()
-                        error_msg = error_detail.get("error", {}).get("message", str(e.response.status_code))
-                    except:
-                        error_msg = f"Bad Request: {e.response.text[:200]}"
-                    logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] returned 400: {error_msg}")
-                    raise Exception(f"Bad Request: {error_msg}")
-
-                cooldown = 120
-                if isinstance(e, (httpx.ConnectError, httpx.TimeoutException, asyncio.TimeoutError)):
-                    cooldown = 60
-                logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] failed: {type(e).__name__}. Cooldown {cooldown}s.")
-                self.config.record_key_failure(key_idx, cooldown)
+            except GatewayError as e:
+                last_error = e
+                if e.skip_retry or e.disable_model:
+                    raise
+            except Exception as e:
+                err = self._classify_exception(e, key_idx, actual_model)
+                last_error = err
+                logger.warning(f"[{self.config.name}] Stream Key[{key_idx}] failed: {err}")
+                self._record_gateway_error(err, actual_model)
+                if err.skip_retry or err.disable_model:
+                    raise err
                 
             if attempt < num_keys - 1:
                 logger.info(f"[{self.config.name}] Stream attempt {attempt+1} failed ({last_error}), trying next key...")
@@ -373,10 +451,7 @@ class OpenAICompatibleProvider(BaseProvider):
         if "Timeout" in str(last_error) or "timeout" in str(last_error):
             logger.warning(f"[{self.config.name}] All keys timed out for streaming {actual_model}. Letting router decide fallback.")
 
-        raise Exception(f"[{self.config.name}] Exhausted all keys for streaming {actual_model}. Last Error: {last_error}")
-        
-        if last_error:
-            raise Exception(f"[{self.config.name}] Streaming failed: {last_error}")
+        self._raise_exhausted(actual_model, last_error)
 
     async def list_models(self) -> list[dict[str, Any]]:
         """List available models with automatic key rotation."""
