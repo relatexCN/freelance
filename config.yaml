@@ -3,6 +3,16 @@
 # Format: "model_alias" -> provider + actual model name
 
 providers:
+  # Optional provider-level pass-through controls:
+  # pass_through_body: false          # Forward the original JSON body after forcing model/stream.
+  # header_passthrough: ["x-request-id", "re:^x-custom-"]
+  # header_overrides:
+  #   X-Provider-Feature: "enabled"
+  #   X-Client-Trace: "{client_header:x-trace-id}"
+  # disabled_fields: ["stream_options.include_obfuscation", "service_tier"]
+  # param_overrides:
+  #   - { op: "set", path: "reasoning.enabled", value: true }
+  #   - { op: "delete", path: "temperature" }
   ollama:
     type: openai
     base_url: https://ollama.com/v1

@@ -5,6 +5,7 @@ Provides an adapter for OpenRouter, Groq, Cerebras, GitHub Models, and other AI 
 
 import json
 import logging
+import re
 import time
 import uuid
 import asyncio
@@ -28,6 +29,27 @@ from app.services.gateway_errors import GatewayError
 
 
 logger = logging.getLogger("freelance.provider")
+
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+_PASSTHROUGH_SKIP_HEADERS = _HOP_BY_HOP_HEADERS | {
+    "host",
+    "content-length",
+    "accept-encoding",
+    "authorization",
+    "x-api-key",
+    "x-goog-api-key",
+    "cookie",
+}
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -78,6 +100,147 @@ class OpenAICompatibleProvider(BaseProvider):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
+
+    def _client_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
+        headers = getattr(request, "_gateway_headers", {}) or {}
+        return {str(k).lower(): str(v) for k, v in headers.items()}
+
+    def _should_passthrough_header(self, name: str) -> bool:
+        lower_name = name.lower()
+        if lower_name in _PASSTHROUGH_SKIP_HEADERS:
+            return False
+
+        rules = self.config.header_passthrough
+        if not rules:
+            return False
+
+        for rule in rules:
+            rule_s = str(rule).strip()
+            if not rule_s:
+                continue
+            rule_l = rule_s.lower()
+            if rule_s == "*":
+                return True
+            if rule_l.startswith("re:") or rule_l.startswith("regex:"):
+                pattern = rule_s.split(":", 1)[1].strip()
+                if pattern and re.search(pattern, name, flags=re.IGNORECASE):
+                    return True
+                continue
+            if lower_name == rule_l:
+                return True
+        return False
+
+    def _resolve_header_value(self, value: Any, api_key: str, client_headers: dict[str, str]) -> Optional[str]:
+        text = str(value)
+        stripped = text.strip()
+        if stripped.startswith("{client_header:") and stripped.endswith("}"):
+            header_name = stripped[len("{client_header:"):-1].strip().lower()
+            return client_headers.get(header_name)
+        return text.replace("{api_key}", api_key or "")
+
+    def _set_header(self, headers: dict[str, str], name: str, value: str):
+        lower_name = name.lower()
+        for existing in list(headers.keys()):
+            if existing.lower() == lower_name and existing != name:
+                del headers[existing]
+        headers[name] = value
+
+    def _build_request_headers(self, request: ChatCompletionRequest, api_key: str) -> dict[str, str]:
+        headers = self._build_headers(api_key)
+        client_headers = self._client_headers(request)
+
+        for name, value in client_headers.items():
+            if self._should_passthrough_header(name):
+                self._set_header(headers, name, value)
+
+        for name, value in self.config.header_overrides.items():
+            if not str(name).strip():
+                continue
+            resolved = self._resolve_header_value(value, api_key, client_headers)
+            if resolved is not None and resolved.strip():
+                self._set_header(headers, str(name), resolved)
+        return headers
+
+    def _delete_path(self, data: Any, path: str):
+        parts = [p for p in str(path).split(".") if p]
+        if not parts:
+            return
+        current = data
+        for part in parts[:-1]:
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list) and part.isdigit():
+                idx = int(part)
+                current = current[idx] if 0 <= idx < len(current) else None
+            else:
+                return
+            if current is None:
+                return
+        last = parts[-1]
+        if isinstance(current, dict):
+            current.pop(last, None)
+        elif isinstance(current, list) and last.isdigit():
+            idx = int(last)
+            if 0 <= idx < len(current):
+                current.pop(idx)
+
+    def _set_path(self, data: Any, path: str, value: Any):
+        parts = [p for p in str(path).split(".") if p]
+        if not parts or not isinstance(data, dict):
+            return
+        current = data
+        for part in parts[:-1]:
+            if not isinstance(current, dict):
+                return
+            if part not in current or not isinstance(current[part], dict):
+                current[part] = {}
+            current = current[part]
+        current[parts[-1]] = value
+
+    def _apply_body_rules(self, payload: dict[str, Any]) -> dict[str, Any]:
+        for field in self.config.disabled_fields:
+            self._delete_path(payload, str(field))
+
+        for override in self.config.param_overrides:
+            if not isinstance(override, dict):
+                continue
+            op = str(override.get("op") or override.get("operation") or "set").lower()
+            path = override.get("path") or override.get("field")
+            if not path:
+                continue
+            if op == "delete":
+                self._delete_path(payload, str(path))
+            elif op == "set":
+                self._set_path(payload, str(path), override.get("value"))
+        return payload
+
+    def _build_payload(self, request: ChatCompletionRequest, actual_model: str, stream: bool) -> dict[str, Any]:
+        if self.config.pass_through_body:
+            raw_body = getattr(request, "_gateway_raw_body", b"") or b""
+            try:
+                payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except Exception:
+                logger.warning(f"[{self.config.name}] Failed to parse raw body for pass-through; falling back to normalized payload")
+                payload = request.to_provider_payload(actual_model)
+        else:
+            payload = request.to_provider_payload(actual_model)
+
+        payload["model"] = actual_model
+        payload["stream"] = stream
+        return self._apply_body_rules(payload)
+
+    def _build_request_kwargs(self, request: ChatCompletionRequest, actual_model: str, api_key: str, stream: bool) -> dict[str, Any]:
+        payload = self._build_payload(request, actual_model, stream)
+        headers = self._build_request_headers(request, api_key)
+        if self.config.pass_through_body or self.config.param_overrides or self.config.disabled_fields:
+            return {
+                "content": json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                "headers": headers,
+            }
+        return {
+            "json": payload,
+            "headers": headers,
+        }
 
     def _extract_error_message(self, resp: httpx.Response) -> str:
         try:
@@ -216,9 +379,6 @@ class OpenAICompatibleProvider(BaseProvider):
         self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
     ) -> ChatCompletionResponse:
         """Non-streaming chat completion with internal multi-key retry logic."""
-        payload = request.to_provider_payload(actual_model)
-        payload["stream"] = False
-
         url = f"{self.config.base_url}/chat/completions"
         effective_timeout = timeout if timeout is not None else self.config.timeout
         
@@ -234,10 +394,10 @@ class OpenAICompatibleProvider(BaseProvider):
             logger.info(f"[{self.config.name}] Requesting {actual_model} using key[{key_idx}]: {masked_key} (attempt {attempt+1}/{num_keys})")
             
             try:
+                request_kwargs = self._build_request_kwargs(request, actual_model, api_key, stream=False)
                 resp = await self.batch_client.post(
-                    url, 
-                    json=payload, 
-                    headers=self._build_headers(api_key),
+                    url,
+                    **request_kwargs,
                     timeout=effective_timeout
                 )
                 
@@ -326,9 +486,6 @@ class OpenAICompatibleProvider(BaseProvider):
         self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
     ) -> AsyncIterator[str]:
         """Streaming chat completion with internal multi-key retry logic."""
-        payload = request.to_provider_payload(actual_model)
-        payload["stream"] = True
-
         url = f"{self.config.base_url}/chat/completions"
         effective_timeout = timeout if timeout is not None else self.config.timeout
         
@@ -344,11 +501,11 @@ class OpenAICompatibleProvider(BaseProvider):
             logger.info(f"[{self.config.name}] Streaming {actual_model} using key[{key_idx}]: {masked_key} (attempt {attempt+1}/{num_keys})")
             
             try:
+                request_kwargs = self._build_request_kwargs(request, actual_model, api_key, stream=True)
                 async with self.stream_client.stream(
                     "POST", 
                     url, 
-                    json=payload, 
-                    headers=self._build_headers(api_key),
+                    **request_kwargs,
                     timeout=httpx.Timeout(
                         connect=10.0,
                         read=effective_timeout,

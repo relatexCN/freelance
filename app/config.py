@@ -130,13 +130,32 @@ def _resolve_env_vars(value: str, settings: Settings) -> str:
 class ProviderConfig:
     """Configuration for a single provider."""
 
-    def __init__(self, name: str, base_url: str, provider_type: str = "openai", api_key: str = "", timeout: int = 120, score_offset: float = 0.0, default_model: str = ""):
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        provider_type: str = "openai",
+        api_key: str = "",
+        timeout: int = 120,
+        score_offset: float = 0.0,
+        default_model: str = "",
+        pass_through_body: bool = False,
+        header_overrides: Optional[dict] = None,
+        header_passthrough: Optional[list] = None,
+        param_overrides: Optional[list] = None,
+        disabled_fields: Optional[list] = None,
+    ):
         self.name = name
         self.provider_type = provider_type
         self.base_url = base_url.rstrip("/")
         self.score_offset = score_offset  # Manual boost/penalty for this provider
         self.timeout = timeout
         self.default_model = default_model  # Default model to use in auto mode
+        self.pass_through_body = pass_through_body
+        self.header_overrides = header_overrides or {}
+        self.header_passthrough = header_passthrough or []
+        self.param_overrides = param_overrides or []
+        self.disabled_fields = disabled_fields or []
         
         # Internal API key pool and round-robin counter
         self.api_keys = []
@@ -388,11 +407,21 @@ class AppConfig:
                 timeout = pconf.get("timeout", 120)
                 score_offset = float(pconf.get("score_offset", 0.0))
                 default_model = pconf.get("default_model", "")
+                pass_through_body = bool(pconf.get("pass_through_body", False))
+                header_overrides = pconf.get("header_overrides", {}) or {}
+                header_passthrough = pconf.get("header_passthrough", []) or []
+                param_overrides = pconf.get("param_overrides", []) or []
+                disabled_fields = pconf.get("disabled_fields", []) or []
                 
                 self.providers[name] = ProviderConfig(
                     name=name, base_url=base_url, provider_type=provider_type, 
                     api_key=api_key, timeout=timeout, score_offset=score_offset,
-                    default_model=default_model
+                    default_model=default_model,
+                    pass_through_body=pass_through_body,
+                    header_overrides=header_overrides,
+                    header_passthrough=header_passthrough,
+                    param_overrides=param_overrides,
+                    disabled_fields=disabled_fields,
                 )
                 provider_count += 1
             

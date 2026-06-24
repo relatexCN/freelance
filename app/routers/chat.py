@@ -25,6 +25,10 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
     model_name = (request.model or "auto").lower()
     last_msg = request.messages[-1].content[:50] if request.messages else ""
     logger.info(f"[*] REQ: {model_name} | Stream: {request.stream} | Msg: {last_msg}...")
+
+    # Keep the original client request available for provider-level pass-through.
+    object.__setattr__(request, "_gateway_raw_body", await fastapi_request.body())
+    object.__setattr__(request, "_gateway_headers", dict(fastapi_request.headers))
     
     # Initialize AgentService and run orchestration
     agent = AgentService(fastapi_request)
