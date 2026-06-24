@@ -23,22 +23,22 @@ class AgentService:
         self.fastapi_request = fastapi_request
         self.executor = ToolExecutor()
 
-    async def _process_tool_calls(self, content: str) -> List[dict]:
-        if not has_xml_tool_call(content):
-            logger.debug(f'[TOOL CALL] No XML tool call detected')
-            return []
-        
-        tool_calls = xml_to_tool_calls(content)
-        if not tool_calls:
-            logger.debug(f'[TOOL CALL] XML detected but no tool calls parsed')
-            return []
-        
+    def _tool_mode(self) -> str:
+        return config.settings.tools.normalized_mode()
+
+    async def _execute_tool_calls(self, tool_calls: List[dict]) -> List[dict]:
         results = []
         for tc in tool_calls:
-            name = tc["function"]["name"]
-            tc_id = tc["id"]
+            function = tc.get("function") or {}
+            name = function.get("name")
+            tc_id = tc.get("id")
+            if not name or not tc_id:
+                continue
             try:
-                args = json.loads(tc["function"]["arguments"])
+                raw_args = function.get("arguments") or "{}"
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                if not isinstance(args, dict):
+                    args = {"value": args}
                 res = await self.executor.execute(name, **args)
                 results.append(format_tool_result(tc_id, res))
             except Exception as e:
@@ -48,6 +48,31 @@ class AgentService:
                     "content": json.dumps({"success": False, "error": str(e)})
                 })
         return results
+
+    async def _process_xml_tool_calls(self, content: str) -> List[dict]:
+        if not has_xml_tool_call(content):
+            logger.debug(f'[TOOL CALL] No XML tool call detected')
+            return []
+        
+        tool_calls = xml_to_tool_calls(content)
+        if not tool_calls:
+            logger.debug(f'[TOOL CALL] XML detected but no tool calls parsed')
+            return []
+
+        return await self._execute_tool_calls(tool_calls)
+
+    async def _process_native_tool_calls(self, tool_calls: Optional[List[dict]]) -> List[dict]:
+        if not tool_calls:
+            return []
+        logger.info(f"[TOOL CALL] Executing {len(tool_calls)} native tool call(s)")
+        return await self._execute_tool_calls(tool_calls)
+
+    def _append_assistant_message(self, request: ChatCompletionRequest, message):
+        request.messages.append(ChatMessage(
+            role=message.role,
+            content=message.content,
+            tool_calls=message.tool_calls,
+        ))
 
     async def run(self, request: ChatCompletionRequest):
         model_name = (request.model or "auto").lower()
@@ -92,18 +117,23 @@ class AgentService:
                         if p_cfg:
                             p_cfg.reset_consecutive_failures()
                         
-                        content = resp.choices[0].message.content or ""
-                        tool_results = await self._process_tool_calls(content)
-                        
+                        message = resp.choices[0].message
+                        content = message.content or ""
+                        tool_results = []
+                        if self._tool_mode() == "local_agent":
+                            tool_results = await self._process_native_tool_calls(message.tool_calls)
+                            if not tool_results:
+                                tool_results = await self._process_xml_tool_calls(content)
+
                         if tool_results and iteration < max_iterations:
-                            request.messages.append(resp.choices[0].message)
+                            self._append_assistant_message(request, message)
                             for tr in tool_results:
                                 request.messages.append(ChatMessage(**tr))
                             found_turn_response = True
                             break
                         else:
-                            # OpenAI Compliance: Strip XML from final content
-                            if has_xml_tool_call(content):
+                            # In local-agent mode, hide XML tool markup from final user-facing content.
+                            if self._tool_mode() == "local_agent" and has_xml_tool_call(content):
                                 from app.utils.tool_converter import extract_xml_block
                                 text_before, _, text_after = extract_xml_block(content)
                                 final_content = (text_before or "") + (text_after or "")
@@ -163,6 +193,16 @@ class AgentService:
         p_cfg = config.providers.get(p_name)
         if p_cfg:
             p_cfg.reset_consecutive_failures()
+
+        if self._tool_mode() != "local_agent":
+            async def passthrough_gen():
+                yield first_chunk
+                async for chunk in StreamerService.stream_with_heartbeat(gen, p_name, actual_id, self.fastapi_request):
+                    if await self.fastapi_request.is_disconnected():
+                        break
+                    yield chunk
+
+            return StreamingResponse(passthrough_gen(), media_type="text/event-stream")
 
         async def agent_gen(current_gen, current_id, current_first, current_iter):
             full_content = ""
@@ -281,7 +321,7 @@ class AgentService:
             
             # Turn continuation check
             if has_xml_tool_call(full_content) and current_iter < max_iterations:
-                tool_results = await self._process_tool_calls(full_content)
+                tool_results = await self._process_xml_tool_calls(full_content)
                 if tool_results:
                     request.messages.append(ChatMessage(role="assistant", content=full_content))
                     for tr in tool_results:

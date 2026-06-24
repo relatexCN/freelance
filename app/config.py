@@ -96,6 +96,17 @@ class ErrorPolicySettings(BaseModel):
     def should_disable_provider(self, status_code: Optional[int]) -> bool:
         return matches_status(status_code, parse_status_code_ranges(self.disable_provider_status_codes))
 
+class ToolSettings(BaseModel):
+    """Tool-call handling mode."""
+    # passthrough: forward tool definitions/calls without local execution.
+    # local_agent: execute supported tool calls inside this gateway.
+    # disabled: remove tool request controls before sending upstream.
+    mode: str = "passthrough"
+
+    def normalized_mode(self) -> str:
+        mode = (self.mode or "passthrough").strip().lower()
+        return mode if mode in {"passthrough", "local_agent", "disabled"} else "passthrough"
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -110,6 +121,7 @@ class Settings(BaseSettings):
     stream_probe: StreamProbeSettings = Field(default_factory=StreamProbeSettings)
     connection_pool: PoolSettings = Field(default_factory=PoolSettings)
     error_policy: ErrorPolicySettings = Field(default_factory=ErrorPolicySettings)
+    tools: ToolSettings = Field(default_factory=ToolSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -396,6 +408,14 @@ class AppConfig:
                             if isinstance(val, list):
                                 val = ",".join(str(item) for item in val)
                             setattr(self.settings.error_policy, key, str(val))
+
+                if "tools" in s_data:
+                    tools_data = s_data["tools"] or {}
+                    if "mode" in tools_data:
+                        mode = str(tools_data["mode"]).strip().lower()
+                        if mode not in {"passthrough", "local_agent", "disabled"}:
+                            raise ValueError(f"Invalid tools.mode: {mode}")
+                        self.settings.tools.mode = mode
 
             # Load providers
             provider_count = 0

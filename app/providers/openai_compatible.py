@@ -198,6 +198,10 @@ class OpenAICompatibleProvider(BaseProvider):
         current[parts[-1]] = value
 
     def _apply_body_rules(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if config.settings.tools.normalized_mode() == "disabled":
+            for field in ("tools", "tool_choice", "parallel_tool_calls"):
+                payload.pop(field, None)
+
         for field in self.config.disabled_fields:
             self._delete_path(payload, str(field))
 

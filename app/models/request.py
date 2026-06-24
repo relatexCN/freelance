@@ -44,6 +44,7 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     tools: Optional[list[dict[str, Any]]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
+    parallel_tool_calls: Optional[bool] = None
     response_format: Optional[ResponseFormat] = None
 
     model_config = {"extra": "allow"}
