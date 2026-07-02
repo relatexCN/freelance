@@ -1,510 +1,895 @@
-# Freelance API Gateway 🚀
+# Freelance API Gateway
 
-高性能、多厂家、智能分流的 OpenAI 兼容 API 中转网关。
+Freelance API Gateway 是一个 OpenAI 兼容的多供应商 LLM 网关。客户端只需要调用统一的 `/v1/chat/completions`、`/v1/models` 等接口，网关会根据 `config.yaml` 中的供应商、模型别名、默认模型和错误策略，把请求转发到实际上游。
 
-本项目通过统一的 OpenAI 标准接口，聚合了 **Ollama (Cloud)**, **OpenRouter**, **Google Gemini**, **Groq**, **Cerebras**, **GitHub Models** 等数十个顶级算力平台。只需要在 `.env` 中配置模型提供商的 API Key 即可。灵感来自 FREERIDE 项目。
+当前项目重点能力：
 
-> **全自动、零配置的白嫖体验**：
-> 如果你在请求中不指定任何模型名，或者模型名为空，网关会自动为你接通当前评分最高的免费模型。
+- 统一 OpenAI Chat Completions API。
+- 多供应商接入，包括 Ollama Cloud、OpenRouter、Groq、Cerebras、SambaNova、NVIDIA、Mistral、Hyperbolic、Novita、Nebius、Google Gemini 等 OpenAI-compatible 上游。
+- 自动模型发现、评分和缓存。
+- `auto` 模式下按分数和供应商默认模型策略选择候选模型。
+- 同一供应商内支持多个 API key 轮询和冷却。
+- 按 HTTP 状态码统一分类错误，并控制 key、model、provider 的冷却策略。
+- 支持 provider 级别的 body、header、参数透传配置。
+- 支持 OpenAI 原生工具调用透传，也可切换为本地 Agent 工具执行模式。
 
-***
+## 项目结构
 
-## ✨ 核心特性
+```text
+app/
+  main.py                         FastAPI 入口、鉴权、中间件、模型缓存刷新、健康检查
+  config.py                       读取 .env/config.yaml，维护供应商、模型路由、错误策略
+  scoring.py                      模型评分、免费/付费过滤、排序
+  cli.py                          freelance-api 命令入口
+  models/
+    request.py                    ChatCompletion 请求模型
+    response.py                   OpenAI 兼容响应模型
+  providers/
+    base.py                       Provider 抽象基类
+    openai_compatible.py          OpenAI-compatible 上游实现，请求透传、key 轮询、错误分类
+  routers/
+    chat.py                       /chat/completions、/models 路由
+    stats.py                      统计接口
+  services/
+    agent.py                      请求编排、多模型尝试、工具调用模式
+    router.py                     模型候选生成、provider/model 可用性判断、错误日志
+    gateway_errors.py             统一错误对象和状态码规则
+    streamer.py                   SSE 流式心跳和首包超时策略
+    stats_service.py              请求统计
+  utils/
+    responses.py                  OpenAI 风格错误响应
+    tool_converter.py             XML 工具调用解析
+    tool_executor.py              本地工具执行
 
-- **🎯 零参数智能选模**: 请求中不传递 `model` 参数时，默认自动查询并路由到当前最优的可用模型。
-- **📊 全量战斗力可视化**: `/v1/models` 接口默认返回所有已配置厂商的模型排行，并在 `owned_by` 中量化显示实力得分。
-- **🛡️ 工业级高可用机制**:
-  - **并发发现 (Parallel Discovery)**: 并行抓取所有 Provider 模型列表，刷新效率提升 300%。
-  - **启动预热 (Initial Hot Load)**: 启动时完成首次同步，确保上线即具备网关能力。
-  - **阶梯式超时 (Tiered Timeout)**: 首选模型 20s 快速 Failover，后续尝试恢复标准超时，保障稳定性。
-  - **单次请求熔断 (Circuit Breaker)**: Provider 连续失败 2 次后在本次请求中自动避开该厂商，配置位置在config.yaml中的max_retries。
-- **⚡ 极速推理支持**: 原生对接 Groq, Cerebras 等低延迟厂家。
-
-***
-
-## 📡 API 接口参考
-
-完全兼容 OpenAI SDK。
-
-### 基础信息
-
-| 项    | 值                                                      |
-| ---- | ------------------------------------------------------ |
-| 基础路径 | `http://localhost:8000`                                |
-| 认证方式 | `Authorization: Bearer <GATEWAY_KEY>`                  |
-| 内容类型 | `application/json`                                     |
-| 字符编码 | UTF-8                                                  |
-
-***
-
-## 🔌 核心接口详解
-
-### 1. 聊天补全接口
-
-**接口地址**: `POST /v1/chat/completions`\
-**兼容路径**: `POST /chat/completions` (无 `/v1` 前缀也支持)
-
-#### 请求参数
-
-| 参数名                         | 类型            | 必填 | 默认值      | 说明                                                                                               |
-| --------------------------- | ------------- | -- | -------- | ------------------------------------------------------------------------------------------------ |
-| **model**                   | string        | 否  | `"auto"` | 模型名称。特殊值：- `auto`: 自动选择最优模型- `free`: 仅使用免费模型- `best-free`: 最优免费模型- 具体模型名: 如 `gpt-4o`, `llama3` 等 |
-| **messages**                | array         | 是  | -        | 消息历史数组，包含对话上下文                                                                                   |
-| **temperature**             | float         | 否  | null     | 采样温度，范围 `0.0~2.0`。值越高越随机，越低越确定                                                                   |
-| **top\_p**                  | float         | 否  | null     | 核采样参数，范围 `0.0~1.0`。与 `temperature` 二选一使用                                                         |
-| **n**                       | integer       | 否  | null     | 生成的聊天补全选择数量                                                                                      |
-| **stream**                  | boolean       | 否  | `false`  | 是否使用流式响应。`true` 时返回 SSE 流                                                                        |
-| **stop**                    | string/array  | 否  | null     | 停止序列，遇到该序列时停止生成                                                                                  |
-| **max\_tokens**             | integer       | 否  | null     | 生成的最大 token 数                                                                                    |
-| **max\_completion\_tokens** | integer       | 否  | null     | 补全的最大 token 数（OpenAI 新参数）                                                                        |
-| **presence\_penalty**       | float         | 否  | null     | 存在惩罚，范围 `-2.0~2.0`。正值增加新话题的可能性                                                                   |
-| **frequency\_penalty**      | float         | 否  | null     | 频率惩罚，范围 `-2.0~2.0`。正值减少重复内容                                                                      |
-| **logit\_bias**             | object        | 否  | null     | 修改指定 token 出现的概率                                                                                 |
-| **logprobs**                | boolean       | 否  | null     | 是否返回对数概率                                                                                         |
-| **top\_logprobs**           | integer       | 否  | null     | 返回最可能的 N 个 token 及其对数概率                                                                          |
-| **user**                    | string        | 否  | null     | 最终用户唯一标识符，用于滥用检测                                                                                 |
-| **seed**                    | integer       | 否  | null     | 随机种子，用于可重复生成                                                                                     |
-| **tools**                   | array         | 否  | null     | 可用工具列表，支持函数调用                                                                                    |
-| **tool\_choice**            | string/object | 否  | null     | 工具选择策略：`auto`, `none`, 或指定工具                                                                     |
-| **response\_format**        | object        | 否  | null     | 响应格式配置                                                                                           |
-
-#### messages 对象结构
-
-每个消息对象包含：
-
-| 字段                 | 类型           | 必填 | 说明                                                                                         |
-| ------------------ | ------------ | -- | ------------------------------------------------------------------------------------------ |
-| **role**           | string       | 是  | 消息角色：- `system`: 系统提示- `user`: 用户消息- `assistant`: 助手回复- `developer`: 开发者提示- `tool`: 工具调用结果 |
-| **content**        | string/array | 否  | 消息内容。可以是字符串或多模态内容数组                                                                        |
-| **name**           | string       | 否  | 参与者名称                                                                                      |
-| **tool\_calls**    | array        | 否  | 工具调用列表，由助手返回                                                                               |
-| **tool\_call\_id** | string       | 否  | 工具调用 ID，用于关联结果                                                                             |
-
-#### response\_format 对象
-
-用于指定响应格式：
-
-```json
-{
-  "type": "json_object",
-  "schema": { ... }
-}
+config.yaml                       供应商、模型别名、超时、冷却、透传、工具模式配置
+.env                              网关 key 和供应商 API key
+latest_models.log                 最近一次模型发现和实际路由候选说明
+error_models.log                  按天追加的模型调用错误日志
+freelance.log                     网关运行日志
 ```
 
-- `type`: `text` 或 `json_object`
-- 当 `type=json_object` 时，模型会输出有效的 JSON
+## 使用前必读
 
-#### 请求示例
+强烈建议在启动前，为每个启用的供应商配置 `default_model`。
+
+```yaml
+providers:
+  openrouter:
+    default_model: nvidia/nemotron-3-super-120b-a12b:free
+
+  nvidia:
+    default_model: minimaxai/minimax-m2.7
+```
+
+原因：`auto/free/best-free` 会走自动路由。如果某个供应商没有配置 `default_model`，该供应商从 `/models` 返回的所有模型都会按评分进入候选列表，实际调用模型可能随上游模型列表和评分变化而变化。配置 `default_model` 后，该供应商在自动路由中只尝试你指定的默认模型，调用行为更稳定、更可控，也更方便排查供应商兼容性和成本问题。
+
+## 安装与启动
+
+项目支持 Python 3.8+。推荐优先使用仓库内置脚本启动：脚本会自动检查 Python、创建 `.venv`、安装依赖，并把命令转发给 `app.cli`。
+
+### 1. 准备配置文件
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Linux / macOS：
 
 ```bash
-# 智能选模示例
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <GATEWAY_KEY>" \
-  -d '{
-    "model": "auto",
-    "messages": [
-      {
-        "role": "system",
-        "content": "你是一个有用的助手。"
-      },
-      {
-        "role": "user",
-        "content": "你好，请介绍一下自己。"
-      }
-    ],
-    "temperature": 0.7,
-    "max_tokens": 1000
-  }'
+cp .env.example .env
 ```
 
-#### 流式响应示例
+然后在 `.env` 中配置网关访问 key 和上游供应商 key。
 
-```bash
-# 流式响应
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <GATEWAY_KEY>" \
-  -d '{
-    "model": "gpt-4o",
-    "messages": [{"role": "user", "content": "写一首诗"}],
-    "stream": true
-  }'
+```env
+API_KEY=sk-freelance-key
+OPENROUTER_API_KEY=sk-or-xxx
+NVIDIA_API_KEY=nvapi-xxx
 ```
 
-流式响应使用 Server-Sent Events (SSE) 格式，每个事件包含一个数据块：
+同一个供应商可以配置多个 key，用英文逗号分隔：
 
-```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"春"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"眠"},"finish_reason":null}]}
-
-data: [DONE]
+```env
+OPENROUTER_API_KEY=sk-or-key1,sk-or-key2,sk-or-key3
 ```
 
-#### 响应格式（非流式）
+### 2. Windows 使用方式
 
-```json
-{
-  "id": "chatcmpl-abc123",
-  "object": "chat.completion",
-  "created": 1712345678,
-  "model": "gpt-4o",
-  "system_fingerprint": "fp_xxx",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好！我是一个 AI 助手..."
-      },
-      "logprobs": null,
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 15,
-    "completion_tokens": 50,
-    "total_tokens": 65
-  }
-}
-```
-
-***
-
-### 2. 列出模型接口
-
-**接口地址**: `GET /v1/models`\
-**兼容路径**: `GET /models`
-
-列出所有可用的模型，并按评分排序。
-
-#### 查询参数
-
-| 参数名      | 类型     | 必填 | 默认值      | 说明                                                         |
-| -------- | ------ | -- | -------- | ---------------------------------------------------------- |
-| **mode** | string | 否  | `"free"` | 过滤模式：- `free`: 仅显示免费模型（默认）- `paid`: 仅显示付费模型- `all`: 显示所有模型 |
-
-#### 请求示例
-
-```bash
-# 获取模型列表（默认免费）
-curl http://localhost:8000/v1/models
-
-# 获取所有模型（免费+付费）
-curl http://localhost:8000/v1/models?mode=all
-
-# 仅获取付费模型
-curl http://localhost:8000/v1/models?mode=paid
-```
-
-#### 响应格式
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "openai/gpt-4o",
-      "object": "model",
-      "created": 1715558400,
-      "owned_by": "openrouter | Score: 0.9523",
-      "score": 0.9523,
-      "context_length": 128000,
-      "capabilities": ["tools", "vision"]
-    },
-    {
-      "id": "meta-llama/llama-3.3-70b-instruct",
-      "object": "model",
-      "created": 1733529600,
-      "owned_by": "openrouter | Score: 0.8945",
-      "score": 0.8945,
-      "context_length": 128000,
-      "capabilities": null
-    }
-  ]
-}
-```
-
-**响应字段说明**:
-
-- `score`: 模型综合评分（0\~1），越高越好
-- `context_length`: 模型支持的最大上下文长度（tokens）
-- `capabilities`: 模型支持的能力列表（如 tools, vision 等）
-- `owned_by`: 显示提供商名称和评分
-
-***
-
-### 3. 获取单个模型信息
-
-**接口地址**: `GET /v1/models/{model_id}`\
-**兼容路径**: `GET /models/{model_id}`
-
-获取指定模型的详细信息。
-
-#### 路径参数
-
-| 参数名           | 类型     | 必填 | 说明                                  |
-| ------------- | ------ | -- | ----------------------------------- |
-| **model\_id** | string | 是  | 模型 ID，如 `gpt-4o`, `openai/gpt-4o` 等 |
-
-#### 请求示例
-
-```bash
-curl http://localhost:8000/v1/models/gpt-4o
-```
-
-#### 响应格式
-
-```json
-{
-  "id": "gpt-4o",
-  "object": "model",
-  "created": 1715558400,
-  "owned_by": "openrouter | Score: 0.9523",
-  "score": 0.9523,
-  "context_length": 128000,
-  "capabilities": ["tools", "vision"]
-}
-```
-
-***
-
-### 4. 健康检查接口
-
-**接口地址**: `GET /health`
-
-检查服务运行状态。
-
-#### 请求示例
-
-```bash
-curl http://localhost:8000/health
-```
-
-#### 响应格式
-
-```json
-{
-  "status": "healthy",
-  "timestamp": 1712345678
-}
-```
-
-***
-
-### 5. 根路径信息
-
-**接口地址**: `GET /`
-
-获取网关基本信息和可用端点。
-
-#### 请求示例
-
-```bash
-curl http://localhost:8000/
-```
-
-#### 响应格式
-
-```json
-{
-  "name": "Freelance API Gateway",
-  "version": "1.0.0",
-  "status": "running",
-  "providers": ["ollama", "openrouter", "groq", "cerebras"],
-  "endpoints": {
-    "chat_completions": "/chat/completions",
-    "models": "/models",
-    "health": "/health"
-  }
-}
-```
-
-***
-
-### 6. 自动路由模式
-
-网关支持智能自动路由，无需指定具体模型：
-
-| 模式值         | 说明            | 使用场景        |
-| ----------- | ------------- | ----------- |
-| `auto`      | 自动选择评分最高的可用模型 | 通用场景，追求最佳体验 |
-| `free`      | 仅使用免费模型       | 成本敏感场景      |
-| `best-free` | 选择评分最高的免费模型   | 平衡成本与质量     |
-
-**示例**:
-
-```json
-{
-  "model": "auto",
-  "messages": [{"role": "user", "content": "你好"}]
-}
-```
-
-***
-
-## ❌ 错误处理
-
-### HTTP 状态码
-
-| 状态码     | 说明    | 常见原因          |
-| ------- | ----- | ------------- |
-| **200** | 成功    | 请求正常处理        |
-| **401** | 未授权   | API Key 无效或缺失 |
-| **404** | 未找到   | 请求的模型不存在      |
-| **502** | 网关错误  | 上游提供商服务异常     |
-| **503** | 服务不可用 | 自动路由缓存未初始化    |
-| **504** | 超时    | 请求处理超时        |
-
-### 错误响应格式
-
-```json
-{
-  "error": {
-    "message": "Invalid or missing API key. Please use 'Authorization: Bearer <GATEWAY_KEY>'",
-    "type": "invalid_request_error",
-    "code": "invalid_api_key"
-  }
-}
-```
-
-**错误类型**:
-
-- `invalid_request_error`: 请求参数错误
-- `upstream_error`: 上游提供商错误
-- `invalid_api_key`: API Key 无效
-
-***
-
-## 🛠️ 快速开始 (快速启动)
-
-本项目支持 **Python 3.8+**，且提供了一键式自动化环境准备工具。
-一.复制`.env.example` 到 `.env` 并根据需要修改模型提供商的 API Key 。
-二.运行 `.\freelance.bat start` 或 `./freelance.sh start` 启动服务。
-### Windows (PowerShell/CMD):
+PowerShell 或 CMD：
 
 ```powershell
 .\freelance.bat start
 ```
 
-### Linux / macOS:
+指定端口：
+
+```powershell
+.\freelance.bat start -p 8001
+```
+
+指定监听地址和端口：
+
+```powershell
+.\freelance.bat start --host 127.0.0.1 --port 8000
+```
+
+后台运行：
+
+```powershell
+.\freelance.bat start -d -p 8000
+```
+
+停止服务：
+
+```powershell
+.\freelance.bat stop
+```
+
+重启服务：
+
+```powershell
+.\freelance.bat restart -d -p 8000
+```
+
+生成并写入新的网关 API key：
+
+```powershell
+.\freelance.bat keygen
+```
+
+也可以在已安装环境中直接调用 CLI：
+
+```powershell
+freelance-api start -p 8000
+freelance-api stop
+freelance-api restart -d
+freelance-api keygen
+```
+
+### 3. Linux 使用方式
+
+首次使用先赋予脚本执行权限：
 
 ```bash
 chmod +x freelance.sh
+```
+
+前台启动：
+
+```bash
 ./freelance.sh start
 ```
 
-> \[!NOTE]
-> `freelance` 脚本会自动：
->
-> 1. 创建虚拟环境 (`.venv`)。
-> 2. 安装所有依赖及 `freelance-api` 命令。
-> 3. 启动/管理服务。
+指定端口：
 
-***
+```bash
+./freelance.sh start -p 8001
+```
 
-## 📊 模型打分逻辑 (Scoring Logic)
+指定监听地址和端口：
 
-Link 网关采用动态加权评分系统，自动选出当前能力最强且最稳定的模型（尤其在 `auto` 模式下）：
+```bash
+./freelance.sh start --host 0.0.0.0 --port 8000
+```
 
-| 维度            | 权重      | 逻辑说明                              |
-| :------------ | :------ | :-------------------------------- |
-| **📏 上下文长度**  | **40%** | 以 1,000,000 tokens 为满分。上下文越大得分越高。 |
-| **🧠 模型能力**   | **30%** | 根据厂商显性能力声明（tools, vision 等）打分。    |
-| **📅 发布时效**   | **20%** | 计算模型发布天数，越新的模型权重越高。               |
-| **🛡️ 厂家信任度** | **10%** | 对核心官方节点保底加分。                      |
+后台运行：
 
-***
+```bash
+./freelance.sh start -d -p 8000
+```
 
-## 💡 进阶命令
+停止服务：
 
-你可以通过 `freelance` 脚本直接调用所有 `freelance-api` 指令：
+```bash
+./freelance.sh stop
+```
 
-- **后台启动**: `.\freelance.bat start -d -p 8000` (Windows) 或 `./freelance.sh start -d` (Unix)
-- **停止服务**: `.\freelance.bat stop`
-- **生成密钥**: `.\freelance.bat keygen`
-- **重启服务**: `.\freelance.bat restart -d`
+重启服务：
 
-***
+```bash
+./freelance.sh restart -d -p 8000
+```
 
-##  OPENCLAW接入指南
+生成并写入新的网关 API key：
 
-**运行openclaw config->添加freelance网关->填写freelance API Gateway的API Key->填写模型ID：`auto`**
+```bash
+./freelance.sh keygen
+```
 
-***
+也可以直接调用 CLI：
 
-***
-## 示例：
-### 配置
-平台A = api key1,api key2
-平台B = 
-平台C = api key3,api key4
-### 运行模式
-freelance->平台A->api key1
-          |
-          V
-freelance->平台A->api key2
-          |
-          V
-freelance->平台C->api key3
-          |
-          V
-freelance->平台C->api key4
-          |
-          V
-无可用模型，报错
-### 简介
-1.freelance运行时遍历所有带api key的平台。
-2.调用models接口为所有可用平台模型打分按score高低依次排序
-3.根据模型socre排行，使用对应平台的api key调用模型(比如score分排名第一的是平台A的模型1，则使用平台A的api key1调用模型1)
-4.如果平台A的模型返回错误，则根据不同错误代码进行不同的处理
-5.若调用模型1返回的是Timeout/网络错误,则尝试max_retries次，如果max_retries次都返回Timeout/网络错误，则直接跳过模型1，使用模型2进行尝试,跳过的模型1禁用一小时不再尝试。
-6.若调用模型1返回的是非429频率限制方面的错误而是api key无效级别的错误(如401/403),则直接跳过api key1并禁用api key1三小时，使用api key2进行尝试。
-7.若调用模型1返回的是429频率限制方面的错误，则直接跳过api key1并禁用api key1半小时，使用api key2进行尝试。
-8.若调用模型1返回的是其他错误，则禁用api key1三小时，使用api key2进行尝试。
-9.如果models接口中平台A的所有模型都返回错误，则视为该平台A暂不可用，禁用平台A三小时，跳过无api key的平台B,尝试带api key的平台C。
-10.若所有api key都尝试了一遍，或者所有模型都尝试了一遍，都没有成功，则返回错误。
+```bash
+freelance-api start -p 8000
+freelance-api stop
+freelance-api restart -d
+freelance-api keygen
+```
 
-***
+### 4. macOS 使用方式
 
-### 模型选择与上游调用逻辑总结
-#### 1. 候选排序 (Ranking)：配置默认优先 > 缓存评分排序	
+macOS 与 Linux 基本一致。首次使用先赋予执行权限：
 
-解析 auto 请求时，首先按 config.yaml 中定义的 default_model 排序，随后追加模型评分缓存中的其余模型。
+```bash
+chmod +x freelance.sh
+```
 
-#### 2. 循环尝试 (Iteration)：平台/模型可用性预检	
+前台启动：
 
-遍历候选列表。在调用前检查 is_provider_available。
+```bash
+./freelance.sh start
+```
 
-#### 3. 智能优化 (Optimization)：熔断平台批量跳过 (新增)
+后台运行：
 
-循环内一旦发现某个平台处于熔断状态，系统会动态标记该平台。本轮请求中属于该平台的后续模型将不再记入报错详情，直接静默跳过。
+```bash
+./freelance.sh start -d -p 8000
+```
 
-#### 4. 故障处理 (Failure)：异常捕获 -> 熔断记录
+停止服务：
 
-若调用抛出异常（如超时），调用 record_failure。目前策略是：任何异常都会导致整个平台进入 1 小时（由配置决定）的熔断期。
+```bash
+./freelance.sh stop
+```
 
-#### 5. 错误反馈 (Response)：去重后的详细报错 (新增)
+重启服务：
 
-若所有候选者均不可用，将 tried_details 去重后返回给下游。客户端将只会看到每种错误状态的唯一代表，避免了因模型数量过多导致的“错误堆叠”。
+```bash
+./freelance.sh restart -d -p 8000
+```
 
-#### 6. 智能体迭代 (Loop)：多轮 Turn 机制	
+生成并写入新的网关 API key：
 
-如果模型返回工具调用请求，Gateway 执行工具后会发起新的一轮 Turn，重新执行上述 1-5 步逻辑。
+```bash
+./freelance.sh keygen
+```
 
-***
+如果系统没有 `python3`，请先安装 Python 3.8+。使用 Homebrew 的示例：
 
-***
+```bash
+brew install python
+```
 
-1. groq/llama-3.3-70b        (score: 0.85)  ← groq 无 default_model → ✅ 可调用
-2. openrouter/nemotron-3     (score: 0.82)  ← openrouter 有 default_model 但不是这个 → ❌ 跳过
-3. openrouter/gpt-4o-mini    (score: 0.78)  ← openrouter 有 default_model 但不是这个 → ❌ 跳过
-4. nvidia/llama-3-nemotron   (score: 0.75)  ← nvidia 无 default_model → ✅ 可调用
-5. openrouter/nemotron-3     (score: 0.82)  ← 这是 openrouter 的 default_model → ✅ 可调用
+### 5. 常用参数
 
-***
+| 参数 | 说明 |
+| --- | --- |
+| `start` | 启动服务 |
+| `stop` | 停止当前服务，依赖 `freelance.pid` |
+| `restart` | 停止后重新启动 |
+| `keygen` | 生成新的 `API_KEY` 并写入 `.env` |
+| `-p, --port` | 指定端口，默认 `8000` |
+| `--host` | 指定监听地址，默认 `0.0.0.0` |
+| `--reload` | 启用开发热重载 |
+| `-d, --daemon` | 后台运行，日志写入 `freelance.log` |
 
-## 📜 开源协议
+默认访问地址：
 
-基于 MIT License 开源。请勿将其用于任何破坏厂家免费额度的恶意滥用。
+```text
+http://localhost:8000
+```
+
+客户端请求需要携带：
+
+```text
+Authorization: Bearer <API_KEY>
+```
+
+如果 `.env` 中没有配置 `API_KEY` 或 `API_KEYS`，网关会跳过鉴权。
+
+后台运行时，主日志写入：
+
+```text
+freelance.log
+```
+
+## API
+
+### Chat Completions
+
+```http
+POST /v1/chat/completions
+POST /chat/completions
+```
+
+示例：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-freelance-key" \
+  -d '{
+    "model": "auto",
+    "messages": [
+      {"role": "user", "content": "你好，介绍一下你自己"}
+    ],
+    "stream": false
+  }'
+```
+
+### Models
+
+```http
+GET /v1/models
+GET /models
+GET /v1/models/{model_id}
+GET /models/{model_id}
+```
+
+`/models` 从自动路由缓存中返回模型列表，并带上评分。
+
+查询参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `all` | `all` 返回全部缓存模型，`free` 只展示免费模型，`paid` 当前接口未单独过滤付费模型 |
+
+注意：`/models?mode=free` 是展示层过滤；当前聊天请求中的 `model=free`、`model=best-free` 和 `model=auto` 都进入同一套自动候选生成逻辑。
+
+### Health
+
+```http
+GET /health
+GET /health/providers
+```
+
+`/health/providers` 会返回每个供应商的熔断状态、可用 key 数量、连续失败次数和 `default_model`。
+
+## 配置入口
+
+项目有两个主要配置来源：
+
+- `.env`：放网关访问 key 和供应商 API key。
+- `config.yaml`：放供应商定义、模型别名、默认模型、错误策略、透传策略、工具模式。
+
+### 供应商配置
+
+供应商定义在 `config.yaml` 的 `providers` 下：
+
+```yaml
+providers:
+  openrouter:
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY:}
+    timeout: 120
+    default_model: nvidia/nemotron-3-super-120b-a12b:free
+
+  nvidia:
+    type: openai
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: ${NVIDIA_API_KEY:}
+    timeout: 250
+    default_model: minimaxai/minimax-m2.7
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `type` | 当前主要支持 `openai`，表示上游兼容 OpenAI API |
+| `base_url` | 上游 API 根地址，不需要带 `/chat/completions` |
+| `api_key` | 支持 `${ENV_NAME:default}` 从 `.env` 或系统环境变量读取 |
+| `timeout` | 该供应商默认超时时间 |
+| `score_offset` | 给该供应商模型评分加权，可正可负 |
+| `default_model` | 自动路由时该供应商强制使用的默认模型 |
+| `pass_through_body` | 是否尽量透传客户端原始 JSON body |
+| `header_passthrough` | 允许从客户端透传到上游的 header 白名单 |
+| `header_overrides` | 写入或覆盖发给上游的 header |
+| `param_overrides` | 发给上游前 set/delete 请求参数 |
+| `disabled_fields` | 发给上游前删除指定字段 |
+
+建议：实际使用时，给每个启用的供应商都配置 `default_model`。这样 `auto/free/best-free` 不会在该供应商返回的所有模型之间漂移，而是稳定调用你确认可用、成本和能力都符合预期的模型；当 `/models` 没有返回该模型时，网关也会把它作为兜底候选追加到实际路由中。
+
+只有配置了可用 `api_key` 的供应商才会在启动时创建 provider 实例，也才会参与模型发现和自动路由。
+
+### 增加、删除或替换供应商
+
+增加供应商：
+
+1. 在 `.env` 中增加供应商 API key。
+2. 在 `config.yaml.providers` 中增加一个 provider。
+3. 如果该供应商兼容 OpenAI `/chat/completions` 和 `/models`，`type` 保持 `openai`。
+4. 重启服务，让启动预热重新拉取模型列表。
+
+示例：
+
+```yaml
+providers:
+  my-provider:
+    type: openai
+    base_url: https://api.example.com/v1
+    api_key: ${MY_PROVIDER_API_KEY:}
+    timeout: 120
+    default_model: example/default-model
+```
+
+删除供应商：
+
+1. 从 `providers` 删除该供应商，或清空它对应的 `.env` key。
+2. 删除或调整 `models` 中指向该供应商的别名。
+3. 重启服务。
+
+替换供应商地址：
+
+```yaml
+providers:
+  openrouter:
+    base_url: https://new-compatible-endpoint.example.com/v1
+```
+
+如果只是替换 `base_url` 或 key，不需要改客户端请求；客户端仍然调用网关统一地址。
+
+## 模型更换逻辑
+
+模型有三种来源：客户端显式模型名、`models` 别名表、自动路由缓存。
+
+### 1. 显式模型别名
+
+`config.yaml.models` 可以把客户端传入的模型名映射到指定供应商和真实模型 ID：
+
+```yaml
+models:
+  "gpt-4o": { provider: "openrouter", model: "openai/gpt-4o" }
+  "deepseek-chat": { provider: "openrouter", model: "deepseek/deepseek-chat" }
+```
+
+客户端请求：
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [{"role": "user", "content": "hello"}]
+}
+```
+
+实际调用：
+
+```text
+openrouter -> openai/gpt-4o
+```
+
+更换别名指向时，只需要改 `models` 表：
+
+```yaml
+models:
+  "gpt-4o": { provider: "nvidia", model: "openai/gpt-4o" }
+```
+
+客户端仍然传 `model: "gpt-4o"`，网关会改走 `nvidia`。
+
+### 2. 未命中别名的模型名
+
+当客户端传入的 `model` 不在 `models` 表中时，网关按以下规则解析：
+
+1. 如果模型名包含 `/`，并且配置了 `openrouter`，默认交给 `openrouter`，例如 `meta-llama/llama-3.3-70b-instruct`。
+2. 否则交给 `default_provider`。
+3. 如果没有可用 `default_provider`，使用配置中的第一个 provider。
+
+示例：
+
+```yaml
+default_provider: "ollama"
+```
+
+客户端请求：
+
+```json
+{"model": "llama3"}
+```
+
+如果 `llama3` 没有在 `models` 表里配置，实际会走：
+
+```text
+ollama -> llama3
+```
+
+### 3. 自动模型选择
+
+客户端传以下模型名时，会进入自动路由：
+
+```text
+auto
+free
+best-free
+```
+
+当前实现中，这三个值都会调用同一套候选生成逻辑。
+
+自动路由依赖启动时和后台定时刷新的模型缓存：
+
+1. 启动时只初始化配置了 API key 的供应商。
+2. 对所有已初始化供应商并发请求 `/models`。
+3. 给每个模型打上 `_gateway_provider`。
+4. 使用 `scoring.py` 计算 `_score` 并降序排序。
+5. 保存到 `config.auto_models_cache`。
+6. 每 6 小时后台刷新一次。
+7. 每次成功刷新会重写 `latest_models.log`。
+
+评分权重：
+
+| 维度 | 权重 | 说明 |
+| --- | --- | --- |
+| `context_length` | 40% | 上下文越长分数越高，最高按 1,000,000 tokens 归一 |
+| `capabilities` | 30% | 根据 `supported_parameters` 或模型名启发式能力加分 |
+| `recency` | 20% | 模型越新分数越高 |
+| `provider_trust` | 10% | 常见可信模型组织或供应商加分 |
+
+供应商还可以通过 `score_offset` 调整整体排序：
+
+```yaml
+providers:
+  groq:
+    score_offset: 0.5
+```
+
+## 自动路由中的供应商和模型切换
+
+这是当前项目最核心的切换规则。
+
+### 候选列表生成规则
+
+当请求 `model=auto/free/best-free` 时，`RouterService.get_models_to_try()` 会生成候选列表：
+
+备注：推荐为生产环境中的每个供应商设置 `default_model`。未设置时，该供应商的所有缓存模型都会按评分进入自动候选，模型可能随上游 `/models` 返回结果和评分变化而变化；设置后，该供应商在自动路由中只尝试指定默认模型，行为更可控。
+
+1. 读取已经按 `_score` 排好序的 `auto_models_cache`。
+2. 如果某个供应商没有配置 `default_model`，该供应商缓存中的所有模型都可以进入候选列表，顺序按评分。
+3. 如果某个供应商配置了 `default_model`，该供应商只有这个 `default_model` 可以进入候选列表，其他模型即使评分更高也会被跳过。
+4. 如果配置了 `default_model`，但该模型没有出现在 `/models` 缓存中，只要该供应商配置了 API key，网关仍会把这个 `default_model` 作为兜底候选追加进去。
+
+示例：
+
+```yaml
+providers:
+  openrouter:
+    default_model: nvidia/nemotron-3-super-120b-a12b:free
+
+  nvidia:
+    default_model: minimaxai/minimax-m2.7
+
+  cerebras:
+    # 没有 default_model
+```
+
+假设缓存评分结果为：
+
+```text
+1. openrouter/openai/gpt-4o-mini                    score=0.90
+2. cerebras/llama-4-scout                           score=0.88
+3. openrouter/nvidia/nemotron-3-super-120b-a12b:free score=0.82
+4. nvidia/minimaxai/minimax-m2.7                    score=0.75
+```
+
+实际候选会变成：
+
+```text
+1. cerebras -> llama-4-scout
+2. openrouter -> nvidia/nemotron-3-super-120b-a12b:free
+3. nvidia -> minimaxai/minimax-m2.7
+```
+
+原因：
+
+- `openrouter` 配了 `default_model`，所以 `openai/gpt-4o-mini` 被跳过。
+- `cerebras` 没有配 `default_model`，所以它的高分模型可以直接进入候选。
+- `nvidia` 配了 `default_model`，只允许 `minimaxai/minimax-m2.7` 进入候选。
+
+### 调用时切换规则
+
+一次聊天请求进入 `AgentService.run()` 后，网关按候选列表顺序尝试：
+
+1. 检查 provider 是否处于平台级冷却。
+2. 检查目标 model 是否处于模型级冷却。
+3. 获取 provider 实例。
+4. 在该 provider 内选择一个可用 API key。
+5. 请求上游。
+6. 成功则直接返回。
+7. 失败则记录错误，根据错误策略冷却 key、model 或 provider，然后继续尝试下一个候选。
+
+简化流程：
+
+```text
+client
+  -> gateway /v1/chat/completions
+  -> 解析 model
+  -> 生成候选 [(provider, actual_model), ...]
+  -> 候选 1
+       -> provider 内轮询 key
+       -> 成功：返回
+       -> 失败：记录冷却和错误日志
+  -> 候选 2
+  -> 候选 3
+  -> 全部失败：返回 OpenAI 风格错误响应
+```
+
+### 同一供应商内的 API key 切换
+
+每个 provider 可以有多个 key：
+
+```env
+OPENROUTER_API_KEY=key1,key2,key3
+```
+
+调用时 `ProviderConfig.get_next_key()` 会：
+
+1. 优先选择不在冷却期、非 fatal 的 key。
+2. 如果没有完全健康的 key，会选择非 fatal 的冷却中 key 作为临时兜底。
+3. 如果所有 key 都 fatal，会触发 provider 级平台冷却。
+
+HTTP 失败后的 key 处理由 `error_policy` 和错误分类共同决定：
+
+| 错误 | 默认处理 |
+| --- | --- |
+| `429` | 标记当前 key 冷却，默认 30 分钟，不视为 fatal |
+| `401` | 标记当前 key 冷却并 fatal，默认 3 小时 |
+| `403` | 标记当前 key 冷却并 fatal，默认 3 小时 |
+| quota/余额不足 | 标记当前 key 冷却并 fatal，默认 1 小时 |
+| timeout/network | 标记当前 key 短冷却，并可推进 provider 失败统计 |
+| `404` | 默认标记 model 冷却 |
+
+### 模型级切换
+
+模型级冷却由 `disable_model_status_codes` 控制，默认：
+
+```yaml
+settings:
+  error_policy:
+    disable_model_status_codes: "404"
+```
+
+如果某个候选模型返回 404，网关会认为这个模型路径不可用，记录模型冷却。后续自动路由遇到同一个 `provider/model` 时会跳过，直到冷却结束。
+
+### 供应商级切换和熔断
+
+供应商级冷却由两部分触发：
+
+1. `GatewayError.disable_provider=true`，由 `error_policy.disable_provider_status_codes` 或 timeout/network 等异常分类决定。
+2. 旧异常路径或所有 key fatal 时，调用 `record_platform_failure()`。
+
+provider 不会一失败就立刻熔断。它有连续失败阈值：
+
+```yaml
+settings:
+  max_retries: 2
+```
+
+当某供应商连续失败次数达到 `max_retries` 后，才进入平台级冷却。冷却期间：
+
+- `RouterService.is_provider_available()` 返回不可用。
+- 自动路由会跳过该供应商下的候选模型。
+- `/health/providers` 可以看到 `melted=true` 和剩余秒数。
+
+成功请求会重置该供应商的连续失败计数。
+
+### 状态码策略配置
+
+默认配置：
+
+```yaml
+settings:
+  error_policy:
+    retry_status_codes: "401-407,409-499,500-503,505-599"
+    skip_retry_status_codes: "400,408,422,504,524"
+    disable_key_status_codes: "401,403"
+    disable_model_status_codes: "404"
+    disable_provider_status_codes: ""
+```
+
+含义：
+
+| 配置 | 作用 |
+| --- | --- |
+| `retry_status_codes` | 这些状态码允许继续尝试其他 key 或候选 |
+| `skip_retry_status_codes` | 这些状态码直接返回给客户端，不再继续重试 |
+| `disable_key_status_codes` | 这些状态码会冷却当前 key |
+| `disable_model_status_codes` | 这些状态码会冷却当前 provider/model |
+| `disable_provider_status_codes` | 这些状态码会推进 provider 熔断 |
+
+例如希望上游 503 直接推进供应商熔断：
+
+```yaml
+settings:
+  error_policy:
+    disable_provider_status_codes: "503"
+```
+
+## 请求透传和上游兼容
+
+不同 OpenAI-compatible 上游支持的参数不完全一致。可以在 provider 级别配置 body、header 和参数规则。
+
+示例：
+
+```yaml
+providers:
+  my-provider:
+    type: openai
+    base_url: https://api.example.com/v1
+    api_key: ${MY_PROVIDER_API_KEY:}
+
+    pass_through_body: true
+
+    header_passthrough:
+      - x-request-id
+      - re:^x-custom-
+
+    header_overrides:
+      X-Provider-Feature: "enabled"
+      X-Client-Trace: "{client_header:x-trace-id}"
+
+    disabled_fields:
+      - stream_options.include_obfuscation
+      - service_tier
+
+    param_overrides:
+      - { op: "set", path: "reasoning.enabled", value: true }
+      - { op: "delete", path: "temperature" }
+```
+
+规则说明：
+
+- `pass_through_body: false` 时，网关使用标准化后的请求模型生成上游 payload。
+- `pass_through_body: true` 时，网关尽量保留客户端原始 JSON body，但仍会强制覆盖 `model` 和 `stream`。
+- `header_passthrough` 只透传白名单 header，默认不会透传 `authorization`、`cookie`、`host`、`content-length` 等敏感或 hop-by-hop header。
+- `header_overrides` 可以写死 header，也可以从客户端 header 取值。
+- `disabled_fields` 用点路径删除字段。
+- `param_overrides` 支持 `set` 和 `delete`。
+
+## 工具调用模式
+
+工具调用由 `settings.tools.mode` 控制：
+
+```yaml
+settings:
+  tools:
+    mode: passthrough
+```
+
+可选值：
+
+| 模式 | 行为 |
+| --- | --- |
+| `passthrough` | 默认模式。OpenAI 原生 `tools`、`tool_choice`、`tool_calls` 透传给上游和客户端，网关不执行本地工具 |
+| `local_agent` | 网关执行支持的本地工具调用，并把工具结果加入下一轮请求 |
+| `disabled` | 发给上游前删除 `tools`、`tool_choice`、`parallel_tool_calls` |
+
+建议：
+
+- 如果客户端自己处理 OpenAI 原生工具调用，使用 `passthrough`。
+- 如果希望网关内置工具执行，使用 `local_agent`。
+- 如果某些上游不兼容工具参数，使用 `disabled` 或 provider 的 `disabled_fields`。
+
+## 日志文件
+
+### latest_models.log
+
+每次模型缓存刷新成功后重写，包含两部分：
+
+```text
+--- A: Theoretical Ranking (by score, grouped by provider) ---
+--- B: Actual Routing (by provider, reflecting default_model strategy) ---
+```
+
+用途：
+
+- 查看每个供应商拉到了哪些模型。
+- 查看模型理论评分。
+- 查看自动路由中每个供应商实际会使用哪个默认模型。
+- 发现某个 provider 的 `/models` 是否返回为空。
+
+### error_models.log
+
+模型调用失败时按天追加：
+
+```text
+=== 2026-07-02 ===
+12:00:01 | RateLimit | status=429 | retryable | cooldown=key | ... | openrouter:model-id
+```
+
+字段包括：
+
+- 时间。
+- 错误类型。
+- HTTP 状态码。
+- 是否继续重试。
+- 冷却对象：`key`、`model`、`provider`。
+- 错误内容。
+- 实际 `provider:model`。
+
+### freelance.log
+
+主运行日志，包含启动预热、请求耗时、模型刷新、上游调用等信息。
+
+## 常见更换场景
+
+### 把 `auto` 固定到某个供应商的指定模型
+
+给供应商配置 `default_model`：
+
+```yaml
+providers:
+  openrouter:
+    default_model: nvidia/nemotron-3-super-120b-a12b:free
+```
+
+这样自动路由中，`openrouter` 只会尝试这个模型。
+
+### 允许某个供应商自动使用所有高分模型
+
+删除或留空该供应商的 `default_model`：
+
+```yaml
+providers:
+  cerebras:
+    default_model: ""
+```
+
+这样 `cerebras` 返回的模型会按评分进入候选。
+
+### 把客户端模型名改到另一个上游
+
+修改 `models` 别名：
+
+```yaml
+models:
+  "gpt-4o-mini": { provider: "openrouter", model: "openai/gpt-4o-mini" }
+```
+
+改为：
+
+```yaml
+models:
+  "gpt-4o-mini": { provider: "nvidia", model: "openai/gpt-4o-mini" }
+```
+
+客户端请求不变：
+
+```json
+{"model": "gpt-4o-mini"}
+```
+
+### 临时禁用某个供应商
+
+最简单方式是清空该供应商的环境变量 key，然后重启：
+
+```env
+OPENROUTER_API_KEY=
+```
+
+也可以从 `config.yaml.providers` 删除该供应商。
+
+### 某个上游不支持特定参数
+
+用 `disabled_fields` 删除：
+
+```yaml
+providers:
+  my-provider:
+    disabled_fields:
+      - parallel_tool_calls
+      - stream_options.include_usage
+```
+
+### 某个上游要求额外参数
+
+用 `param_overrides` 设置：
+
+```yaml
+providers:
+  my-provider:
+    param_overrides:
+      - { op: "set", path: "reasoning.enabled", value: true }
+```
+
+## 当前实现注意点
+
+- `model=auto`、`model=free`、`model=best-free` 当前走同一套聊天候选逻辑；免费过滤主要体现在 `/models?mode=free` 展示接口。
+- `latest_models.log` 只有在模型刷新成功且至少获取到一个模型时才会重写；如果所有供应商 `/models` 都失败，旧文件会保留。
+- `latest_models.log` 的理论排名是按供应商分组展示，每组内部按分数排序，不是一个纯全局列表。
+- 自动路由的“实际排名”来自当前缓存和 `default_model` 配置，不是基于历史成功率的实时学习排序。
+- 只有配置了 API key 的供应商会实例化并参与自动发现；没有 key 的供应商仍可保留在配置中，但不会被自动路由使用。
+
+## License
+
+MIT
