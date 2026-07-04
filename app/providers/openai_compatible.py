@@ -252,7 +252,8 @@ class OpenAICompatibleProvider(BaseProvider):
                         
                         # 1. Prepare for TTFT (Heartbeat disabled temporarily)
                         start_time = time.time()
-                        ttft_recorded = False
+                        chunks_received = 0
+                        bytes_received = 0
                         
                         # Get the iterator 
                         lines_iter = resp.aiter_lines().__aiter__()
@@ -271,8 +272,14 @@ class OpenAICompatibleProvider(BaseProvider):
                         first_chunk = first_chunk.strip()
                         if first_chunk and first_chunk.startswith("data: "):
                             ttft = (time.time() - start_time) * 1000
-                            logger.info(f"[{self.config.name}] TTFT: {ttft:.2f}ms | Model: {actual_model}")
+                            chunks_received += 1
+                            bytes_received += len(first_chunk)
+                            logger.info(f"[{self.config.name}] First chunk received for {actual_model} at +{ttft:.2f}ms (len={len(first_chunk)})")
                             yield f"{first_chunk}\n\n"
+                            if first_chunk == "data: [DONE]":
+                                logger.info(f"[{self.config.name}] Received end signal for {actual_model} in first chunk")
+                                logger.info(f"[{self.config.name}] Stream finished for {actual_model}: {chunks_received} chunks, {bytes_received} bytes received")
+                                return
                             await asyncio.sleep(0.01)
                         
                         # Continue with remaining chunks
@@ -283,16 +290,22 @@ class OpenAICompatibleProvider(BaseProvider):
                                 line = line.strip()
                                 if not line: continue
                                 if line == "data: [DONE]": 
+                                    chunks_received += 1
+                                    bytes_received += len(line)
+                                    logger.info(f"[{self.config.name}] Received end signal for {actual_model} after {chunks_received} chunks")
                                     yield "data: [DONE]\n\n"
                                     break
                                 
                                 if line.startswith("data: "):
+                                    chunks_received += 1
+                                    bytes_received += len(line)
                                     yield f"{line}\n\n"
                                     await asyncio.sleep(0.01)
                                 
                             except StopAsyncIteration:
                                 break
                         
+                        logger.info(f"[{self.config.name}] Stream finished for {actual_model}: {chunks_received} chunks, {bytes_received} bytes received")
                         return # Success
 
                     elif resp.status_code == 429:

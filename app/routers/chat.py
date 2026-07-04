@@ -156,13 +156,20 @@ def _get_read_timeout(model_id: str) -> int:
     else:
         return config.settings.stream_probe.read_timeout
 
-async def _stream_with_heartbeat(gen: AsyncGenerator, model_id: str, request: Request):
+async def _stream_with_heartbeat(
+    gen: AsyncGenerator,
+    model_id: str,
+    request: Request,
+    initial_chunks: int = 0,
+    initial_bytes: int = 0,
+):
     """
     Wraps provider stream with heartbeat functionality and read timeout handling.
     Provider yields raw SSE strings (data: ...\n\n).
     """
     start_time = time.time()
-    chunks_sent = 0
+    chunks_sent = initial_chunks
+    bytes_relayed = initial_bytes
     last_activity_time = time.time()
     ping_interval = config.settings.stream_probe.ping_interval
     read_timeout = _get_read_timeout(model_id)  # Get model-specific read timeout
@@ -211,6 +218,7 @@ async def _stream_with_heartbeat(gen: AsyncGenerator, model_id: str, request: Re
         """Task to process business data from upstream."""
         nonlocal last_activity_time
         nonlocal chunks_sent
+        nonlocal bytes_relayed
         try:
             logger.info(f"[*] Starting stream for {model_id}")
             async for chunk in gen:
@@ -226,15 +234,14 @@ async def _stream_with_heartbeat(gen: AsyncGenerator, model_id: str, request: Re
                 
                 # Update last activity time
                 last_activity_time = time.time()
-                
+
+                chunk_size = len(chunk)
+                bytes_relayed += chunk_size
                 if chunks_sent == 0:
                     ttft = (time.time() - start_time) * 1000
-                    logger.info(f"First chunk for {model_id} relayed at +{ttft:.2f}ms")
-                
-                # Log chunk size and content preview
-                chunk_size = len(chunk)
-                chunk_preview = chunk[:100] + "..." if chunk_size > 100 else chunk
-                logger.debug(f"Relaying chunk {chunks_sent+1} ({chunk_size} bytes): {chunk_preview}")
+                    logger.info(f"[STREAM] First chunk for {model_id} relayed at +{ttft:.2f}ms (len={chunk_size})")
+                elif chunk.strip() == "data: [DONE]":
+                    logger.info(f"[STREAM] Received end signal for {model_id} after {chunks_sent + 1} chunks")
                 
                 # Put business data into queue
                 await message_queue.put(("business", chunk))
@@ -252,10 +259,10 @@ async def _stream_with_heartbeat(gen: AsyncGenerator, model_id: str, request: Re
                     "choices": [{"index": 0, "delta": {"content": f"\n\n[Gateway Connection Error: {type(e).__name__}]\n\n详细错误: {error_msg}"}, "finish_reason": "error"}]
                 }
                 error_chunk_str = f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
-                logger.info(f"Sending error chunk: {error_chunk_str[:150]}...")
+                logger.info(f"[STREAM] Sending error chunk for {model_id} (len={len(error_chunk_str)})")
                 await message_queue.put(("business", error_chunk_str))
                 done_chunk = "data: [DONE]\n\n"
-                logger.info(f"Sending done chunk: {done_chunk}")
+                logger.info(f"[STREAM] Received end signal for {model_id} after stream error")
                 await message_queue.put(("business", done_chunk))
         finally:
             # Signal end of business data
@@ -312,7 +319,7 @@ async def _stream_with_heartbeat(gen: AsyncGenerator, model_id: str, request: Re
         except asyncio.TimeoutError:
             logger.warning("[*] Business data task timeout during cleanup")
         
-        logger.info(f"--- [STREAM FINISHED] ({chunks_sent} chunks relayed) ---")
+        logger.info(f"--- [STREAM FINISHED] ({chunks_sent} chunks, {bytes_relayed} bytes relayed) ---")
 
 async def _mock_stream_from_response(resp: ChatCompletionResponse) -> AsyncGenerator[str, None]:
     """Wraps a standard ChatCompletionResponse into an SSE-compatible generator."""
@@ -340,7 +347,7 @@ async def _mock_stream_from_response(resp: ChatCompletionResponse) -> AsyncGener
     }
     chunk_str = json.dumps(chunk, ensure_ascii=False)
     sse_chunk = f"data: {chunk_str}\n\n"
-    logger.info(f"Sending mock content chunk ({len(sse_chunk)} bytes): {chunk_str}")
+    logger.info(f"[STREAM] First mock chunk for {resp.model} prepared (len={len(sse_chunk)})")
     yield sse_chunk
     
     # Send finish chunk
@@ -359,11 +366,11 @@ async def _mock_stream_from_response(resp: ChatCompletionResponse) -> AsyncGener
     }
     finish_chunk_str = json.dumps(finish_chunk, ensure_ascii=False)
     sse_finish_chunk = f"data: {finish_chunk_str}\n\n"
-    logger.info(f"Sending mock finish chunk ({len(sse_finish_chunk)} bytes): {finish_chunk_str}")
+    logger.info(f"[STREAM] Mock finish chunk for {resp.model} prepared (len={len(sse_finish_chunk)})")
     yield sse_finish_chunk
     
     logger.info(f"--- [STREAM FINISHED (MOCK)] ---")
-    logger.info("Sending mock done chunk")
+    logger.info(f"[STREAM] Received end signal for {resp.model} (mock)")
     yield "data: [DONE]\n\n"
 
 @router.post("/chat/completions")
@@ -468,12 +475,20 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
                 # Success: Return the stream wrapped in Standard SSE headers
                 async def final_gen():
                     logger.info(f"[*] Starting final stream for {actual_id}")
-                    logger.info(f"Sending first chunk: {first_chunk[:100]}..." if len(first_chunk) > 100 else f"Sending first chunk: {first_chunk}")
+                    logger.info(f"[STREAM] First chunk for {actual_id} received (len={len(first_chunk)})")
                     yield first_chunk
+                    if first_chunk.strip() == "data: [DONE]":
+                        logger.info(f"[STREAM] Received end signal for {actual_id} in first chunk")
                     await asyncio.sleep(0.01)
                     
                     try:
-                        async for chunk in _stream_with_heartbeat(gen, actual_id, fastapi_request):
+                        async for chunk in _stream_with_heartbeat(
+                            gen,
+                            actual_id,
+                            fastapi_request,
+                            initial_chunks=1,
+                            initial_bytes=len(first_chunk),
+                        ):
                             # 检查客户端是否断开
                             if await fastapi_request.is_disconnected():
                                 logger.warning(f"[DISCONNECT] Client disconnected, canceling upstream for {p_name}/{actual_id}")
