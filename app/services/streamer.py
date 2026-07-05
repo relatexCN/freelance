@@ -62,13 +62,20 @@ class StreamerService:
             return config.settings.stream_probe.read_timeout
 
     @staticmethod
-    async def stream_with_heartbeat(gen: AsyncGenerator, p_name: str, model_id: str, request: Request):
+    async def stream_with_heartbeat(
+        gen: AsyncGenerator,
+        p_name: str,
+        model_id: str,
+        request: Request,
+        initial_chunks: int = 0,
+        initial_bytes: int = 0,
+    ):
         """
         Wraps provider stream with heartbeat functionality and read timeout handling.
         """
         start_time = time.time()
-        chunks_sent = 0
-        total_bytes = 0
+        chunks_sent = initial_chunks
+        total_bytes = initial_bytes
         last_activity_time = time.time()
         ping_interval = config.settings.stream_probe.ping_interval
         read_timeout = StreamerService.get_read_timeout(model_id)
@@ -112,11 +119,11 @@ class StreamerService:
                     total_bytes += chunk_len
                     if chunks_sent == 0:
                         ttft = (time.time() - start_time) * 1000
-                        logger.info(f"First chunk for {model_id} at +{ttft:.2f}ms (len={chunk_len})")
+                        logger.info(f"[STREAM] First chunk for {model_id} at +{ttft:.2f}ms (len={chunk_len})")
                         # RECORD TTFT and success start
                         stats_service.record_request(p_name, model_id, ttft_ms=ttft)
-                    else:
-                        logger.debug(f"[STREAM] Received chunk {chunks_sent+1} for {model_id} (len={chunk_len})")
+                    elif chunk and chunk.strip() == "data: [DONE]":
+                        logger.info(f"[STREAM] Received end signal for {model_id} after {chunks_sent + 1} chunks")
                     await message_queue.put(("business", chunk))
                     chunks_sent += 1
                 logger.info(f"[STREAM] Business task completed, total chunks: {chunks_sent}")
@@ -147,7 +154,7 @@ class StreamerService:
                     continue
                     
                 if msg_type == "end":
-                    logger.info(f"[STREAM] Received end signal")
+                    logger.info(f"[STREAM] Business data stream ended for {model_id}")
                     break
                 yield data
                 message_queue.task_done()

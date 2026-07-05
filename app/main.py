@@ -33,6 +33,22 @@ formatter = logging.Formatter(
     "%Y-%m-%d %H:%M:%S"
 )
 
+
+class StreamSseNoiseFilter(logging.Filter):
+    """Suppress high-volume per-SSE-chunk logs while keeping stream milestones."""
+
+    NOISY_MARKERS = (
+        "[STREAM] Received chunk ",
+        "Relaying chunk ",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(marker in message for marker in self.NOISY_MARKERS)
+
+
+stream_noise_filter = StreamSseNoiseFilter()
+
 # 2. Add Handlers based on environment
 LOG_FILE = "freelance.log"
 
@@ -41,17 +57,20 @@ if os.environ.get("FREELANCE_DAEMON") == "1":
     # We only need to provide the stream to stdout.
     cons_h = logging.StreamHandler()
     cons_h.setFormatter(formatter)
+    cons_h.addFilter(stream_noise_filter)
     fl_logger.addHandler(cons_h)
 else:
     # NORMAL MODE: We handle both terminal output AND manual file backup.
     # Clear and set File Handler
     file_h = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
     file_h.setFormatter(formatter)
+    file_h.addFilter(stream_noise_filter)
     fl_logger.addHandler(file_h)
     
     # Add Console Handler
     cons_h = logging.StreamHandler()
     cons_h.setFormatter(formatter)
+    cons_h.addFilter(stream_noise_filter)
     fl_logger.addHandler(cons_h)
 
 logger = fl_logger

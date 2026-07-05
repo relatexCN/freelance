@@ -183,21 +183,36 @@ class AgentService:
 
     async def _handle_stream(self, request, provider, p_name, actual_id, iteration, max_iterations):
         probe_timeout = StreamerService.get_probe_timeout(actual_id)
+        stream_start = time.time()
         gen = provider.chat_completion_stream(request, actual_id, timeout=probe_timeout)
-        
+
         try:
             first_chunk = await gen.__anext__()
         except Exception as e:
             raise Exception(f"Failed to get first chunk: {e}")
 
+        first_ttft = (time.time() - stream_start) * 1000
+        logger.info(f"[STREAM] First chunk for {actual_id} received at +{first_ttft:.2f}ms (len={len(first_chunk)})")
+        if first_chunk.strip() == "data: [DONE]":
+            logger.info(f"[STREAM] Received end signal for {actual_id} in first chunk")
+
         p_cfg = config.providers.get(p_name)
         if p_cfg:
             p_cfg.reset_consecutive_failures()
+        from app.services.stats_service import stats_service
+        stats_service.record_request(p_name, actual_id, ttft_ms=first_ttft)
 
         if self._tool_mode() != "local_agent":
             async def passthrough_gen():
                 yield first_chunk
-                async for chunk in StreamerService.stream_with_heartbeat(gen, p_name, actual_id, self.fastapi_request):
+                async for chunk in StreamerService.stream_with_heartbeat(
+                    gen,
+                    p_name,
+                    actual_id,
+                    self.fastapi_request,
+                    initial_chunks=1,
+                    initial_bytes=len(first_chunk),
+                ):
                     if await self.fastapi_request.is_disconnected():
                         break
                     yield chunk
@@ -261,7 +276,14 @@ class AgentService:
 
             # 2. Main relay loop
             pending_buffer = ""
-            async for chunk in StreamerService.stream_with_heartbeat(current_gen, p_name, current_id, self.fastapi_request):
+            async for chunk in StreamerService.stream_with_heartbeat(
+                current_gen,
+                p_name,
+                current_id,
+                self.fastapi_request,
+                initial_chunks=1,
+                initial_bytes=len(current_first),
+            ):
                 if await self.fastapi_request.is_disconnected(): break
                 
                 # Relay non-data pings immediately
@@ -330,6 +352,7 @@ class AgentService:
                     next_gen = provider.chat_completion_stream(request, current_id, timeout=probe_timeout)
                     try:
                         next_first = await next_gen.__anext__()
+                        logger.info(f"[STREAM] First chunk for {current_id} received after tool call (len={len(next_first)})")
                         async for c in agent_gen(next_gen, current_id, next_first, current_iter + 1):
                             yield c
                         return
