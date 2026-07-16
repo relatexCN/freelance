@@ -18,14 +18,14 @@ providers:
     base_url: https://ollama.com/v1
     api_key: ${OLLAMA_API_KEY:}
     timeout: 120
-    default_model: gemma4:31b-cloud  # Auto模式下使用的默认模型
+    default_model: nemotron-3-ultra  # Auto模式下使用的默认模型
 
   openrouter:
     type: openai
     base_url: https://openrouter.ai/api/v1
     api_key: ${OPENROUTER_API_KEY:}
     timeout: 120
-    default_model: nvidia/nemotron-3-super-120b-a12b:free  # Auto模式下使用的默认模型
+    default_model: nvidia/nemotron-3-ultra-550b-a55b:free  # Auto模式下使用的默认模型
 
   groq:
     type: openai
@@ -52,7 +52,7 @@ providers:
     base_url: https://integrate.api.nvidia.com/v1
     api_key: ${NVIDIA_API_KEY:}
     timeout: 250
-    default_model: minimaxai/minimax-m2.7
+    default_model: openai/gpt-oss-120b
 
   mistral:
     type: openai
@@ -84,6 +84,13 @@ providers:
     api_key: ${GEMINI_API_KEY:}
     timeout: 300
 
+  agnes-ai:
+    type: openai
+    base_url: https://apihub.agnes-ai.com/v1
+    api_key: ${AGNES_API_KEY:}
+    timeout: 60
+    default_model: agnes-2.0-flash
+
 # Model routing rules
 # When a client requests a model, it will be routed to the specified provider
 # If no route matches, the default provider will be used
@@ -106,6 +113,12 @@ models:
   "claude-3-opus": { provider: "openrouter", model: "anthropic/claude-3-opus" }
   "gemini-pro": { provider: "openrouter", model: "google/gemini-pro-1.5" }
   "deepseek-chat": { provider: "openrouter", model: "deepseek/deepseek-chat" }
+
+  # Agnes-ai models
+  "agnes-2.0-flash": { provider: "agnes-ai", model: "agnes-2.0-flash" }
+  "agnes-image-2.0-flash": { provider: "agnes-ai", model: "agnes-image-2.0-flash" }
+  "agnes-image-2.1-flash": { provider: "agnes-ai", model: "agnes-image-2.1-flash" }
+  "agnes-video-v2.0": { provider: "agnes-ai", model: "agnes-video-v2.0" }
 
 # Default provider when model is not found in routing table
 # default_provider: "ollama"
