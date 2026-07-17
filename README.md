@@ -511,22 +511,55 @@ best-free
 
 | 维度 | 权重 | 说明 |
 | --- | --- | --- |
-| `context_length` | 40% | 上下文越长分数越高，最高按 1,000,000 tokens 归一 |
-| `capabilities` | 30% | 根据 `supported_parameters` 或模型名启发式能力加分 |
-| `recency` | 20% | 模型越新分数越高 |
-| `provider_trust` | 10% | 常见可信模型组织或供应商加分 |
+| `capabilities` | 40% | 按工具调用、推理、结构化输出、Token 控制等能力组计分；同组参数再多也不会重复加分 |
+| `context` | 20% | 8K 到 1M 之间采用对数曲线，长上下文仍有优势，但收益递减 |
+| `recency` | 15% | 默认按 730 天半衰期平滑衰减；缺失或异常时间使用中性分 |
+| `model_tier` | 15% | 根据 `pro/ultra/max/opus/sonnet`、参数规模及 `flash/lite/mini` 等模型档位标识评分 |
+| `stability` | 10% | 稳定版本优先，`preview/beta/experimental/latest` 等版本适度降权 |
 
-供应商还可以通过 `score_offset` 调整整体排序：
+默认不再根据模型组织或供应商名称提供信任加分，避免供应商身份主导模型排名。每个模型会保存 `_score_components` 分项明细，`/models` 通过 `score_breakdown` 返回，`latest_models.log` 也会逐项展示。
+
+供应商仍可通过 `score_offset` 做小幅运维修正，但最终修正会被 `max_provider_adjustment` 限制，默认最多 ±0.03：
 
 ```yaml
 providers:
   groq:
-    score_offset: 0.5
+    score_offset: 0.02
+
+settings:
+  scoring:
+    capabilities_weight: 0.40
+    context_weight: 0.20
+    recency_weight: 0.15
+    model_tier_weight: 0.15
+    stability_weight: 0.10
+    recency_half_life_days: 730
+    max_provider_adjustment: 0.03
 ```
+
+权重会自动归一化，因此允许按需调整而不必严格相加为 1。
 
 ## 自动路由中的供应商和模型切换
 
 这是当前项目最核心的切换规则。
+
+### 自定义模型排名（可选）
+
+可以用 `auto_routing.custom_ranking` 显式指定 `auto/free/best-free` 的优先调用顺序：
+
+```yaml
+auto_routing:
+  custom_ranking:
+    - { provider: "agnes-ai", model: "agnes-2.0-flash" }
+    - { provider: "agnes-ai", model: "agnes-image-2.0-flash" }
+    - { provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free" }
+```
+
+- 列表从上到下依次尝试，重复项会自动去重。
+- 自定义项不依赖 `/models` 缓存；只要 provider 已配置 API key，即使模型发现没有返回该模型，它仍可参与调用。
+- 自定义列表之后会追加原有评分和 `default_model` 规则生成的候选，作为回退。
+- 未配置 `auto_routing`、删除 `custom_ranking`，或将它设为 `[]` 时，完全使用原有默认排名。
+- 推荐使用上面的 `{ provider, model }` 写法；也支持 `models` 中已有的别名，以及 `"provider:model-id"` 简写。
 
 ### 候选列表生成规则
 
@@ -534,10 +567,12 @@ providers:
 
 备注：推荐为生产环境中的每个供应商设置 `default_model`。未设置时，该供应商的所有缓存模型都会按评分进入自动候选，模型可能随上游 `/models` 返回结果和评分变化而变化；设置后，该供应商在自动路由中只尝试指定默认模型，行为更可控。
 
-1. 读取已经按 `_score` 排好序的 `auto_models_cache`。
-2. 如果某个供应商没有配置 `default_model`，该供应商缓存中的所有模型都可以进入候选列表，顺序按评分。
-3. 如果某个供应商配置了 `default_model`，该供应商只有这个 `default_model` 可以进入候选列表，其他模型即使评分更高也会被跳过。
-4. 如果配置了 `default_model`，但该模型没有出现在 `/models` 缓存中，只要该供应商配置了 API key，网关仍会把这个 `default_model` 作为兜底候选追加进去。
+1. 如果配置了 `custom_ranking`，先按配置顺序加入这些模型。
+2. 读取已经按 `_score` 排好序的 `auto_models_cache`。
+3. 如果某个供应商没有配置 `default_model`，该供应商缓存中的所有模型都可以进入候选列表，顺序按评分。
+4. 如果某个供应商配置了 `default_model`，默认排名中只有这个 `default_model` 可以进入候选列表；自定义排名仍可显式加入该供应商的其他模型。
+5. 如果配置了 `default_model`，但该模型没有出现在 `/models` 缓存中，只要该供应商配置了 API key，网关仍会把这个 `default_model` 作为兜底候选追加进去。
+6. 合并候选并去重；自定义排名在前，默认排名在后。
 
 示例：
 
@@ -768,14 +803,14 @@ settings:
 
 ```text
 --- A: Theoretical Ranking (by score, grouped by provider) ---
---- B: Actual Routing (by provider, reflecting default_model strategy) ---
+--- B: Actual Routing (custom ranking + default fallbacks) ---
 ```
 
 用途：
 
 - 查看每个供应商拉到了哪些模型。
 - 查看模型理论评分。
-- 查看自动路由中每个供应商实际会使用哪个默认模型。
+- 查看自动路由的真实候选顺序，以及哪些候选来自自定义排名。
 - 发现某个 provider 的 `/models` 是否返回为空。
 
 ### error_models.log
@@ -887,7 +922,7 @@ providers:
 - `model=auto`、`model=free`、`model=best-free` 当前走同一套聊天候选逻辑；免费过滤主要体现在 `/models?mode=free` 展示接口。
 - `latest_models.log` 只有在模型刷新成功且至少获取到一个模型时才会重写；如果所有供应商 `/models` 都失败，旧文件会保留。
 - `latest_models.log` 的理论排名是按供应商分组展示，每组内部按分数排序，不是一个纯全局列表。
-- 自动路由的“实际排名”来自当前缓存和 `default_model` 配置，不是基于历史成功率的实时学习排序。
+- 自动路由的“实际排名”优先来自可选的 `custom_ranking`，其后来自当前缓存和 `default_model` 配置，不是基于历史成功率的实时学习排序。
 - 只有配置了 API key 的供应商会实例化并参与自动发现；没有 key 的供应商仍可保留在配置中，但不会被自动路由使用。
 
 ## License

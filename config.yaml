@@ -1,16 +1,30 @@
-# API Gateway Configuration
-# Model routing: map model names to providers
-# Format: "model_alias" -> provider + actual model name
+# API 网关配置
+# 模型路由：把客户端使用的模型名称映射到具体供应商
+# 格式："模型别名" -> 供应商 + 上游真实模型名称
+
+# model=auto/free/best-free 的可选自定义调用顺序：
+# 1. custom_ranking 中的模型严格按照从上到下的顺序优先尝试；
+# 2. 自定义模型全部失败后，继续尝试评分机制及 default_model 生成的默认候选；
+# 3. 删除 auto_routing、删除 custom_ranking，或保留空列表 []，均表示使用默认排名；
+# 4. 每项必须填写已存在的 provider 和上游真实 model ID；重复项会自动去重；
+# 5. 自定义项即使没有出现在上游 /models 返回值中，只要供应商配置了 API key 仍可调用。
+auto_routing:
+  custom_ranking: []  # 空列表表示不干预评分排名
+  # 自定义顺序示例（启用时删除上面的 [] 并取消以下注释）：
+  # custom_ranking:
+  #   - { provider: "agnes-ai", model: "agnes-2.0-flash" }
+  #   - { provider: "agnes-ai", model: "agnes-image-2.0-flash" }
+  #   - { provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free" }
 
 providers:
-  # Optional provider-level pass-through controls:
-  # pass_through_body: false          # Forward the original JSON body after forcing model/stream.
-  # header_passthrough: ["x-request-id", "re:^x-custom-"]
-  # header_overrides:
+  # 供应商级请求透传选项（以下为公共示例，可配置到任意具体 provider 下）：
+  # pass_through_body: false          # 是否透传客户端原始 JSON；model 和 stream 始终由网关覆盖
+  # header_passthrough: ["x-request-id", "re:^x-custom-"] # 允许透传的请求头，支持 re: 正则表达式
+  # header_overrides:                 # 固定设置或根据客户端请求头生成上游请求头
   #   X-Provider-Feature: "enabled"
   #   X-Client-Trace: "{client_header:x-trace-id}"
-  # disabled_fields: ["stream_options.include_obfuscation", "service_tier"]
-  # param_overrides:
+  # disabled_fields: ["stream_options.include_obfuscation", "service_tier"] # 发送上游前删除的字段
+  # param_overrides:                  # 按路径设置或删除请求参数
   #   - { op: "set", path: "reasoning.enabled", value: true }
   #   - { op: "delete", path: "temperature" }
   ollama:
@@ -32,7 +46,7 @@ providers:
     base_url: https://api.groq.com/openai/v1/responses
     api_key: ${GROQ_API_KEY:}
     timeout: 60
-    score_offset: 0.5  # Boost Groq models due to extreme low latency
+    score_offset: 0.03  # 因低延迟给予小幅加分；实际值受 max_provider_adjustment 限制
     default_model: groq/compound
 
   cerebras:
@@ -91,11 +105,11 @@ providers:
     timeout: 60
     default_model: agnes-2.0-flash
 
-# Model routing rules
-# When a client requests a model, it will be routed to the specified provider
-# If no route matches, the default provider will be used
+# 模型别名路由规则
+# 客户端请求下列别名时，网关将请求转发到指定 provider 的真实 model
+# 如果没有匹配任何别名，则使用 default_provider
 models:
-  # Ollama models
+  # Ollama 模型
   "llama3": { provider: "ollama", model: "llama3" }
   "llama3:8b": { provider: "ollama", model: "llama3:8b" }
   "llama3:70b": { provider: "ollama", model: "llama3:70b" }
@@ -106,7 +120,7 @@ models:
   "mistral": { provider: "ollama", model: "mistral" }
   "codellama": { provider: "ollama", model: "codellama" }
 
-  # OpenRouter models
+  # OpenRouter 模型
   "gpt-4o": { provider: "openrouter", model: "openai/gpt-4o" }
   "gpt-4o-mini": { provider: "openrouter", model: "openai/gpt-4o-mini" }
   "claude-3.5-sonnet": { provider: "openrouter", model: "anthropic/claude-3.5-sonnet" }
@@ -114,22 +128,37 @@ models:
   "gemini-pro": { provider: "openrouter", model: "google/gemini-pro-1.5" }
   "deepseek-chat": { provider: "openrouter", model: "deepseek/deepseek-chat" }
 
-  # Agnes-ai models
+  # Agnes-ai 模型
   "agnes-2.0-flash": { provider: "agnes-ai", model: "agnes-2.0-flash" }
   "agnes-image-2.0-flash": { provider: "agnes-ai", model: "agnes-image-2.0-flash" }
   "agnes-image-2.1-flash": { provider: "agnes-ai", model: "agnes-image-2.1-flash" }
   "agnes-video-v2.0": { provider: "agnes-ai", model: "agnes-video-v2.0" }
 
-# Default provider when model is not found in routing table
+# 模型名称未命中 models 路由表时使用的默认供应商
 # default_provider: "ollama"
 
-# Global settings
+# 全局设置
 settings:
   # 最大重试次数
   max_retries: 2
   # 统一超时时间（秒），null表示使用各提供商默认超时
   # 默认为20秒
   unified_timeout: 180
+
+  # 可解释模型评分：
+  # - 所有权重会自动归一化，因此不要求相加严格等于 1；
+  # - 默认不根据供应商或模型组织名称增加信任分；
+  # - 最终基础分 = 各维度得分乘以归一化后的对应权重；
+  # - provider.score_offset 仅作为小幅运维修正，受 max_provider_adjustment 限制；
+  # - 修改后需重启服务，并在模型缓存刷新后生成新的排名。
+  scoring:
+    capabilities_weight: 0.40  # 能力覆盖权重：工具调用、推理、结构化输出等能力组
+    context_weight: 0.20       # 上下文长度权重：8K 到 1M 使用对数曲线，收益递减
+    recency_weight: 0.15       # 发布时间权重：越新的模型得分越高
+    model_tier_weight: 0.15    # 模型档位权重：区分 pro/ultra/max 与 flash/lite/mini 等
+    stability_weight: 0.10     # 稳定性权重：preview/beta/experimental/latest 等会适度降分
+    recency_half_life_days: 730 # 时间分半衰期（天）；模型每老 730 天，时间得分减半
+    max_provider_adjustment: 0.03 # 单个供应商 score_offset 的最大绝对值，0.03 表示最多 ±0.03
   
   # 融断与冷却设置（秒）
   cooldown:
@@ -151,10 +180,10 @@ settings:
     disable_model_status_codes: "404"
     disable_provider_status_codes: ""
 
-  # Tool-call handling:
-  # passthrough  - forward OpenAI tools/tool_calls without local execution (default)
-  # local_agent  - execute supported local tools inside this gateway
-  # disabled     - remove tool controls before sending requests upstream
+  # 工具调用处理方式：
+  # passthrough  - 原样转发 OpenAI tools/tool_calls，由客户端负责处理（默认）
+  # local_agent  - 在网关内部执行受支持的工具调用
+  # disabled     - 发送上游前移除工具相关参数
   tools:
     mode: passthrough
 

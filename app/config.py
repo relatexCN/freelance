@@ -107,6 +107,17 @@ class ToolSettings(BaseModel):
         mode = (self.mode or "passthrough").strip().lower()
         return mode if mode in {"passthrough", "local_agent", "disabled"} else "passthrough"
 
+
+class ScoringSettings(BaseModel):
+    """Weights for metadata-based model ranking."""
+    capabilities_weight: float = 0.40
+    context_weight: float = 0.20
+    recency_weight: float = 0.15
+    model_tier_weight: float = 0.15
+    stability_weight: float = 0.10
+    recency_half_life_days: int = 730
+    max_provider_adjustment: float = 0.03
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -122,6 +133,7 @@ class Settings(BaseSettings):
     connection_pool: PoolSettings = Field(default_factory=PoolSettings)
     error_policy: ErrorPolicySettings = Field(default_factory=ErrorPolicySettings)
     tools: ToolSettings = Field(default_factory=ToolSettings)
+    scoring: ScoringSettings = Field(default_factory=ScoringSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -340,6 +352,7 @@ class AppConfig:
         self.providers: dict[str, ProviderConfig] = {}
         self.model_routes: dict[str, ModelRoute] = {}
         self.default_provider: str = "ollama"
+        self.custom_model_ranking: list[tuple[str, str]] = []
         self.auto_models_cache: list[dict] = []  # Ranked list of available models
         self.auto_models_last_update: float = 0.0
         self.providers_with_models_in_cache: set = set()  # Providers that successfully returned models
@@ -417,6 +430,30 @@ class AppConfig:
                             raise ValueError(f"Invalid tools.mode: {mode}")
                         self.settings.tools.mode = mode
 
+                if "scoring" in s_data:
+                    scoring_data = s_data["scoring"] or {}
+                    for key, val in scoring_data.items():
+                        if not hasattr(self.settings.scoring, key):
+                            continue
+                        if key == "recency_half_life_days":
+                            parsed = int(val)
+                            if parsed <= 0:
+                                raise ValueError("scoring.recency_half_life_days must be positive")
+                        else:
+                            parsed = float(val)
+                            if parsed < 0:
+                                raise ValueError(f"scoring.{key} cannot be negative")
+                        setattr(self.settings.scoring, key, parsed)
+                    scoring_weights = (
+                        self.settings.scoring.capabilities_weight,
+                        self.settings.scoring.context_weight,
+                        self.settings.scoring.recency_weight,
+                        self.settings.scoring.model_tier_weight,
+                        self.settings.scoring.stability_weight,
+                    )
+                    if sum(scoring_weights) <= 0:
+                        raise ValueError("At least one settings.scoring weight must be positive")
+
             # Load providers
             provider_count = 0
             providers_data = raw.get("providers", {})
@@ -456,10 +493,54 @@ class AppConfig:
                         model=mconf["model"],
                     )
                     route_count += 1
+
+            # Optional explicit priority for auto/free/best-free routing.  Dict
+            # entries are unambiguous and are the documented form; aliases are
+            # also accepted as a convenience when they exist in `models`.
+            auto_routing = raw.get("auto_routing", {}) or {}
+            ranking_data = auto_routing.get("custom_ranking", []) or []
+            if not isinstance(ranking_data, list):
+                raise ValueError("auto_routing.custom_ranking must be a list")
+
+            ranking_seen = set()
+            for index, entry in enumerate(ranking_data):
+                provider_name = ""
+                model_id = ""
+                if isinstance(entry, dict):
+                    provider_name = str(entry.get("provider", "")).strip()
+                    model_id = str(entry.get("model", "")).strip()
+                elif isinstance(entry, str):
+                    route = self.model_routes.get(entry.strip())
+                    if route:
+                        provider_name, model_id = route.provider, route.model
+                    elif ":" in entry:
+                        provider_name, model_id = (part.strip() for part in entry.split(":", 1))
+
+                if not provider_name or not model_id:
+                    raise ValueError(
+                        f"Invalid auto_routing.custom_ranking entry at index {index}: "
+                        "expected {provider: ..., model: ...}, a configured model alias, "
+                        "or 'provider:model'"
+                    )
+                if provider_name not in self.providers:
+                    raise ValueError(
+                        f"Unknown provider '{provider_name}' in "
+                        f"auto_routing.custom_ranking entry {index}"
+                    )
+
+                pair = (provider_name, model_id)
+                if pair not in ranking_seen:
+                    self.custom_model_ranking.append(pair)
+                    ranking_seen.add(pair)
             
             self.default_provider = raw.get("default_provider", "ollama")
             logger.info(f"[*] Configuration loaded from: {config_path.absolute()}")
             logger.info(f"Loaded {provider_count} providers and {route_count} routes")
+            if self.custom_model_ranking:
+                logger.info(
+                    "Loaded custom auto-routing ranking with "
+                    f"{len(self.custom_model_ranking)} model(s)"
+                )
 
         except Exception as e:
             logger.error(f"Critical error parsing {config_path}: {e}")

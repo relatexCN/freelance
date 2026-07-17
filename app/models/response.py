@@ -88,6 +88,7 @@ class ModelInfo(BaseModel):
     score: Optional[float] = 0.0
     context_length: Optional[int] = None
     capabilities: Optional[list[str]] = None
+    score_breakdown: Optional[dict[str, float]] = None
     
     model_config = {"extra": "allow"}
 

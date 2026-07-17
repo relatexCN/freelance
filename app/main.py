@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import config
 from app.routers import chat, stats
-from app.services.router import _providers, get_provider_instance
+from app.services.router import RouterService, _providers, get_provider_instance
 from app.scoring import rank_models
 
 # ----------------------------
@@ -105,7 +105,18 @@ def _write_latest_models_log(ranked_models: list, providers_with_models: set):
             global_idx += 1
             model_id = m.get("id", "unknown")
             score = m.get("_score", 0)
-            lines.append(f"    {global_idx:4d}. {model_id:54s}  score={score:.4f}\n")
+            components = m.get("_score_components", {})
+            component_note = (
+                f" cap={components.get('capabilities', 0):.2f}"
+                f" ctx={components.get('context', 0):.2f}"
+                f" recent={components.get('recency', 0):.2f}"
+                f" tier={components.get('model_tier', 0):.2f}"
+                f" stable={components.get('stability', 0):.2f}"
+                f" provider_adj={components.get('provider_adjustment', 0):+.3f}"
+            )
+            lines.append(
+                f"    {global_idx:4d}. {model_id:54s}  score={score:.4f}{component_note}\n"
+            )
         if len(models) > 20:
             lines.append(f"    ... ({len(models) - 20} more models omitted)\n")
 
@@ -116,25 +127,19 @@ def _write_latest_models_log(ranked_models: list, providers_with_models: set):
             p_cfg = configured_providers[p_name]
             lines.append(f"    {p_name} [{len(p_cfg.api_keys)} keys]: list_models returned empty or failed\n")
 
-    lines.append(f"\n--- B: Actual Routing (by provider, reflecting default_model strategy) ---\n")
-    actual_idx = 0
-    for p_name, p_cfg in configured_providers.items():
-        if p_cfg.default_model:
-            actual_idx += 1
-            in_cache = any(
-                m.get("_gateway_provider") == p_name and m.get("id") == p_cfg.default_model
-                for m in ranked_models
-            )
-            cache_note = "" if in_cache else " (not in cache, used as fallback)"
-            lines.append(f"    {actual_idx:4d}. [{p_name:16s}] {p_cfg.default_model}{cache_note}\n")
-        else:
-            provider_specific = [m for m in ranked_models if m.get("_gateway_provider") == p_name]
-            if provider_specific:
-                for m in provider_specific:
-                    actual_idx += 1
-                    lines.append(f"    {actual_idx:4d}. [{p_name:16s}] {m.get('id', 'unknown')}\n")
-            else:
-                lines.append(f"         [{p_name:16s}] (no models in cache, provider skipped)\n")
+    routing_mode = "custom ranking + default fallbacks" if config.custom_model_ranking else "default ranking"
+    lines.append(f"\n--- B: Actual Routing ({routing_mode}) ---\n")
+    custom_pairs = set(config.custom_model_ranking)
+    for actual_idx, (p_name, model_id) in enumerate(RouterService.build_auto_candidates(), 1):
+        marker = " [custom]" if (p_name, model_id) in custom_pairs else ""
+        in_cache = any(
+            m.get("_gateway_provider") == p_name and m.get("id") == model_id
+            for m in ranked_models
+        )
+        cache_note = "" if in_cache else " (not in cache)"
+        lines.append(
+            f"    {actual_idx:4d}. [{p_name:16s}] {model_id}{marker}{cache_note}\n"
+        )
 
     try:
         with open(LATEST_MODELS_LOG, "w", encoding="utf-8") as f:

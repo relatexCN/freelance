@@ -35,6 +35,61 @@ class RouterService:
         return not (p_cfg.is_platform_melted() or p_cfg.is_model_melted(actual_id))
 
     @staticmethod
+    def build_auto_candidates() -> List[Tuple[str, str]]:
+        """Build auto-routing candidates, applying explicit ranking when present."""
+        default_ranked = []
+        providers_with_default = {
+            p_name for p_name, p_cfg in config.providers.items()
+            if p_cfg.default_model
+        }
+
+        seen = set()
+        for m in config.auto_models_cache:
+            p_name = m.get("_gateway_provider", config.default_provider)
+            model_id = m.get("id")
+            if not model_id:
+                continue
+            pair = (p_name, model_id)
+            if pair in seen:
+                continue
+            seen.add(pair)
+
+            p_cfg = config.providers.get(p_name)
+            if not p_cfg:
+                continue
+            if p_name not in providers_with_default or model_id == p_cfg.default_model:
+                default_ranked.append(pair)
+
+        # A configured default remains usable when /models omitted it or model
+        # discovery failed for that provider.
+        for p_name, p_cfg in config.providers.items():
+            if p_cfg.default_model and p_cfg.api_keys:
+                pair = (p_name, p_cfg.default_model)
+                if pair not in default_ranked:
+                    logger.info(
+                        f"[router] Adding fallback default_model for {p_name}: "
+                        f"{p_cfg.default_model}"
+                    )
+                    default_ranked.append(pair)
+
+        if not config.custom_model_ranking:
+            return default_ranked
+
+        # Explicit entries lead.  Keep the normal ranking after them so a
+        # partial custom list changes priority without removing safe fallbacks.
+        candidates = []
+        candidate_seen = set()
+        for pair in [*config.custom_model_ranking, *default_ranked]:
+            if pair in candidate_seen:
+                continue
+            p_cfg = config.providers.get(pair[0])
+            if not p_cfg or not p_cfg.api_keys:
+                continue
+            candidates.append(pair)
+            candidate_seen.add(pair)
+        return candidates
+
+    @staticmethod
     async def get_models_to_try(model_name: str) -> List[Tuple[str, str]]:
         """Resolve a requested model name to a ranked list of (provider, actual_id)."""
         model_name = model_name.lower()
@@ -42,55 +97,13 @@ class RouterService:
 
         if model_name in ("auto", "free", "best-free"):
             # Wait for cache if empty
-            if not config.auto_models_cache:
+            if not config.auto_models_cache and not config.custom_model_ranking:
                 start_wait = time.time()
                 while not config.auto_models_cache and (time.time() - start_wait) < 5.0:
                     await asyncio.sleep(1.0)
-            
-            if not config.auto_models_cache:
+            if not config.auto_models_cache and not config.custom_model_ranking:
                 return []
-
-            # Build a set of providers that have a default_model configured
-            providers_with_default = {
-                p_name for p_name, p_cfg in config.providers.items()
-                if p_cfg.default_model
-            }
-
-            # Iterate cache (already ranked by score) and apply filtering rules:
-            # - Provider WITHOUT default_model: include all its models
-            # - Provider WITH default_model: only include its default_model, skip others
-            seen = set()
-            for m in config.auto_models_cache:
-                p_name = m.get("_gateway_provider", config.default_provider)
-                model_id = m["id"]
-                pair = (p_name, model_id)
-
-                if pair in seen:
-                    continue
-                seen.add(pair)
-
-                p_cfg = config.providers.get(p_name)
-                if not p_cfg:
-                    continue
-
-                if p_name in providers_with_default:
-                    # Provider has a default_model: only allow the default_model itself
-                    if model_id == p_cfg.default_model:
-                        models_to_try.append(pair)
-                    # else: skip non-default models from this provider
-                else:
-                    # Provider has NO default_model: allow all its models (score-ranked)
-                    models_to_try.append(pair)
-
-            # Fallback: for providers with default_model, always ensure their
-            # default_model is tried (handles both list_models failure and
-            # default_model not being in the returned model list)
-            for p_name, p_cfg in config.providers.items():
-                if p_name in providers_with_default and p_cfg.default_model and p_cfg.api_keys:
-                    pair = (p_name, p_cfg.default_model)
-                    if pair not in seen:
-                        logger.info(f"[router] Adding fallback default_model for {p_name}: {p_cfg.default_model}")
-                        models_to_try.append(pair)
+            models_to_try = RouterService.build_auto_candidates()
         else:
             p_cfg, actual = config.resolve_model(model_name)
             if p_cfg:

@@ -1,196 +1,220 @@
-"""
-Model scoring and ranking logic based on FreeRide.
-"""
+"""Explainable metadata-based model scoring and ranking."""
 
-import time
 import logging
-from typing import Any
+import math
+import re
+import time
+from typing import Optional
 
-logger = logging.getLogger("link.scoring")
+logger = logging.getLogger("freelance.scoring")
 
-# Ranking weights from TrueRide
-RANKING_WEIGHTS = {
-    "context_length": 0.4,      # Prefer longer context
-    "capabilities": 0.3,        # Prefer more capabilities
-    "recency": 0.2,             # Prefer newer models
-    "provider_trust": 0.1       # Prefer trusted providers
-}
-
-# Recognized model families for heuristic guessing (context_length, capability_level, recency)
+# Fallback metadata for upstreams that omit context length or creation time.
 MODEL_SPECS = {
-    "llama-3.3": (128000, 0.9, 1733529600), # Newer llama 3.3
-    "llama-3.2": (128000, 0.7, 1727308800),
-    "llama-3.1": (128000, 0.8, 1721692800),
-    "llama-3": (8192, 0.5, 1713484800),
-    "gpt-4o": (128000, 1.0, 1715558400),
-    "gpt-4.1": (128000, 1.1, 1730000000),
-    "o1": (128000, 1.2, 1725000000),
-    "gemini-1.5-pro": (1000000, 0.9, 1715558400),
-    "gemini-1.5-flash": (1000000, 0.6, 1715558400),
-    "gemini-2.0-flash": (1000000, 0.8, 1734000000),
-    "qwen2.5": (128000, 0.8, 1726704000),
-    "deepseek-v3": (128000, 1.0, 1735000000),
-    "deepseek-r1": (128000, 1.2, 1737000000),
+    "llama-3.3": (128000, 0.80, 1733529600),
+    "llama-3.2": (128000, 0.70, 1727308800),
+    "llama-3.1": (128000, 0.75, 1721692800),
+    "llama-3": (8192, 0.50, 1713484800),
+    "gpt-4o": (128000, 0.85, 1715558400),
+    "gpt-4.1": (128000, 0.90, 1730000000),
+    "o1": (128000, 0.90, 1725000000),
+    "gemini-1.5-pro": (1000000, 0.80, 1715558400),
+    "gemini-1.5-flash": (1000000, 0.65, 1715558400),
+    "gemini-2.0-flash": (1000000, 0.70, 1734000000),
+    "qwen2.5": (128000, 0.75, 1726704000),
+    "deepseek-v3": (128000, 0.85, 1735000000),
+    "deepseek-r1": (128000, 0.90, 1737000000),
 }
 
-TRUSTED_PROVIDERS = [
-    "google", "meta-llama", "mistralai", "deepseek",
-    "nvidia", "qwen", "microsoft", "allenai", "arcee-ai",
-    "groq", "cerebras", "github", "sambanova", "mistral", "google-gemini"
-]
+# Capabilities are scored by useful feature groups.  Counting every parameter
+# independently over-rewards APIs that expose many equivalent sampling knobs.
+CAPABILITY_GROUPS = {
+    "tools": (0.25, {"tools", "tool_choice", "parallel_tool_calls"}),
+    "reasoning": (0.25, {"reasoning", "reasoning_effort", "include_reasoning"}),
+    "structured_output": (0.20, {"structured_outputs", "response_format", "json_mode"}),
+    "token_control": (0.10, {"max_tokens", "max_completion_tokens", "stop"}),
+    "sampling": (0.08, {"temperature", "top_p", "top_k", "min_p"}),
+    "penalties": (0.06, {"frequency_penalty", "presence_penalty", "repetition_penalty", "logit_bias"}),
+    "observability": (0.06, {"logprobs", "top_logprobs", "seed"}),
+}
+
+PREMIUM_TIER_MARKERS = ("pro", "ultra", "max", "opus", "sonnet", "large")
+FAST_TIER_MARKERS = ("flash", "lite", "mini", "nano", "small")
+UNSTABLE_MARKERS = ("preview", "beta", "experimental", "nightly", "canary")
+
 
 def heuristically_infer_specs(model_id: str):
-    """Attempt to guess context and capability based on model string keywords."""
-    model_id = model_id.lower()
-    ctx, cap, rel = 8192, 0.2, 0.0
-    
-    # Try specs map first
-    for key, (m_ctx, m_cap, m_rel) in MODEL_SPECS.items():
-        if key in model_id:
-            ctx, cap, rel = m_ctx, m_cap, m_rel
+    """Guess missing context/capability/recency metadata from a model ID."""
+    normalized_id = model_id.lower()
+    context, capability, released = 8192, 0.40, 0.0
+    for key, specs in MODEL_SPECS.items():
+        if key in normalized_id:
+            context, capability, released = specs
             break
-            
-    # Heuristic adjustments
-    if "-70b" in model_id or "-large" in model_id:
-        cap = max(cap, 0.8)
-    if "-405b" in model_id:
-        cap = max(cap, 1.0)
-    if "flash" in model_id or "nano" in model_id:
-        cap = cap * 0.7 # Penalize complex reasoning slightly for speed-focused models
-    if "vision" in model_id:
-        cap += 0.1
-        
-    return ctx, cap, rel
+    return context, capability, released
 
-def calculate_model_score(model: dict) -> float:
-    """
-    Calculate a ranking score for a model based on multiple criteria.
-    Supports standard OpenAI formats and knowledge-based fallbacks.
-    """
-    score = 0.0
-    model_id = model.get("id", "").lower()
 
-    # Get inferred base stats
-    inf_ctx, inf_cap, inf_rel = heuristically_infer_specs(model_id)
+def _context_score(context_length: int) -> float:
+    """Use diminishing returns between 8K and 1M tokens."""
+    lower, upper = 8192, 1_000_000
+    bounded = min(max(context_length, lower), upper)
+    return math.log(bounded / lower) / math.log(upper / lower)
 
-    # 1. Context length score (normalized to 0-1, max 1M tokens)
-    context_length = int(model.get("context_length", 0)) or inf_ctx
+
+def _capability_score(model: dict, inferred_score: float) -> float:
+    raw = model.get("supported_parameters") or model.get("capabilities") or []
+    if not isinstance(raw, (list, tuple, set)) or not raw:
+        return min(max(inferred_score, 0.0), 1.0)
+    capabilities = {str(item).strip().lower() for item in raw}
+    return sum(
+        weight for weight, members in CAPABILITY_GROUPS.values()
+        if capabilities.intersection(members)
+    )
+
+
+def _recency_score(created: float, half_life_days: int, now: float) -> float:
+    """Smoothly decay age; invalid or missing timestamps receive a neutral score."""
+    earliest_supported = 1420070400  # 2015-01-01
+    if not created or created < earliest_supported or created > now + 7 * 86400:
+        return 0.50
+    age_days = max(0.0, (now - created) / 86400)
+    return 2 ** (-age_days / half_life_days)
+
+
+def _model_tier_score(model_id: str) -> float:
+    name = model_id.lower().replace("_", "-")
+    tokens = {token for token in re.split(r"[^a-z0-9]+", name) if token}
+    if tokens.intersection(PREMIUM_TIER_MARKERS) or re.search(r"(?:^|[-/])(70|120|405|550)b(?:$|[-:])", name):
+        return 1.0
+    if tokens.intersection(FAST_TIER_MARKERS):
+        return 0.50
+    return 0.75
+
+
+def _stability_score(model_id: str) -> float:
+    name = model_id.lower()
+    if any(marker in name for marker in UNSTABLE_MARKERS):
+        return 0.45
+    if "latest" in name or name.startswith("~"):
+        return 0.70
+    return 1.0
+
+
+def calculate_model_score(model: dict, now: Optional[float] = None) -> float:
+    """Calculate and attach an explainable score between 0 and 1."""
+    from app.config import config
+
+    scoring = config.settings.scoring
+    model_id = str(model.get("id", "")).lower()
+    inferred_context, inferred_capability, inferred_release = heuristically_infer_specs(model_id)
+
+    try:
+        context_length = int(model.get("context_length", 0)) or inferred_context
+    except (TypeError, ValueError):
+        context_length = inferred_context
     model["context_length"] = context_length
-    
-    context_score = min(context_length / 1_000_000, 1.0)
-    score += context_score * RANKING_WEIGHTS["context_length"]
 
-    # 2. Capabilities score
-    capabilities = model.get("supported_parameters", [])
-    capability_count = len(capabilities) if capabilities else 0
-    
-    if capability_count:
-        capability_score = min(capability_count / 10, 1.0)
-    else:
-        capability_score = inf_cap
-        
-    model["_capability_score"] = capability_score
-    score += capability_score * RANKING_WEIGHTS["capabilities"]
+    created = model.get("created")
+    if not isinstance(created, (int, float)):
+        created = inferred_release
+    current_time = time.time() if now is None else now
 
-    # 3. Recency score (based on creation date)
-    created = 0
-    if "created" in model and isinstance(model["created"], (int, float)):
-        created = model["created"]
-    elif inf_rel:
-        created = inf_rel
-    
-    if created:
-        days_old = (time.time() - created) / 86400
-        recency_score = max(0, 1 - (days_old / 365))  # Newer models score higher
-        score += recency_score * RANKING_WEIGHTS["recency"]
+    raw_components = {
+        "capabilities": _capability_score(model, inferred_capability),
+        "context": _context_score(context_length),
+        "recency": _recency_score(created, scoring.recency_half_life_days, current_time),
+        "model_tier": _model_tier_score(model_id),
+        "stability": _stability_score(model_id),
+    }
+    weights = {
+        "capabilities": scoring.capabilities_weight,
+        "context": scoring.context_weight,
+        "recency": scoring.recency_weight,
+        "model_tier": scoring.model_tier_weight,
+        "stability": scoring.stability_weight,
+    }
+    weight_total = sum(weights.values())
+    if weight_total <= 0:
+        raise ValueError("At least one scoring weight must be greater than zero")
 
-    # 4. Provider trust score
-    provider = model_id.split("/")[0] if "/" in model_id else ""
-        
-    if provider in TRUSTED_PROVIDERS:
-        trust_index = TRUSTED_PROVIDERS.index(provider)
-        trust_score = 1 - (trust_index / (len(TRUSTED_PROVIDERS) * 2)) # Trust factor
-        score += trust_score * RANKING_WEIGHTS["provider_trust"]
-
+    weighted_components = {
+        name: raw_components[name] * weight / weight_total
+        for name, weight in weights.items()
+    }
+    score = sum(weighted_components.values())
+    model["_capability_score"] = raw_components["capabilities"]
+    model["_score_components"] = {
+        **{name: round(value, 6) for name, value in raw_components.items()},
+        "provider_adjustment": 0.0,
+    }
     return score
 
 
 def filter_free_models(models: list) -> list:
-    """Filter models to only include free ones."""
+    """Filter models to those advertised as free."""
     free_models = []
-
     for model in models:
         model_id = model.get("id", "")
         pricing = model.get("pricing")
-        
-        # If the model comes from a generic provider that isn't openrouter,
-        # we generally assume it's free/allowed for routing if the user configured it,
-        # unless it explicitly has pricing > 0.
         gateway_provider = model.get("_gateway_provider", "")
-        is_openrouter = "openrouter" in gateway_provider.lower() or "openrouter" in model.get("owned_by", "").lower()
-
+        is_openrouter = (
+            "openrouter" in gateway_provider.lower()
+            or "openrouter" in model.get("owned_by", "").lower()
+        )
         if not is_openrouter:
             free_models.append(model)
             continue
-
-        # OpenRouter specific filtering
         if pricing is not None:
             prompt_cost = pricing.get("prompt")
-            if prompt_cost is not None:
-                try:
-                    if float(prompt_cost) == 0:
-                        free_models.append(model)
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-        # Also include models with :free suffix
+            try:
+                if prompt_cost is not None and float(prompt_cost) == 0:
+                    free_models.append(model)
+                    continue
+            except (ValueError, TypeError):
+                pass
         if ":free" in model_id and model not in free_models:
             free_models.append(model)
-
     return free_models
 
 
 def filter_paid_models(models: list) -> list:
-    """Filter only for paid models (those not in free_models)."""
+    """Filter models not classified as free."""
     free_ids = {str(m.get("id")) for m in filter_free_models(models)}
     return [m for m in models if str(m.get("id")) not in free_ids]
 
 
 def rank_models(models: list, only_free: bool = False) -> list:
-    """Rank models based on scores. Can optionally filter only for free models."""
+    """Rank models and apply a tightly bounded provider adjustment."""
     try:
         if not models:
             return []
-            
-        if only_free:
-            filtered = filter_free_models(models)
-        else:
-            filtered = models
-
+        filtered = filter_free_models(models) if only_free else models
         scored_models = []
         from app.config import config
-        
+
+        adjustment_limit = config.settings.scoring.max_provider_adjustment
         for model in filtered:
             if not isinstance(model, dict):
                 continue
-                
             try:
                 score = calculate_model_score(model)
-                # Apply provider offsets
-                p_name = model.get("_gateway_provider")
-                if p_name and p_name in config.providers:
-                    p_config = config.providers[p_name]
-                    score += p_config.score_offset
-                    
+                provider_name = model.get("_gateway_provider")
+                adjustment = 0.0
+                if provider_name and provider_name in config.providers:
+                    configured = config.providers[provider_name].score_offset
+                    adjustment = max(-adjustment_limit, min(configured, adjustment_limit))
+                score = max(0.0, min(1.0, score + adjustment))
+                model["_score_components"]["provider_adjustment"] = round(adjustment, 6)
                 model["_score"] = score
                 scored_models.append(model)
-            except Exception as e:
-                logger.warning(f"Error scoring individual model: {e}")
-                model["_score"] = 0.1
+            except Exception as exc:
+                logger.warning(f"Error scoring individual model: {exc}")
+                model["_score"] = 0.0
                 scored_models.append(model)
 
-        return sorted(scored_models, key=lambda x: x.get("_score", 0), reverse=True)
-    except Exception as e:
-        logger.error(f"Critical error in rank_models: {e}")
-        return models  # Return unsorted as fallback
+        return sorted(
+            scored_models,
+            key=lambda item: (-item.get("_score", 0), str(item.get("id", ""))),
+        )
+    except Exception as exc:
+        logger.error(f"Critical error in rank_models: {exc}")
+        return models

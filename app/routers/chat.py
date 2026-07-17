@@ -44,6 +44,7 @@ async def list_models(mode: str = "all"):
             score=m.get("_score", 0.0),
             context_length=m.get("context_length"),
             capabilities=m.get("supported_parameters") or m.get("capabilities"),
+            score_breakdown=m.get("_score_components"),
         )
         for m in scored
         if isinstance(m, dict) and m.get("id")
@@ -65,6 +66,7 @@ async def get_model(model_id: str):
                 score=m.get("_score", 0.0),
                 context_length=m.get("context_length"),
                 capabilities=m.get("supported_parameters") or m.get("capabilities"),
+                score_breakdown=m.get("_score_components"),
             ).model_dump()
 
     return make_error_response("Not found", 404)
