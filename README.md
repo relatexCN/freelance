@@ -543,6 +543,15 @@ settings:
 
 这是当前项目最核心的切换规则。
 
+### 对话内切换命令
+
+- `/switch`：将自动路由轮转到下一个优先级模型，并保留其后的候选模型作为故障回退。
+- `/switch:openrouter:nvidia/chatgpt5.6`：固定调用 `openrouter` 供应商的 `nvidia/chatgpt5.6` 模型。
+- `/switch:auto`：清除当前会话的固定选择，恢复自动路由第一优先级。
+- 只有内容完全匹配上述格式的用户消息才会作为命令处理；普通正文中提到 `/switch` 不会触发切换。
+- 网关依次从 `X-Freelance-Session-ID`、`X-OpenClaw-Session-ID`、`X-Conversation-ID`、`X-Session-ID`、`X-Chat-ID` 请求头及 OpenAI `user` 字段识别会话；切换状态默认保留 24 小时。
+- 没有稳定会话标识时，网关仍根据请求携带的消息历史重建切换状态，作为兼容降级。
+
 ### 自定义模型排名（可选）
 
 可以用 `auto_routing.custom_ranking` 显式指定 `auto/free/best-free` 的优先调用顺序：

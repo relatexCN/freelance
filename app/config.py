@@ -128,6 +128,7 @@ class Settings(BaseSettings):
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
     max_iterations: int = Field(default=3, alias="MAX_ITERATIONS")
     unified_timeout: Optional[float] = Field(default=None, alias="UNIFIED_TIMEOUT")
+    switch_session_ttl_seconds: int = Field(default=86400, alias="SWITCH_SESSION_TTL_SECONDS")
     cooldown: CooldownSettings = Field(default_factory=CooldownSettings)
     stream_probe: StreamProbeSettings = Field(default_factory=StreamProbeSettings)
     connection_pool: PoolSettings = Field(default_factory=PoolSettings)
@@ -386,6 +387,11 @@ class AppConfig:
                         self.settings.unified_timeout = float(unified_timeout_val)
                     else:
                         self.settings.unified_timeout = None
+                if "switch_session_ttl_seconds" in s_data:
+                    switch_ttl = int(s_data["switch_session_ttl_seconds"])
+                    if switch_ttl <= 0:
+                        raise ValueError("settings.switch_session_ttl_seconds must be positive")
+                    self.settings.switch_session_ttl_seconds = switch_ttl
                 
                 if "cooldown" in s_data:
                     c_data = s_data["cooldown"]

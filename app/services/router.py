@@ -1,7 +1,9 @@
 import asyncio
 import os
+import threading
 import time
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple, Optional, Any
 
@@ -17,6 +19,14 @@ ERROR_MODELS_LOG = "error_models.log"
 # Only instantiate providers that have API keys configured
 _providers = {name: get_provider(p_cfg) for name, p_cfg in config.providers.items() if p_cfg.api_keys}
 
+
+@dataclass
+class SessionSwitchState:
+    provider: str
+    model: str
+    explicit: bool
+    expires_at: float
+
 def get_provider_instance(name: str, force_create: bool = False):
     """Retrieve or optionally create a provider instance."""
     if name not in _providers and force_create:
@@ -26,6 +36,239 @@ def get_provider_instance(name: str, force_create: bool = False):
     return _providers.get(name)
 
 class RouterService:
+    _SWITCH_PREFIX = "/switch"
+    _SWITCH_AUTO = "__auto__"
+    _session_switches: dict[str, SessionSwitchState] = {}
+    _session_switch_lock = threading.Lock()
+
+    @staticmethod
+    def resolve_session_id(request: Any) -> Optional[str]:
+        """Resolve an explicit, stable session identifier without unsafe IP fallbacks."""
+        headers = getattr(request, "_gateway_headers", {}) or {}
+        normalized_headers = {str(k).lower(): str(v).strip() for k, v in headers.items()}
+        for header_name in (
+            "x-freelance-session-id",
+            "x-openclaw-session-id",
+            "x-conversation-id",
+            "x-session-id",
+            "x-chat-id",
+        ):
+            value = normalized_headers.get(header_name, "")
+            if value and len(value) <= 512:
+                return f"header:{header_name}:{value}"
+
+        user = str(getattr(request, "user", "") or "").strip()
+        if user and len(user) <= 512:
+            return f"user:{user}"
+        return None
+
+    @staticmethod
+    def _purge_expired_switches(now: Optional[float] = None):
+        current_time = time.time() if now is None else now
+        expired = [
+            session_id
+            for session_id, state in RouterService._session_switches.items()
+            if state.expires_at <= current_time
+        ]
+        for session_id in expired:
+            RouterService._session_switches.pop(session_id, None)
+
+    @staticmethod
+    def _get_session_switch(session_id: str) -> Optional[SessionSwitchState]:
+        with RouterService._session_switch_lock:
+            RouterService._purge_expired_switches()
+            state = RouterService._session_switches.get(session_id)
+            if state is None:
+                return None
+            state.expires_at = time.time() + config.settings.switch_session_ttl_seconds
+            return state
+
+    @staticmethod
+    def _set_session_switch(
+        session_id: str, target: Tuple[str, str], *, explicit: bool
+    ) -> SessionSwitchState:
+        state = SessionSwitchState(
+            provider=target[0],
+            model=target[1],
+            explicit=explicit,
+            expires_at=time.time() + config.settings.switch_session_ttl_seconds,
+        )
+        with RouterService._session_switch_lock:
+            RouterService._purge_expired_switches()
+            RouterService._session_switches[session_id] = state
+        return state
+
+    @staticmethod
+    def _clear_session_switch(session_id: str):
+        with RouterService._session_switch_lock:
+            RouterService._session_switches.pop(session_id, None)
+
+    @staticmethod
+    def clear_session_switches():
+        """Clear all in-memory switch state; primarily useful for controlled resets/tests."""
+        with RouterService._session_switch_lock:
+            RouterService._session_switches.clear()
+
+    @staticmethod
+    def _message_text(message: Any) -> str:
+        """Return plain text only when a message has an unambiguous text body."""
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list) and content:
+            text_parts = []
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in ("text", "input_text"):
+                    return ""
+                value = part.get("text")
+                if not isinstance(value, str):
+                    return ""
+                text_parts.append(value)
+            text = "\n".join(text_parts).strip()
+        else:
+            return ""
+
+        # OpenClaw may prepend its conversation metadata to the actual user
+        # text.  Only inspect the text after that fenced metadata envelope.
+        metadata_marker = "Conversation info (untrusted metadata):"
+        if metadata_marker in text:
+            metadata_tail = text.rsplit(metadata_marker, 1)[1]
+            fence_end = metadata_tail.find("```", metadata_tail.find("```") + 3)
+            if fence_end >= 0:
+                return metadata_tail[fence_end + 3:].strip()
+        return text
+
+    @staticmethod
+    def parse_switch_command(message: Any) -> Optional[Tuple[str, str]]:
+        """Parse an exact /switch command; ('', '') means rotate automatically."""
+        if str(getattr(message, "role", "")).lower() != "user":
+            return None
+
+        text = RouterService._message_text(message)
+        if text.lower() == RouterService._SWITCH_PREFIX:
+            return "", ""
+        if text.lower() == f"{RouterService._SWITCH_PREFIX}:auto":
+            return RouterService._SWITCH_AUTO, ""
+        if not text.lower().startswith(f"{RouterService._SWITCH_PREFIX}:"):
+            return None
+
+        target = text[len(RouterService._SWITCH_PREFIX) + 1:]
+        if ":" not in target:
+            return None
+        provider_name, model_id = target.split(":", 1)
+        provider_name = provider_name.strip().lower()
+        model_id = model_id.strip()
+        if not provider_name or not model_id:
+            return None
+        return provider_name, model_id
+
+    @staticmethod
+    def _current_switch_command(messages: Optional[List[Any]]) -> Optional[Tuple[str, str]]:
+        """Return a command only when the current (last user) message is a command."""
+        for message in reversed(messages or []):
+            if str(getattr(message, "role", "")).lower() == "user":
+                return RouterService.parse_switch_command(message)
+        return None
+
+    @staticmethod
+    def _rotate_candidates(
+        candidates: List[Tuple[str, str]], current: Optional[Tuple[str, str]]
+    ) -> List[Tuple[str, str]]:
+        if not candidates:
+            return []
+        if current not in candidates:
+            return candidates
+        start = candidates.index(current)
+        return candidates[start:] + candidates[:start]
+
+    @staticmethod
+    def apply_session_switch(
+        candidates: List[Tuple[str, str]],
+        session_id: str,
+        command: Optional[Tuple[str, str]],
+    ) -> List[Tuple[str, str]]:
+        """Apply/update the persistent switch state for one identified session."""
+        if command is not None:
+            provider_name, model_id = command
+            if provider_name == RouterService._SWITCH_AUTO:
+                RouterService._clear_session_switch(session_id)
+                logger.info("[router] Switch command restored automatic routing")
+                return candidates
+
+            if provider_name:
+                target = (provider_name, model_id)
+                RouterService._set_session_switch(session_id, target, explicit=True)
+                logger.info(f"[router] Persistent switch selected {target[0]}:{target[1]}")
+                return [target]
+
+            previous = RouterService._get_session_switch(session_id)
+            current = (previous.provider, previous.model) if previous else (
+                candidates[0] if candidates else None
+            )
+            if not candidates:
+                return []
+            if current in candidates:
+                target = candidates[(candidates.index(current) + 1) % len(candidates)]
+            else:
+                target = candidates[0]
+            RouterService._set_session_switch(session_id, target, explicit=False)
+            logger.info(f"[router] Persistent switch rotated to {target[0]}:{target[1]}")
+            return RouterService._rotate_candidates(candidates, target)
+
+        state = RouterService._get_session_switch(session_id)
+        if state is None:
+            return candidates
+        target = (state.provider, state.model)
+        return [target] if state.explicit else RouterService._rotate_candidates(candidates, target)
+
+    @staticmethod
+    def apply_switch_commands(
+        candidates: List[Tuple[str, str]], messages: Optional[List[Any]] = None
+    ) -> List[Tuple[str, str]]:
+        """Rebuild the selected model from exact switch commands in message history."""
+        if not messages:
+            return candidates
+
+        current = candidates[0] if candidates else None
+        switched = False
+        explicit_target = False
+
+        for message in messages:
+            command = RouterService.parse_switch_command(message)
+            if command is None:
+                continue
+
+            switched = True
+            provider_name, model_id = command
+            if provider_name == RouterService._SWITCH_AUTO:
+                current = candidates[0] if candidates else None
+                explicit_target = False
+                continue
+            if provider_name:
+                current = (provider_name, model_id)
+                explicit_target = True
+                continue
+
+            explicit_target = False
+            if not candidates:
+                current = None
+            elif current in candidates:
+                current = candidates[(candidates.index(current) + 1) % len(candidates)]
+            else:
+                current = candidates[0]
+
+        if not switched or current is None:
+            return candidates
+
+        if explicit_target:
+            logger.info(f"[router] Switch command selected {current[0]}:{current[1]}")
+            return [current]
+
+        start = candidates.index(current)
+        rotated = candidates[start:] + candidates[:start]
+        logger.info(f"[router] Switch command rotated auto routing to {current[0]}:{current[1]}")
+        return rotated
+
     @staticmethod
     def is_provider_available(p_name: str, actual_id: str) -> bool:
         """Check if a provider/model is available (not melted)."""
@@ -90,7 +333,11 @@ class RouterService:
         return candidates
 
     @staticmethod
-    async def get_models_to_try(model_name: str) -> List[Tuple[str, str]]:
+    async def get_models_to_try(
+        model_name: str,
+        messages: Optional[List[Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Tuple[str, str]]:
         """Resolve a requested model name to a ranked list of (provider, actual_id)."""
         model_name = model_name.lower()
         models_to_try = []
@@ -108,8 +355,36 @@ class RouterService:
             p_cfg, actual = config.resolve_model(model_name)
             if p_cfg:
                 models_to_try.append((p_cfg.name, actual))
-                
-        return models_to_try
+
+        if session_id:
+            current_command = RouterService._current_switch_command(messages)
+            current_state = RouterService._get_session_switch(session_id)
+            needs_auto_candidates = (
+                model_name in ("auto", "free", "best-free")
+                or current_command in (("", ""), (RouterService._SWITCH_AUTO, ""))
+                or (current_state is not None and not current_state.explicit)
+            )
+            if needs_auto_candidates:
+                auto_candidates = RouterService.build_auto_candidates()
+                switch_base = auto_candidates or models_to_try
+            else:
+                switch_base = models_to_try
+            return RouterService.apply_session_switch(
+                switch_base,
+                session_id,
+                current_command,
+            )
+
+        has_switch_command = bool(messages) and any(
+            RouterService.parse_switch_command(message) is not None
+            for message in messages
+        )
+        if not has_switch_command:
+            return models_to_try
+
+        auto_candidates = RouterService.build_auto_candidates()
+        switch_base = auto_candidates or models_to_try
+        return RouterService.apply_switch_commands(switch_base, messages)
 
     @staticmethod
     def record_failure(p_name: str, actual_id: str, error: Exception):

@@ -76,7 +76,12 @@ class AgentService:
 
     async def run(self, request: ChatCompletionRequest):
         model_name = (request.model or "auto").lower()
-        models_to_try = await RouterService.get_models_to_try(model_name)
+        session_id = RouterService.resolve_session_id(request)
+        models_to_try = await RouterService.get_models_to_try(
+            model_name,
+            request.messages,
+            session_id=session_id,
+        )
         
         if not models_to_try:
             return make_error_response("No available models found", 404)

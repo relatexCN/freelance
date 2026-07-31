@@ -258,6 +258,38 @@ class OpenAICompatibleProvider(BaseProvider):
         except Exception:
             return resp.text[:500]
 
+    def _extract_structured_error(self, data: Any) -> Optional[tuple[str, Optional[int]]]:
+        """Extract a non-empty OpenAI-style error from a successful JSON response."""
+        if not isinstance(data, dict):
+            return None
+
+        error = data.get("error")
+        if error is None or error == "" or error == {}:
+            return None
+
+        if not isinstance(error, dict):
+            return str(error), None
+
+        message = str(
+            error.get("message")
+            or error.get("detail")
+            or error.get("code")
+            or error
+        )
+
+        status_code = None
+        for field in ("status_code", "status", "http_status", "code"):
+            value = error.get(field)
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 400 <= candidate <= 599:
+                status_code = candidate
+                break
+
+        return message, status_code
+
     def _classify_http_error(self, status_code: int, message: str, key_idx: int, actual_model: str) -> GatewayError:
         policy = config.settings.error_policy
         lower_msg = (message or "").lower()
@@ -407,10 +439,21 @@ class OpenAICompatibleProvider(BaseProvider):
                 
                 if resp.status_code == 200:
                     data = resp.json()
-                    if "error" in data:
-                        err = data["error"]
-                        err_msg = err.get("message") if isinstance(err, dict) else str(err)
-                        raise Exception(f"Upstream API Error: {err_msg}")
+                    structured_error = self._extract_structured_error(data)
+                    if structured_error is not None:
+                        err_msg, embedded_status = structured_error
+                        err = self._classify_http_error(
+                            embedded_status or 502,
+                            f"Upstream API Error: {err_msg}",
+                            key_idx,
+                            actual_model,
+                        )
+                        logger.warning(
+                            f"[{self.config.name}] {actual_model} returned HTTP 200 "
+                            f"with a structured error: {err}"
+                        )
+                        self._record_gateway_error(err, actual_model)
+                        raise err
 
                     choices_data = data.get("choices", [])
                     if not choices_data:
