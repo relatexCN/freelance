@@ -2,14 +2,43 @@ import logging
 import time
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.config import config
-from app.models import ChatCompletionRequest, ModelInfo, ModelListResponse
+from app.models import (
+    ChatCompletionRequest,
+    ModelInfo,
+    ModelListResponse,
+    MultiChatCompletionRequest,
+)
 from app.services.agent import AgentService
+from app.services.multi_chat import MultiChatRequestError, MultiChatService
 from app.utils.responses import make_error_response
 
 router = APIRouter()
 logger = logging.getLogger("freelance")
+
+
+@router.post("/chat/completions/multi")
+async def multi_chat_completions(
+    fastapi_request: Request,
+    request: MultiChatCompletionRequest,
+):
+    """Return independent answers from multiple configured models."""
+    object.__setattr__(request, "_gateway_headers", dict(fastapi_request.headers))
+    try:
+        result = await MultiChatService.run(request)
+    except MultiChatRequestError as exc:
+        return make_error_response(
+            str(exc),
+            400,
+            type="invalid_request_error",
+            code=exc.code,
+        )
+    body = result.model_dump(exclude_none=True)
+    if result.status == "failed":
+        return JSONResponse(status_code=502, content=body)
+    return body
 
 
 @router.post("/chat/completions")
@@ -19,7 +48,13 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
     Orchestrates multi-turn dialogue via AgentService.
     """
     model_name = (request.model or "auto").lower()
-    last_msg = request.messages[-1].content[:50] if request.messages else ""
+    last_content = request.messages[-1].content if request.messages else None
+    if isinstance(last_content, str):
+        last_msg = last_content[:50]
+    elif last_content is None:
+        last_msg = ""
+    else:
+        last_msg = str(last_content)[:50]
     logger.info(f"[*] REQ: {model_name} | Stream: {request.stream} | Msg: {last_msg}...")
 
     # Keep the original client request available for provider-level pass-through.

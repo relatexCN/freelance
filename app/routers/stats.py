@@ -9,8 +9,3 @@ async def get_stats():
     Returns real-time performance metrics and provider health status.
     """
     return stats_service.get_stats()
-
-@router.get("/health")
-async def health_check():
-    """Simple health check endpoint."""
-    return {"status": "healthy"}

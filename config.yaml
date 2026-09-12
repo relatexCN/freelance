@@ -139,6 +139,8 @@ models:
 
 # 全局设置
 settings:
+  # 单次 /chat/completions/multi 最多调用的模型数量
+  multi_model_max_models: 5
   # 最大重试次数
   max_retries: 2
   # 统一超时时间（秒），null表示使用各提供商默认超时

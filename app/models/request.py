@@ -54,3 +54,20 @@ class ChatCompletionRequest(BaseModel):
         data = self.model_dump(exclude_none=True)
         data["model"] = actual_model
         return data
+
+
+class MultiChatCompletionRequest(ChatCompletionRequest):
+    """Request the same prompt from multiple provider/model targets."""
+
+    models: list[str] = Field(min_length=1)
+    parallel: bool = True
+    stream: bool = False
+
+    def to_single_request(self, model: str) -> ChatCompletionRequest:
+        data = self.model_dump(
+            exclude={"models", "parallel"},
+            exclude_none=True,
+        )
+        data["model"] = model
+        data["stream"] = False
+        return ChatCompletionRequest(**data)

@@ -308,6 +308,41 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### Multi-model Chat Completions
+
+同一个问题可并行或串行发送给多个已配置模型。该接口不会改变原有 Chat Completions 的自动回退行为。
+
+```http
+POST /v1/chat/completions/multi
+POST /chat/completions/multi
+```
+
+```bash
+curl http://localhost:8000/v1/chat/completions/multi \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-freelance-key" \
+  -d '{
+    "models": [
+      "ollama:deepseek-v3.2",
+      "openrouter:minimax/minimax-m2.5:free"
+    ],
+    "messages": [
+      {"role": "user", "content": "分析今天的 AI 行业趋势"}
+    ],
+    "parallel": true,
+    "stream": false
+  }'
+```
+
+- `models` 支持 `provider:model-id`，也支持 `models` 配置中的别名。
+- `parallel=true` 并行调用；`false` 按列表顺序串行调用。
+- 单个模型失败不会取消其他调用，整体状态为 `success`、`partial_success` 或 `failed`。
+- 每项包含 `provider`、`model`、`status`、`latency_ms`、`content`、完整 `response`、`usage` 或 `error`。
+- 当前仅支持非流式聚合；`stream=true` 返回 400。
+- `settings.multi_model_max_models` 控制单次模型数，默认最多 5 个；重复目标返回 400。
+- 当所有上游模型均失败时，接口返回 HTTP 502，并在响应体中保留每个模型的错误详情；部分成功仍返回 HTTP 200。
+- 多模型接口不执行本地 Agent 工具循环；当 `tools.mode=local_agent` 时返回 400。需要本地工具执行时请使用单模型接口，或将工具模式设为 `passthrough` 由客户端处理。
+
 ### Models
 
 ```http

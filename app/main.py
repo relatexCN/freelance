@@ -331,6 +331,7 @@ async def root():
         "providers": list(config.providers.keys()),
         "endpoints": {
             "chat_completions": "/chat/completions",
+            "multi_chat_completions": "/chat/completions/multi",
             "models": "/models",
             "health": "/health",
             "stats": "/stats",
