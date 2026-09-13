@@ -343,6 +343,8 @@ curl http://localhost:8000/v1/chat/completions/multi \
 - 当所有上游模型均失败时，接口返回 HTTP 502，并在响应体中保留每个模型的错误详情；部分成功仍返回 HTTP 200。
 - 多模型接口不执行本地 Agent 工具循环；当 `tools.mode=local_agent` 时返回 400。需要本地工具执行时请使用单模型接口，或将工具模式设为 `passthrough` 由客户端处理。
 
+流式单模型请求也会检查 HTTP 200 SSE 数据中的结构化 `error`：首块即报错时会先尝试下一个 Key或备用模型；流已经输出后才报错时，会转发错误事件并补发 `data: [DONE]`，避免客户端因异常断链而无法结束请求。
+
 ### Models
 
 ```http

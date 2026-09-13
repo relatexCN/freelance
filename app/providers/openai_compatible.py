@@ -290,6 +290,24 @@ class OpenAICompatibleProvider(BaseProvider):
 
         return message, status_code
 
+    def _extract_sse_structured_error(
+        self, line: str
+    ) -> Optional[tuple[str, Optional[int]]]:
+        """Extract an OpenAI-style error embedded in an SSE data event."""
+        stripped = (line or "").strip()
+        if not stripped.startswith("data:"):
+            return None
+
+        payload = stripped[5:].strip()
+        if not payload or payload == "[DONE]":
+            return None
+
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return self._extract_structured_error(data)
+
     def _classify_http_error(self, status_code: int, message: str, key_idx: int, actual_model: str) -> GatewayError:
         policy = config.settings.error_policy
         lower_msg = (message or "").lower()
@@ -597,7 +615,26 @@ class OpenAICompatibleProvider(BaseProvider):
                         
                         # Process first chunk
                         first_chunk = first_chunk.strip()
-                        if first_chunk and first_chunk.startswith("data: "):
+                        if first_chunk and first_chunk.startswith("data:"):
+                            structured_error = self._extract_sse_structured_error(first_chunk)
+                            if structured_error is not None:
+                                err_msg, embedded_status = structured_error
+                                err = self._classify_http_error(
+                                    embedded_status or 502,
+                                    f"Upstream API Error: {err_msg}",
+                                    key_idx,
+                                    actual_model,
+                                )
+                                logger.warning(
+                                    f"[{self.config.name}] {actual_model} returned HTTP 200 "
+                                    f"with a structured stream error before content: {err}"
+                                )
+                                self._record_gateway_error(err, actual_model)
+                                last_error = err
+                                if err.skip_retry or err.disable_model:
+                                    raise err
+                                continue
+
                             ttft = (time.time() - start_time) * 1000
                             chunks_received += 1
                             bytes_received += len(first_chunk)
@@ -623,9 +660,26 @@ class OpenAICompatibleProvider(BaseProvider):
                                     yield "data: [DONE]\n\n"
                                     break
                                 
-                                if line.startswith("data: "):
+                                if line.startswith("data:"):
                                     chunks_received += 1
                                     bytes_received += len(line)
+                                    structured_error = self._extract_sse_structured_error(line)
+                                    if structured_error is not None:
+                                        err_msg, embedded_status = structured_error
+                                        err = self._classify_http_error(
+                                            embedded_status or 502,
+                                            f"Upstream API Error: {err_msg}",
+                                            key_idx,
+                                            actual_model,
+                                        )
+                                        logger.warning(
+                                            f"[{self.config.name}] {actual_model} returned a "
+                                            f"structured stream error after streaming began: {err}"
+                                        )
+                                        self._record_gateway_error(err, actual_model)
+                                        yield f"{line}\n\n"
+                                        yield "data: [DONE]\n\n"
+                                        return
                                     yield f"{line}\n\n"
                                     await asyncio.sleep(0.01)
                                 

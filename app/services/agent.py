@@ -96,6 +96,7 @@ class AgentService:
             found_turn_response = False
             tried_details = []
             last_err = None
+            last_exception = None
             
             # Inner loop: Try each provider for the current turn
             for p_name, actual_id in models_to_try:
@@ -146,6 +147,7 @@ class AgentService:
                             return JSONResponse(content=resp.model_dump(exclude_none=True))
                             
                 except Exception as e:
+                    last_exception = e
                     last_err = str(e)
                     tried_details.append(f"{p_name}/{actual_id} error: {last_err}")
                     RouterService.record_failure(p_name, actual_id, e)
@@ -182,7 +184,14 @@ class AgentService:
                 
                 details_str = "; ".join(deduped_details)
                 err_msg = f"All providers failed for turn {iteration}. Details: {details_str}"
-                return make_error_response(err_msg, 503 if not last_err else 500)
+                status_code = 503 if not last_err else 502
+                if (
+                    isinstance(last_exception, GatewayError)
+                    and last_exception.status_code is not None
+                    and 400 <= last_exception.status_code <= 599
+                ):
+                    status_code = last_exception.status_code
+                return make_error_response(err_msg, status_code)
                 
         return make_error_response(f"Agent exceeded max iterations ({max_iterations})", 500)
 
@@ -193,6 +202,8 @@ class AgentService:
 
         try:
             first_chunk = await gen.__anext__()
+        except GatewayError:
+            raise
         except Exception as e:
             raise Exception(f"Failed to get first chunk: {e}")
 
