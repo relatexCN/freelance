@@ -1,7 +1,8 @@
 import asyncio
+import json
 import logging
 import time
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from app.config import config
 from app.models import (
@@ -49,6 +50,60 @@ class MultiChatService:
         return provider_config, actual_model
 
     @staticmethod
+    def _configured_default_targets() -> list[tuple[str, str]]:
+        """Return every callable provider default model in configuration order."""
+        targets = []
+        seen = set()
+        for provider_name, provider_config in config.providers.items():
+            actual_model = str(provider_config.default_model or "").strip()
+            target = (provider_name, actual_model)
+            if not provider_config.api_keys or not actual_model or target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+        return targets
+
+    @staticmethod
+    def prepare_targets(request: MultiChatCompletionRequest) -> list[tuple[str, str]]:
+        """Validate a multi request and resolve its explicit or configured targets."""
+        if config.settings.tools.normalized_mode() == "local_agent":
+            raise MultiChatRequestError(
+                "Multi-model requests do not support the local Agent tool loop; "
+                "use tools.mode=passthrough or the single-model endpoint",
+                "multi_local_agent_not_supported",
+            )
+
+        targets = []
+        seen = set()
+        if request.models is None:
+            targets = MultiChatService._configured_default_targets()
+            if not targets:
+                raise MultiChatRequestError(
+                    "No callable provider default models are configured",
+                    "no_default_multi_models",
+                )
+        else:
+            for model_spec in request.models:
+                provider_config, actual_model = MultiChatService._resolve_model(model_spec)
+                target = (provider_config.name, actual_model)
+                if target in seen:
+                    raise MultiChatRequestError(
+                        f"Duplicate model target: {target[0]}:{target[1]}",
+                        "duplicate_model",
+                    )
+                seen.add(target)
+                targets.append(target)
+
+        max_models = config.settings.multi_model_max_models
+        if len(targets) > max_models:
+            source = "configured default models" if request.models is None else "models requested"
+            raise MultiChatRequestError(
+                f"Too many {source}: {len(targets)}; maximum is {max_models}",
+                "too_many_models",
+            )
+        return targets
+
+    @staticmethod
     async def _call_model(
         request: MultiChatCompletionRequest,
         provider_name: str,
@@ -86,7 +141,7 @@ class MultiChatService:
                 error=f"Provider '{provider_name}' is unavailable",
             )
 
-        single_request = request.to_single_request(actual_model)
+        single_request = request.to_single_request(actual_model, stream=False)
         gateway_headers = getattr(request, "_gateway_headers", None)
         if gateway_headers:
             object.__setattr__(single_request, "_gateway_headers", gateway_headers)
@@ -135,39 +190,156 @@ class MultiChatService:
             )
 
     @staticmethod
-    async def run(request: MultiChatCompletionRequest) -> MultiChatCompletionResponse:
-        if config.settings.tools.normalized_mode() == "local_agent":
-            raise MultiChatRequestError(
-                "Multi-model requests do not support the local Agent tool loop; "
-                "use tools.mode=passthrough or the single-model endpoint",
-                "multi_local_agent_not_supported",
-            )
+    def _stream_event(
+        provider_name: str,
+        actual_model: str,
+        *,
+        status: str,
+        chunk: Optional[dict] = None,
+        error: Optional[str] = None,
+    ) -> str:
+        payload = dict(chunk or {})
+        payload.setdefault("object", "multi.chat.completion.chunk")
+        payload["provider"] = provider_name
+        payload["model"] = actual_model
+        payload["status"] = status
+        if error is not None:
+            payload["error"] = {"message": error, "type": "upstream_error"}
+            payload.setdefault("choices", [])
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-        if request.stream:
-            raise MultiChatRequestError(
-                "Multi-model streaming is not supported; set stream=false",
-                "multi_stream_not_supported",
+    @staticmethod
+    async def _stream_model(
+        request: MultiChatCompletionRequest,
+        provider_name: str,
+        actual_model: str,
+    ) -> AsyncIterator[str]:
+        provider_config = config.providers.get(provider_name)
+        provider = get_provider_instance(provider_name)
+        if not provider_config or not provider_config.api_keys:
+            yield MultiChatService._stream_event(
+                provider_name,
+                actual_model,
+                status="error",
+                error=f"Provider '{provider_name}' has no configured API key",
             )
-
-        max_models = config.settings.multi_model_max_models
-        if len(request.models) > max_models:
-            raise MultiChatRequestError(
-                f"Too many models requested: {len(request.models)}; maximum is {max_models}",
-                "too_many_models",
+            return
+        if not RouterService.is_provider_available(provider_name, actual_model):
+            yield MultiChatService._stream_event(
+                provider_name,
+                actual_model,
+                status="error",
+                error=RouterService.get_provider_status_message(provider_name, actual_model),
             )
+            return
+        if provider is None:
+            yield MultiChatService._stream_event(
+                provider_name,
+                actual_model,
+                status="error",
+                error=f"Provider '{provider_name}' is unavailable",
+            )
+            return
 
-        targets = []
-        seen = set()
-        for model_spec in request.models:
-            provider_config, actual_model = MultiChatService._resolve_model(model_spec)
-            target = (provider_config.name, actual_model)
-            if target in seen:
-                raise MultiChatRequestError(
-                    f"Duplicate model target: {target[0]}:{target[1]}",
-                    "duplicate_model",
+        single_request = request.to_single_request(actual_model, stream=True)
+        gateway_headers = getattr(request, "_gateway_headers", None)
+        if gateway_headers:
+            object.__setattr__(single_request, "_gateway_headers", gateway_headers)
+
+        emitted_error = False
+        try:
+            async for raw_chunk in provider.chat_completion_stream(
+                single_request,
+                actual_model,
+                timeout=config.settings.unified_timeout or provider_config.timeout,
+            ):
+                stripped = (raw_chunk or "").strip()
+                if not stripped or stripped == "data: [DONE]":
+                    continue
+                if not stripped.startswith("data:"):
+                    yield raw_chunk
+                    continue
+
+                raw_data = stripped[5:].strip()
+                try:
+                    chunk = json.loads(raw_data)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    chunk = {"raw": raw_data, "choices": []}
+                emitted_error = emitted_error or bool(chunk.get("error"))
+                yield MultiChatService._stream_event(
+                    provider_name,
+                    actual_model,
+                    status="error" if chunk.get("error") else "streaming",
+                    chunk=chunk,
                 )
-            seen.add(target)
-            targets.append(target)
+        except Exception as exc:
+            emitted_error = True
+            logger.warning(f"[MULTI] Stream {provider_name}/{actual_model} failed: {exc}")
+            RouterService.record_failure(provider_name, actual_model, exc)
+            yield MultiChatService._stream_event(
+                provider_name,
+                actual_model,
+                status="error",
+                error=str(exc) or repr(exc),
+            )
+
+        yield MultiChatService._stream_event(
+            provider_name,
+            actual_model,
+            status="error" if emitted_error else "completed",
+        )
+
+    @staticmethod
+    async def stream(
+        request: MultiChatCompletionRequest,
+        targets: list[tuple[str, str]],
+    ) -> AsyncIterator[str]:
+        """Stream tagged chunks from the selected models, in parallel by default."""
+        if not request.parallel:
+            for provider_name, actual_model in targets:
+                async for event in MultiChatService._stream_model(
+                    request, provider_name, actual_model
+                ):
+                    yield event
+            yield "data: [DONE]\n\n"
+            return
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def worker(provider_name: str, actual_model: str):
+            try:
+                async for event in MultiChatService._stream_model(
+                    request, provider_name, actual_model
+                ):
+                    await queue.put(event)
+            finally:
+                await queue.put(None)
+
+        tasks = [
+            asyncio.create_task(worker(provider_name, actual_model))
+            for provider_name, actual_model in targets
+        ]
+        completed = 0
+        try:
+            while completed < len(tasks):
+                event = await queue.get()
+                if event is None:
+                    completed += 1
+                else:
+                    yield event
+            yield "data: [DONE]\n\n"
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    async def run(
+        request: MultiChatCompletionRequest,
+        targets: Optional[list[tuple[str, str]]] = None,
+    ) -> MultiChatCompletionResponse:
+        targets = targets or MultiChatService.prepare_targets(request)
 
         logger.info(f"[MULTI] Calling {len(targets)} model(s); parallel={request.parallel}")
         if request.parallel:

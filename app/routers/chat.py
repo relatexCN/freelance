@@ -2,7 +2,7 @@ import logging
 import time
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import config
 from app.models import (
@@ -27,7 +27,7 @@ async def multi_chat_completions(
     """Return independent answers from multiple configured models."""
     object.__setattr__(request, "_gateway_headers", dict(fastapi_request.headers))
     try:
-        result = await MultiChatService.run(request)
+        targets = MultiChatService.prepare_targets(request)
     except MultiChatRequestError as exc:
         return make_error_response(
             str(exc),
@@ -35,6 +35,15 @@ async def multi_chat_completions(
             type="invalid_request_error",
             code=exc.code,
         )
+
+    if request.stream:
+        return StreamingResponse(
+            MultiChatService.stream(request, targets),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    result = await MultiChatService.run(request, targets)
     body = result.model_dump(exclude_none=True)
     if result.status == "failed":
         return JSONResponse(status_code=502, content=body)
