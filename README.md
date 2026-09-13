@@ -329,18 +329,18 @@ curl http://localhost:8000/v1/chat/completions/multi \
     "messages": [
       {"role": "user", "content": "分析今天的 AI 行业趋势"}
     ],
-    "parallel": true,
-    "stream": false
+    "parallel": true
   }'
 ```
 
 - `models` 为可选参数；传入时仅请求指定目标，支持 `provider:model-id` 和 `models` 配置中的别名。
 - 省略 `models` 时，请求所有已配置 API Key 且设置了 `default_model` 的供应商默认模型；没有 `default_model` 或没有 API Key 的供应商会跳过。
 - `parallel=true` 并行调用；`false` 按列表顺序串行调用。
-- `stream` 为可选参数，默认 `false`。`stream=false` 返回聚合 JSON；`stream=true` 返回 SSE，每个 JSON 数据块都会附带 `provider`、`model` 和 `status`，所有模型结束后统一发送 `data: [DONE]`。
+- 多模型接口固定返回非流式聚合 JSON，不接受 `stream` 参数；需要 SSE 时使用单模型 `/chat/completions` 接口。
 - 单个模型失败不会取消其他调用，整体状态为 `success`、`partial_success` 或 `failed`。
 - 每项包含 `provider`、`model`、`status`、`latency_ms`、`content`、完整 `response`、`usage` 或 `error`。
 - `settings.multi_model_max_models` 同时限制显式目标和自动选择的默认模型数量，默认最多 5 个；重复目标返回 400。若可调用的默认模型超过限制，应提高该配置或显式传入 `models`。
+- `settings.multi_model_timeout` 控制整次多模型聚合的总等待时间，默认 90 秒，包含所有模型及其内部 Key 重试。超时后取消未完成调用并保留已完成结果；部分成功返回 200，全部超时返回 504。
 - 当所有上游模型均失败时，接口返回 HTTP 502，并在响应体中保留每个模型的错误详情；部分成功仍返回 HTTP 200。
 - 多模型接口不执行本地 Agent 工具循环；当 `tools.mode=local_agent` 时返回 400。需要本地工具执行时请使用单模型接口，或将工具模式设为 `passthrough` 由客户端处理。
 

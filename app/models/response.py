@@ -58,6 +58,7 @@ class MultiChatCompletionItem(BaseModel):
     response: Optional[dict[str, Any]] = None
     usage: Optional[UsageInfo] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
 
 
 class MultiChatCompletionResponse(BaseModel):

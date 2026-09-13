@@ -141,6 +141,8 @@ models:
 settings:
   # 单次 /chat/completions/multi 最多调用的模型数量
   multi_model_max_models: 5
+  # 多模型非流式聚合的整次请求总超时（秒），包含所有模型及其内部 Key 重试
+  multi_model_timeout: 90
   # 最大重试次数
   max_retries: 2
   # 统一超时时间（秒），null表示使用各提供商默认超时

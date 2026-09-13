@@ -128,6 +128,7 @@ class Settings(BaseSettings):
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
     max_iterations: int = Field(default=3, alias="MAX_ITERATIONS")
     multi_model_max_models: int = Field(default=5, alias="MULTI_MODEL_MAX_MODELS")
+    multi_model_timeout: float = Field(default=90, alias="MULTI_MODEL_TIMEOUT")
     unified_timeout: Optional[float] = Field(default=None, alias="UNIFIED_TIMEOUT")
     switch_session_ttl_seconds: int = Field(default=86400, alias="SWITCH_SESSION_TTL_SECONDS")
     cooldown: CooldownSettings = Field(default_factory=CooldownSettings)
@@ -387,6 +388,11 @@ class AppConfig:
                     if max_models <= 0:
                         raise ValueError("settings.multi_model_max_models must be positive")
                     self.settings.multi_model_max_models = max_models
+                if "multi_model_timeout" in s_data:
+                    multi_timeout = float(s_data["multi_model_timeout"])
+                    if multi_timeout <= 0:
+                        raise ValueError("settings.multi_model_timeout must be positive")
+                    self.settings.multi_model_timeout = multi_timeout
                 if "unified_timeout" in s_data:
                     unified_timeout_val = s_data["unified_timeout"]
                     if unified_timeout_val is not None:

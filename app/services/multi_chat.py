@@ -1,8 +1,7 @@
 import asyncio
-import json
 import logging
 import time
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 from app.config import config
 from app.models import (
@@ -141,7 +140,7 @@ class MultiChatService:
                 error=f"Provider '{provider_name}' is unavailable",
             )
 
-        single_request = request.to_single_request(actual_model, stream=False)
+        single_request = request.to_single_request(actual_model)
         gateway_headers = getattr(request, "_gateway_headers", None)
         if gateway_headers:
             object.__setattr__(single_request, "_gateway_headers", gateway_headers)
@@ -190,149 +189,91 @@ class MultiChatService:
             )
 
     @staticmethod
-    def _stream_event(
+    def _timeout_item(
         provider_name: str,
         actual_model: str,
-        *,
-        status: str,
-        chunk: Optional[dict] = None,
-        error: Optional[str] = None,
-    ) -> str:
-        payload = dict(chunk or {})
-        payload.setdefault("object", "multi.chat.completion.chunk")
-        payload["provider"] = provider_name
-        payload["model"] = actual_model
-        payload["status"] = status
-        if error is not None:
-            payload["error"] = {"message": error, "type": "upstream_error"}
-            payload.setdefault("choices", [])
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    @staticmethod
-    async def _stream_model(
-        request: MultiChatCompletionRequest,
-        provider_name: str,
-        actual_model: str,
-    ) -> AsyncIterator[str]:
-        provider_config = config.providers.get(provider_name)
-        provider = get_provider_instance(provider_name)
-        if not provider_config or not provider_config.api_keys:
-            yield MultiChatService._stream_event(
-                provider_name,
-                actual_model,
-                status="error",
-                error=f"Provider '{provider_name}' has no configured API key",
-            )
-            return
-        if not RouterService.is_provider_available(provider_name, actual_model):
-            yield MultiChatService._stream_event(
-                provider_name,
-                actual_model,
-                status="error",
-                error=RouterService.get_provider_status_message(provider_name, actual_model),
-            )
-            return
-        if provider is None:
-            yield MultiChatService._stream_event(
-                provider_name,
-                actual_model,
-                status="error",
-                error=f"Provider '{provider_name}' is unavailable",
-            )
-            return
-
-        single_request = request.to_single_request(actual_model, stream=True)
-        gateway_headers = getattr(request, "_gateway_headers", None)
-        if gateway_headers:
-            object.__setattr__(single_request, "_gateway_headers", gateway_headers)
-
-        emitted_error = False
-        try:
-            async for raw_chunk in provider.chat_completion_stream(
-                single_request,
-                actual_model,
-                timeout=config.settings.unified_timeout or provider_config.timeout,
-            ):
-                stripped = (raw_chunk or "").strip()
-                if not stripped or stripped == "data: [DONE]":
-                    continue
-                if not stripped.startswith("data:"):
-                    yield raw_chunk
-                    continue
-
-                raw_data = stripped[5:].strip()
-                try:
-                    chunk = json.loads(raw_data)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    chunk = {"raw": raw_data, "choices": []}
-                emitted_error = emitted_error or bool(chunk.get("error"))
-                yield MultiChatService._stream_event(
-                    provider_name,
-                    actual_model,
-                    status="error" if chunk.get("error") else "streaming",
-                    chunk=chunk,
-                )
-        except Exception as exc:
-            emitted_error = True
-            logger.warning(f"[MULTI] Stream {provider_name}/{actual_model} failed: {exc}")
-            RouterService.record_failure(provider_name, actual_model, exc)
-            yield MultiChatService._stream_event(
-                provider_name,
-                actual_model,
-                status="error",
-                error=str(exc) or repr(exc),
-            )
-
-        yield MultiChatService._stream_event(
-            provider_name,
-            actual_model,
-            status="error" if emitted_error else "completed",
+        timeout_seconds: float,
+    ) -> MultiChatCompletionItem:
+        return MultiChatCompletionItem(
+            provider=provider_name,
+            model=actual_model,
+            status="error",
+            latency_ms=round(timeout_seconds * 1000, 2),
+            error=f"Multi-model request exceeded its {timeout_seconds:g}s overall timeout",
+            error_code="multi_timeout",
         )
 
     @staticmethod
-    async def stream(
+    async def _run_parallel_with_deadline(
         request: MultiChatCompletionRequest,
         targets: list[tuple[str, str]],
-    ) -> AsyncIterator[str]:
-        """Stream tagged chunks from the selected models, in parallel by default."""
-        if not request.parallel:
-            for provider_name, actual_model in targets:
-                async for event in MultiChatService._stream_model(
-                    request, provider_name, actual_model
-                ):
-                    yield event
-            yield "data: [DONE]\n\n"
-            return
-
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def worker(provider_name: str, actual_model: str):
-            try:
-                async for event in MultiChatService._stream_model(
-                    request, provider_name, actual_model
-                ):
-                    await queue.put(event)
-            finally:
-                await queue.put(None)
-
+        timeout_seconds: float,
+    ) -> list[MultiChatCompletionItem]:
         tasks = [
-            asyncio.create_task(worker(provider_name, actual_model))
+            asyncio.create_task(
+                MultiChatService._call_model(request, provider_name, actual_model)
+            )
             for provider_name, actual_model in targets
         ]
-        completed = 0
-        try:
-            while completed < len(tasks):
-                event = await queue.get()
-                if event is None:
-                    completed += 1
-                else:
-                    yield event
-            yield "data: [DONE]\n\n"
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+        if pending:
+            logger.warning(
+                f"[MULTI] Overall timeout reached after {timeout_seconds:g}s; "
+                f"cancelling {len(pending)} unfinished model(s)"
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        responses = []
+        for target, task in zip(targets, tasks):
+            if task in done:
+                responses.append(task.result())
+            else:
+                responses.append(
+                    MultiChatService._timeout_item(*target, timeout_seconds)
+                )
+        return responses
+
+    @staticmethod
+    async def _run_serial_with_deadline(
+        request: MultiChatCompletionRequest,
+        targets: list[tuple[str, str]],
+        timeout_seconds: float,
+    ) -> list[MultiChatCompletionItem]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        responses = []
+        for index, (provider_name, actual_model) in enumerate(targets):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                responses.extend(
+                    MultiChatService._timeout_item(*target, timeout_seconds)
+                    for target in targets[index:]
+                )
+                break
+            try:
+                response = await asyncio.wait_for(
+                    MultiChatService._call_model(request, provider_name, actual_model),
+                    timeout=remaining,
+                )
+                responses.append(response)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[MULTI] Overall timeout reached after {timeout_seconds:g}s "
+                    f"during serial model calls"
+                )
+                responses.append(
+                    MultiChatService._timeout_item(
+                        provider_name, actual_model, timeout_seconds
+                    )
+                )
+                responses.extend(
+                    MultiChatService._timeout_item(*target, timeout_seconds)
+                    for target in targets[index + 1:]
+                )
+                break
+        return responses
 
     @staticmethod
     async def run(
@@ -340,21 +281,20 @@ class MultiChatService:
         targets: Optional[list[tuple[str, str]]] = None,
     ) -> MultiChatCompletionResponse:
         targets = targets or MultiChatService.prepare_targets(request)
+        timeout_seconds = config.settings.multi_model_timeout
 
-        logger.info(f"[MULTI] Calling {len(targets)} model(s); parallel={request.parallel}")
+        logger.info(
+            f"[MULTI] Calling {len(targets)} model(s); parallel={request.parallel}; "
+            f"overall_timeout={timeout_seconds:g}s"
+        )
         if request.parallel:
-            responses = list(await asyncio.gather(*(
-                MultiChatService._call_model(request, provider_name, actual_model)
-                for provider_name, actual_model in targets
-            )))
+            responses = await MultiChatService._run_parallel_with_deadline(
+                request, targets, timeout_seconds
+            )
         else:
-            responses = []
-            for provider_name, actual_model in targets:
-                responses.append(await MultiChatService._call_model(
-                    request,
-                    provider_name,
-                    actual_model,
-                ))
+            responses = await MultiChatService._run_serial_with_deadline(
+                request, targets, timeout_seconds
+            )
 
         successes = sum(item.status == "success" for item in responses)
         if successes == len(responses):

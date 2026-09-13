@@ -2,7 +2,7 @@ import logging
 import time
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from app.config import config
 from app.models import (
@@ -36,17 +36,13 @@ async def multi_chat_completions(
             code=exc.code,
         )
 
-    if request.stream:
-        return StreamingResponse(
-            MultiChatService.stream(request, targets),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
     result = await MultiChatService.run(request, targets)
     body = result.model_dump(exclude_none=True)
     if result.status == "failed":
-        return JSONResponse(status_code=502, content=body)
+        all_timed_out = all(
+            item.error_code == "multi_timeout" for item in result.responses
+        )
+        return JSONResponse(status_code=504 if all_timed_out else 502, content=body)
     return body
 
 
