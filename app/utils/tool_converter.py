@@ -16,7 +16,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
 
-logger = logging.getLogger("link.tool_converter")
+logger = logging.getLogger("freelance.tool_converter")
 
 # Quick detection pattern — lightweight check before full parsing
 _XML_TOOL_CALL_PATTERN = re.compile(r'<function_calls\s*>', re.DOTALL)

@@ -394,6 +394,10 @@ class RouterService:
             return
             
         gw_error = GatewayError.from_exception(error, provider=p_name, model=actual_id)
+        from app.core.observability import log_event
+        log_event(logger, "routing_failure", logging.WARNING, provider=p_name, model=actual_id,
+                  status_code=gw_error.status_code, error_code=gw_error.error_code,
+                  error_type=gw_error.error_type, retryable=gw_error.retryable)
         err_str = str(gw_error)
         stats_service.record_request(p_name, actual_id, error=err_str)
 
@@ -424,6 +428,14 @@ class RouterService:
 
     @staticmethod
     def _write_error_log(p_name: str, actual_id: str, err_type: str, err_str: str, error: Optional[GatewayError] = None):
+        from app.core.observability import EventFormatter, request_id
+        if config.settings.logging.include_diagnostics:
+            secrets = [config.settings.api_key, *config.settings.api_keys.split(",")]
+            for provider in config.providers.values():
+                secrets.extend(provider.api_keys)
+            err_str = EventFormatter(config.settings.logging, lambda: secrets).redact(err_str)
+        else:
+            err_str = f"request_id={request_id.get()} error_code={error.error_code if error else err_type}"
         today = datetime.now().strftime("%Y-%m-%d")
         time_str = datetime.now().strftime("%H:%M:%S")
         

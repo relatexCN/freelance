@@ -24,7 +24,8 @@ from app.models.response import (
     StreamChoice,
     UsageInfo,
 )
-from app.providers.base import BaseProvider
+from app.core.providers.base import BaseProvider
+from app.core.observability import log_event
 from app.services.gateway_errors import GatewayError
 
 
@@ -404,6 +405,10 @@ class OpenAICompatibleProvider(BaseProvider):
         )
 
     def _record_gateway_error(self, err: GatewayError, actual_model: str):
+        log_event(logger, "upstream_failed", logging.WARNING, provider=self.config.name,
+                  model=actual_model, key_index=err.key_index, status_code=err.status_code,
+                  error_type=err.error_type, error_code=err.error_code,
+                  retryable=err.retryable, cooldown=err.cooldown)
         cooldown = err.cooldown or config.settings.cooldown.other_error
         if err.disable_key and err.key_index >= 0:
             self.config.record_key_failure(err.key_index, cooldown, is_fatal=err.key_fatal)
@@ -444,8 +449,9 @@ class OpenAICompatibleProvider(BaseProvider):
             if not api_key:
                 break
                 
-            masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "no-key"
-            logger.info(f"[{self.config.name}] Requesting {actual_model} using key[{key_idx}]: {masked_key} (attempt {attempt+1}/{num_keys})")
+            log_event(logger, "upstream_started", provider=self.config.name, model=actual_model,
+                      key_index=key_idx, attempt=attempt + 1, stream=False)
+            attempt_start = time.perf_counter()
             
             try:
                 request_kwargs = self._build_request_kwargs(request, actual_model, api_key, stream=False)
@@ -477,7 +483,12 @@ class OpenAICompatibleProvider(BaseProvider):
                     if not choices_data:
                         raise Exception("Upstream returned 200 OK but choices list is empty.")
                     
-                    return self._parse_response(data, request.model)
+                    result = self._parse_response(data, request.model)
+                    log_event(logger, "upstream_finished", provider=self.config.name,
+                              model=actual_model, key_index=key_idx,
+                              elapsed_ms=round((time.perf_counter() - attempt_start) * 1000, 3),
+                              usage=result.usage.model_dump() if result.usage else None)
+                    return result
                 
                 else:
                     err = self._classify_http_error(
@@ -562,8 +573,8 @@ class OpenAICompatibleProvider(BaseProvider):
             if not api_key:
                 break
                 
-            masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "no-key"
-            logger.info(f"[{self.config.name}] Streaming {actual_model} using key[{key_idx}]: {masked_key} (attempt {attempt+1}/{num_keys})")
+            log_event(logger, "upstream_started", provider=self.config.name, model=actual_model,
+                      key_index=key_idx, attempt=attempt + 1, stream=True)
             
             try:
                 request_kwargs = self._build_request_kwargs(request, actual_model, api_key, stream=True)
@@ -636,11 +647,15 @@ class OpenAICompatibleProvider(BaseProvider):
                                 continue
 
                             ttft = (time.time() - start_time) * 1000
+                            log_event(logger, "upstream_first_chunk", provider=self.config.name,
+                                      model=actual_model, key_index=key_idx, elapsed_ms=round(ttft, 3))
                             chunks_received += 1
                             bytes_received += len(first_chunk)
                             logger.info(f"[{self.config.name}] First chunk received for {actual_model} at +{ttft:.2f}ms (len={len(first_chunk)})")
                             yield f"{first_chunk}\n\n"
                             if first_chunk == "data: [DONE]":
+                                log_event(logger, "upstream_stream_finished", provider=self.config.name,
+                                          model=actual_model, key_index=key_idx, outcome="done")
                                 logger.info(f"[{self.config.name}] Received end signal for {actual_model} in first chunk")
                                 logger.info(f"[{self.config.name}] Stream finished for {actual_model}: {chunks_received} chunks, {bytes_received} bytes received")
                                 return
@@ -654,6 +669,8 @@ class OpenAICompatibleProvider(BaseProvider):
                                 line = line.strip()
                                 if not line: continue
                                 if line == "data: [DONE]": 
+                                    log_event(logger, "upstream_stream_finished", provider=self.config.name,
+                                              model=actual_model, key_index=key_idx, outcome="done")
                                     chunks_received += 1
                                     bytes_received += len(line)
                                     logger.info(f"[{self.config.name}] Received end signal for {actual_model} after {chunks_received} chunks")
@@ -684,6 +701,8 @@ class OpenAICompatibleProvider(BaseProvider):
                                     await asyncio.sleep(0.01)
                                 
                             except StopAsyncIteration:
+                                log_event(logger, "upstream_stream_finished", provider=self.config.name,
+                                          model=actual_model, key_index=key_idx, outcome="eof")
                                 break
                         
                         logger.info(f"[{self.config.name}] Stream finished for {actual_model}: {chunks_received} chunks, {bytes_received} bytes received")

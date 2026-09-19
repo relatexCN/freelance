@@ -14,67 +14,19 @@ from app.routers import chat, stats
 from app.services.router import RouterService, _providers, get_provider_instance
 from app.scoring import rank_models
 
-# ----------------------------
-# LOGGING UNIFICATION
-# ----------------------------
-fl_logger = logging.getLogger("freelance")
-fl_logger.setLevel(logging.DEBUG)
-fl_logger.propagate = False  # Avoid duplicates from root
-
-# Clear ALL existing handlers to enable idempotent configuration
-for h in fl_logger.handlers[:]:
-    fl_logger.removeHandler(h)
-for h in logging.root.handlers[:]:
-    logging.root.removeHandler(h)
-
-# 1. Define Formatter
-formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)-8s | %(message)s",
-    "%Y-%m-%d %H:%M:%S"
-)
+from app.core.observability import configure_logging, log_event, RequestEventMiddleware
 
 
-class StreamSseNoiseFilter(logging.Filter):
-    """Suppress high-volume per-SSE-chunk logs while keeping stream milestones."""
-
-    NOISY_MARKERS = (
-        "[STREAM] Received chunk ",
-        "Relaying chunk ",
-    )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        return not any(marker in message for marker in self.NOISY_MARKERS)
+def _logging_secrets():
+    keys = [config.settings.api_key]
+    keys.extend(k.strip() for k in config.settings.api_keys.split(","))
+    for provider in config.providers.values():
+        keys.extend(provider.api_keys)
+    return [key for key in keys if key]
 
 
-stream_noise_filter = StreamSseNoiseFilter()
-
-# 2. Add Handlers based on environment
-LOG_FILE = "freelance.log"
-
-if os.environ.get("FREELANCE_DAEMON") == "1":
-    # DAEMON MODE: OS handles redirection to file via stdout.
-    # We only need to provide the stream to stdout.
-    cons_h = logging.StreamHandler()
-    cons_h.setFormatter(formatter)
-    cons_h.addFilter(stream_noise_filter)
-    fl_logger.addHandler(cons_h)
-else:
-    # NORMAL MODE: We handle both terminal output AND manual file backup.
-    # Clear and set File Handler
-    file_h = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
-    file_h.setFormatter(formatter)
-    file_h.addFilter(stream_noise_filter)
-    fl_logger.addHandler(file_h)
-    
-    # Add Console Handler
-    cons_h = logging.StreamHandler()
-    cons_h.setFormatter(formatter)
-    cons_h.addFilter(stream_noise_filter)
-    fl_logger.addHandler(cons_h)
-
-logger = fl_logger
-# ----------------------------
+logger = configure_logging(config.settings.logging, _logging_secrets,
+                           daemon=os.environ.get("FREELANCE_DAEMON") == "1")
 
 LATEST_MODELS_LOG = "latest_models.log"
 
@@ -282,12 +234,7 @@ async def auth_middleware(request: Request, call_next):
     token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
 
     if token not in valid_keys:
-        # Log the unauthorized attempt (with masked token)
-        masked = f"{token[:4]}****" if len(token) > 4 else "****"
-        logger.warning(
-            f"Unauthorized access attempt to {request.url.path} from {request.client.host}. "
-            f"Token: {masked}"
-        )
+        log_event(logger, "authentication_failed", logging.WARNING, status_code=401)
         return JSONResponse(
             status_code=401,
             content={
@@ -302,17 +249,8 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# Request logging middleware
-@app.middleware("http")
-async def logging_middleware(request: Request, call_next):
-    """Log request details."""
-    start = time.time()
-    response = await call_next(request)
-    elapsed = (time.time() - start) * 1000
-    logger.info(
-        f"{request.method} {request.url.path} - {response.status_code} - {elapsed:.1f}ms"
-    )
-    return response
+# Register last so request context surrounds authentication and response streaming.
+app.add_middleware(RequestEventMiddleware)
 
 
 # Dual routing support: Root path and /v1 for full OpenAI-compatibility

@@ -139,6 +139,12 @@ models:
 
 # 全局设置
 settings:
+  logging:
+    format: json  # json / text（文本模式也使用新的事件字段）
+    level: INFO
+    log_request_payload: false  # 临时调试选项；可能包含私人内容
+    include_diagnostics: false  # 自由文本诊断可能包含上游回显内容
+    max_field_chars: 4096
   # 单次 /chat/completions/multi 最多调用的模型数量
   multi_model_max_models: 5
   # 多模型非流式聚合的整次请求总超时（秒），包含所有模型及其内部 Key 重试

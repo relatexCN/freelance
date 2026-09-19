@@ -8,6 +8,7 @@ from fastapi import Request
 from app.config import config
 
 logger = logging.getLogger("freelance")
+from app.core.observability import log_event
 
 # Known model families that can't be identified by size suffix alone
 _KNOWN_MODEL_FAMILIES = {
@@ -89,11 +90,13 @@ class StreamerService:
             try:
                 while not stop_event.is_set():
                     if await request.is_disconnected():
+                        log_event(logger, "stream_disconnected", provider=p_name, model=model_id)
                         logger.warning(f"[CLIENT_DISCONNECT] Client disconnected for {model_id}")
                         break
                     current_time = time.time()
                     time_since_activity = current_time - last_activity_time
                     if time_since_activity >= read_timeout:
+                        log_event(logger, "stream_timeout", logging.WARNING, provider=p_name, model=model_id)
                         logger.warning(f"[TIMEOUT] Read timeout detected for {model_id} (inactivity: {time_since_activity:.1f}s)")
                         timeout_event.set()
                         break
@@ -129,6 +132,8 @@ class StreamerService:
                 logger.info(f"[STREAM] Business task completed, total chunks: {chunks_sent}")
             except Exception as e:
                 if not isinstance(e, asyncio.CancelledError):
+                    log_event(logger, "stream_failed", logging.ERROR, provider=p_name,
+                              model=model_id, error_type=type(e).__name__)
                     logger.error(f"Stream interrupted: {e}")
                     await message_queue.put(("business", f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"))
             finally:
@@ -144,6 +149,7 @@ class StreamerService:
                     logger.warning(f"[STREAM] Timeout event set, exiting loop")
                     break
                 if await request.is_disconnected():
+                    log_event(logger, "stream_disconnected", provider=p_name, model=model_id)
                     logger.warning(f"[STREAM] Client disconnected, exiting loop")
                     break
                 
@@ -162,4 +168,7 @@ class StreamerService:
             stop_event.set()
             h_task.cancel()
             b_task.cancel()
+            log_event(logger, "stream_relay_finished", provider=p_name, model=model_id,
+                      chunks=chunks_sent, characters=total_bytes,
+                      elapsed_ms=round((time.time() - start_time) * 1000, 3))
             logger.info(f"--- [STREAM FINISHED] ({chunks_sent} chunks, {total_bytes} bytes relayed) ---")

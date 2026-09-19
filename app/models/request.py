@@ -70,9 +70,14 @@ class MultiChatCompletionRequest(_ChatCompletionRequestBase):
     @model_validator(mode="before")
     @classmethod
     def reject_stream_parameter(cls, data):
-        if isinstance(data, dict) and "stream" in data:
+        if (
+            isinstance(data, dict)
+            and "stream" in data
+            and data.get("stream") is not None
+            and data.get("stream") is not False
+        ):
             raise ValueError(
-                "The multi-model endpoint does not accept the stream parameter"
+                "The multi-model endpoint does not support stream=true"
             )
         return data
 
@@ -82,5 +87,7 @@ class MultiChatCompletionRequest(_ChatCompletionRequestBase):
             exclude_none=True,
         )
         data["model"] = model
+        # Compatibility-only stream=false/null may arrive as an allowed extra.
+        # Always enforce non-streaming for each upstream call.
         data["stream"] = False
         return ChatCompletionRequest(**data)

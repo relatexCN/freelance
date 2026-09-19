@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.config import config
+from app.core.observability import log_event
 from app.models import (
     ChatCompletionRequest,
     ModelInfo,
@@ -26,6 +27,9 @@ async def multi_chat_completions(
 ):
     """Return independent answers from multiple configured models."""
     object.__setattr__(request, "_gateway_headers", dict(fastapi_request.headers))
+    log_event(logger, "multi_chat_requested", models=request.models, parallel=request.parallel)
+    if config.settings.logging.log_request_payload:
+        log_event(logger, "request_payload", request_payload=request.model_dump(exclude_none=True))
     try:
         targets = MultiChatService.prepare_targets(request)
     except MultiChatRequestError as exc:
@@ -53,14 +57,10 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
     Orchestrates multi-turn dialogue via AgentService.
     """
     model_name = (request.model or "auto").lower()
-    last_content = request.messages[-1].content if request.messages else None
-    if isinstance(last_content, str):
-        last_msg = last_content[:50]
-    elif last_content is None:
-        last_msg = ""
-    else:
-        last_msg = str(last_content)[:50]
-    logger.info(f"[*] REQ: {model_name} | Stream: {request.stream} | Msg: {last_msg}...")
+    log_event(logger, "chat_requested", model=model_name, stream=request.stream,
+              message_count=len(request.messages))
+    if config.settings.logging.log_request_payload:
+        log_event(logger, "request_payload", request_payload=request.model_dump(exclude_none=True))
 
     # Keep the original client request available for provider-level pass-through.
     object.__setattr__(request, "_gateway_raw_body", await fastapi_request.body())

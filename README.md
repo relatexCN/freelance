@@ -336,7 +336,7 @@ curl http://localhost:8000/v1/chat/completions/multi \
 - `models` 为可选参数；传入时仅请求指定目标，支持 `provider:model-id` 和 `models` 配置中的别名。
 - 省略 `models` 时，请求所有已配置 API Key 且设置了 `default_model` 的供应商默认模型；没有 `default_model` 或没有 API Key 的供应商会跳过。
 - `parallel=true` 并行调用；`false` 按列表顺序串行调用。
-- 多模型接口固定返回非流式聚合 JSON，不接受 `stream` 参数；需要 SSE 时使用单模型 `/chat/completions` 接口。
+- 多模型接口固定返回非流式聚合 JSON。为兼容 OpenAI 客户端，允许省略 `stream`，也接受 `stream:false` 或 `stream:null` 并按非流式处理；`stream:true` 返回 422。需要 SSE 时使用单模型 `/chat/completions` 接口。
 - 单个模型失败不会取消其他调用，整体状态为 `success`、`partial_success` 或 `failed`。
 - 每项包含 `provider`、`model`、`status`、`latency_ms`、`content`、完整 `response`、`usage` 或 `error`。
 - `settings.multi_model_max_models` 同时限制显式目标和自动选择的默认模型数量，默认最多 5 个；重复目标返回 400。若可调用的默认模型超过限制，应提高该配置或显式传入 `models`。

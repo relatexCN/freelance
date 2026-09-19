@@ -8,13 +8,14 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 import yaml
 from dotenv import load_dotenv
 from pydantic import Field, BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.services.gateway_errors import matches_status, parse_status_code_ranges
+from app.core.observability import log_event
 
 # --- Advanced Path Resolution ---
 # 1. First, check the Current Working Directory (where the user is running the command)
@@ -118,6 +119,14 @@ class ScoringSettings(BaseModel):
     recency_half_life_days: int = 730
     max_provider_adjustment: float = 0.03
 
+class LoggingSettings(BaseModel):
+    format: Literal["json", "text"] = "json"
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_request_payload: bool = False
+    include_diagnostics: bool = False
+    max_field_chars: int = Field(default=4096, ge=128)
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -137,6 +146,7 @@ class Settings(BaseSettings):
     error_policy: ErrorPolicySettings = Field(default_factory=ErrorPolicySettings)
     tools: ToolSettings = Field(default_factory=ToolSettings)
     scoring: ScoringSettings = Field(default_factory=ScoringSettings)
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -248,6 +258,7 @@ class ProviderConfig:
                         self.fatal_keys.remove(idx)
                 
                 self._current_key_idx = (idx + 1) % num_keys
+                log_event(logger, "key_selected", provider=self.name, key_index=idx, state="healthy")
                 logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (HEALTHY) | Status: {', '.join(status_parts)}")
                 return self.api_keys[idx], idx
 
@@ -258,6 +269,8 @@ class ProviderConfig:
             if idx not in self.fatal_keys:
                 self._current_key_idx = (idx + 1) % num_keys
                 remaining = self.key_cooldowns[idx] - now if idx in self.key_cooldowns else 0
+                log_event(logger, "key_selected", provider=self.name, key_index=idx,
+                          state="cooldown_fallback", cooldown_remaining_seconds=remaining)
                 logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (IN_COOLDOWN, {remaining:.0f}s remaining) | Status: {', '.join(status_parts)}")
                 return self.api_keys[idx], idx
         
@@ -379,6 +392,8 @@ class AppConfig:
             self.settings = Settings()
             if "settings" in raw:
                 s_data = raw["settings"]
+                if "logging" in s_data:
+                    self.settings.logging = LoggingSettings(**(s_data["logging"] or {}))
                 if "max_retries" in s_data:
                     self.settings.max_retries = int(s_data["max_retries"])
                 if "max_iterations" in s_data:

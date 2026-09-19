@@ -9,8 +9,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.models import ChatCompletionRequest, ChatMessage, ChatCompletionResponse
 from app.config import config
+from app.core.observability import log_event
 from app.utils.tool_converter import has_xml_tool_call, xml_to_tool_calls
-from app.utils.tool_executor import ToolExecutor, format_tool_result
+from app.manager_agent.tools.executor import ToolExecutor, format_tool_result
 from app.utils.responses import make_error_response
 from app.services.router import RouterService, get_provider_instance
 from app.services.streamer import StreamerService
@@ -111,6 +112,8 @@ class AgentService:
                     continue
                 
                 try:
+                    log_event(logger, "provider_selected", provider=p_name, model=actual_id,
+                              iteration=iteration, stream=request.stream)
                     if request.stream:
                         return await self._handle_stream(request, provider, p_name, actual_id, iteration, max_iterations)
                     else:
@@ -208,6 +211,8 @@ class AgentService:
             raise Exception(f"Failed to get first chunk: {e}")
 
         first_ttft = (time.time() - stream_start) * 1000
+        log_event(logger, "first_chunk_received", provider=p_name, model=actual_id,
+                  elapsed_ms=round(first_ttft, 3))
         logger.info(f"[STREAM] First chunk for {actual_id} received at +{first_ttft:.2f}ms (len={len(first_chunk)})")
         if first_chunk.strip() == "data: [DONE]":
             logger.info(f"[STREAM] Received end signal for {actual_id} in first chunk")
