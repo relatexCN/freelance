@@ -2,6 +2,7 @@
 venv/
 env/
 .venv/
+.venv-mcp/
 
 # Environment variables (contains secrets)
 .env

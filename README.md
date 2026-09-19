@@ -12,6 +12,26 @@ Freelance API Gateway 是一个 OpenAI 兼容的多供应商 LLM 网关。客户
 - 按 HTTP 状态码统一分类错误，并控制 key、model、provider 的冷却策略。
 - 支持 provider 级别的 body、header、参数透传配置。
 - 支持 OpenAI 原生工具调用透传，也可切换为本地 Agent 工具执行模式。
+- 多模型独立回答：跟随各厂商默认模型，支持并行/串行、部分成功、总超时和请求任务取消清理。
+- 独立 stdio MCP 工具 `compare_models`：让 OpenClaw、Hermes 等客户端使用多模型接口，自行比较和汇总结果。
+- 可选只读管理 Agent：读取供应商状态、模型缓存和调用统计，生成健康分析及建议，不自动改配置。
+- 请求级结构化日志：关联请求、路由、Key 索引、耗时及错误，默认隐藏消息正文和 Key 片段。
+
+## 架构与职责
+
+项目以个人使用的模型网关为核心，提供三条独立调用路径：
+
+| 入口 | 处理流程 | 输出 |
+| --- | --- | --- |
+| 单模型聊天 | HTTP → `AgentService` → 路由/Provider → 上游 | 一次聊天回答或 SSE；可按候选故障切换 |
+| 多模型/MCP | 外部 Agent → MCP（可选）→ 多模型 HTTP → `MultiChatService` → 各上游 | 多份独立答案及各自状态；由外部 Agent 汇总 |
+| 管理报告 | 管理 HTTP → `manager_agent` → 只读快照/分析模型 | 运行状态和管理建议，不执行配置修改 |
+
+`core` 提供共享 Provider 契约和日志能力，`providers` 实现供应商适配。路由、熔断、Key 轮询仍由确定性代码控制。MCP 是单独进程，只调用已运行网关的 HTTP 接口，不维护另一份供应商配置。
+
+当前 `services/agent.py` 仍承担普通聊天编排，并保留可选的本地工具循环。`manager_agent` 是只读模型运维分析模块，不是多 Agent 管理平台，也不是通用任务规划执行器。尚未实现独立 `gateway/manager/combined` 启动模式；管理状态、规划和策略暂集中在 `manager_agent/service.py`，未拆成 `state.py/planner.py/policy.py/controller.py`。
+
+外部 Agent 接入推荐边界：网关负责模型调用；OpenClaw/Hermes 负责工具执行、多轮任务和答案汇总。普通聊天选 `tools.mode: passthrough`；多模型接口不接受工具调用。
 
 ## 项目结构
 
@@ -21,17 +41,22 @@ app/
   config.py                       读取 .env/config.yaml，维护供应商、模型路由、错误策略
   scoring.py                      模型评分、免费/付费过滤、排序
   cli.py                          freelance-api 命令入口
+  mcp_server.py                   freelance-mcp 入口，独立 stdio → HTTP 桥接
+  core/
+    providers/base.py             共享 Provider 抽象接口
+    observability.py              结构化事件、请求 ID、完整响应生命周期记录
   models/
     request.py                    ChatCompletion 请求模型
     response.py                   OpenAI 兼容响应模型
   providers/
-    base.py                       Provider 抽象基类
+    base.py                       旧 Provider 接口路径的兼容导入
     openai_compatible.py          OpenAI-compatible 上游实现，请求透传、key 轮询、错误分类
   routers/
-    chat.py                       /chat/completions、/models 路由
+    chat.py                       /chat/completions、/chat/completions/multi、/models
     stats.py                      统计接口
   services/
     agent.py                      请求编排、多模型尝试、工具调用模式
+    multi_chat.py                 多模型独立调用、结果聚合、超时和取消清理
     router.py                     模型候选生成、provider/model 可用性判断、错误日志
     gateway_errors.py             统一错误对象和状态码规则
     streamer.py                   SSE 流式心跳和首包超时策略
@@ -39,13 +64,20 @@ app/
   utils/
     responses.py                  OpenAI 风格错误响应
     tool_converter.py             XML 工具调用解析
-    tool_executor.py              本地工具执行
+    tool_executor.py              本地工具执行器旧路径兼容别名
+  manager_agent/
+    api.py                        /management/snapshot、/management/report
+    monitor.py                    只读采集供应商、模型和统计快照
+    service.py                    有限轮分析、只读工具白名单、建议校验、资源清理
+    tools/executor.py             历史本地执行器；管理报告不使用它
 
 config.yaml                       供应商、模型别名、超时、冷却、透传、工具模式配置
 .env                              网关 key 和供应商 API key
 latest_models.log                 最近一次模型发现和实际路由候选说明
 error_models.log                  按天追加的模型调用错误日志
 freelance.log                     网关运行日志
+docs/                             MCP、管理 Agent、工具边界和阶段记录
+tests/                            当前工作区的自动化测试
 ```
 
 ## 使用前必读
@@ -65,7 +97,7 @@ providers:
 
 ## 安装与启动
 
-项目支持 Python 3.8+。推荐优先使用仓库内置脚本启动：脚本会自动检查 Python、创建 `.venv`、安装依赖，并把命令转发给 `app.cli`。
+建议使用 Python 3.11（当前已验证环境）；MCP 要求 Python 3.10+。`pyproject.toml` 与启动脚本仍保留旧的 3.8 声明，不能视为当前依赖及代码在 3.8 上已经验证。仓库内置脚本会检查 Python，在首次创建 `.venv` 时安装依赖，并把命令转发给 `app.cli`；已有环境不会自动更新依赖，升级后需手动执行 `python -m pip install -e .`。
 
 ### 1. 准备配置文件
 
@@ -245,7 +277,7 @@ chmod +x freelance.sh
 ./freelance.sh keygen
 ```
 
-如果系统没有 `python3`，请先安装 Python 3.8+。使用 Homebrew 的示例：
+如果系统没有 `python3`，请先安装 Python 3.11 或经过验证的更新版本。使用 Homebrew 的示例：
 
 ```bash
 brew install python
@@ -277,6 +309,8 @@ Authorization: Bearer <API_KEY>
 ```
 
 如果 `.env` 中没有配置 `API_KEY` 或 `API_KEYS`，网关会跳过鉴权。
+
+这是直接运行应用时的行为；仓库启动脚本还会执行 `scripts/check_gateway_key.py` 做启动前检查。个人本机使用可显式传 `--host 127.0.0.1`。CLI 的监听参数以 `--host/--port` 为准，不要仅修改 `.env` 的 `HOST/PORT` 就假定 CLI 已采用它们。
 
 后台运行时，主日志写入：
 
@@ -322,27 +356,28 @@ curl http://localhost:8000/v1/chat/completions/multi \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-freelance-key" \
   -d '{
-    "models": [
-      "ollama:deepseek-v3.2",
-      "openrouter:minimax/minimax-m2.5:free"
-    ],
     "messages": [
-      {"role": "user", "content": "分析今天的 AI 行业趋势"}
+      {"role": "user", "content": "比较这两种技术方案的优缺点"}
     ],
     "parallel": true
   }'
 ```
 
-- `models` 为可选参数；传入时仅请求指定目标，支持 `provider:model-id` 和 `models` 配置中的别名。
+- 日常及 MCP 接入省略 `models`，使调用组合跟随配置。显式 `models` 参数保留兼容：传入时仅请求指定目标，支持 `provider:model-id` 和配置中的别名；MCP 不开放该参数。
 - 省略 `models` 时，请求所有已配置 API Key 且设置了 `default_model` 的供应商默认模型；没有 `default_model` 或没有 API Key 的供应商会跳过。
-- `parallel=true` 并行调用；`false` 按列表顺序串行调用。
+- `parallel=true` 并行调用；`false` 按目标顺序串行调用。两者都是独立回答，串行不会把上一模型的答案传给下一模型，也不会自动投票、复核或汇总。
 - 多模型接口固定返回非流式聚合 JSON。为兼容 OpenAI 客户端，允许省略 `stream`，也接受 `stream:false` 或 `stream:null` 并按非流式处理；`stream:true` 返回 422。需要 SSE 时使用单模型 `/chat/completions` 接口。
 - 单个模型失败不会取消其他调用，整体状态为 `success`、`partial_success` 或 `failed`。
 - 每项包含 `provider`、`model`、`status`、`latency_ms`、`content`、完整 `response`、`usage` 或 `error`。
-- `settings.multi_model_max_models` 同时限制显式目标和自动选择的默认模型数量，默认最多 5 个；重复目标返回 400。若可调用的默认模型超过限制，应提高该配置或显式传入 `models`。
+- `settings.multi_model_max_models` 同时限制显式目标和默认模型数量，默认最多 5 个；重复目标返回 400。若默认组合超过限制，应调整厂商配置或提高上限，不会静默截断。
 - `settings.multi_model_timeout` 控制整次多模型聚合的总等待时间，默认 90 秒，包含所有模型及其内部 Key 重试。超时后取消未完成调用并保留已完成结果；部分成功返回 200，全部超时返回 504。
 - 当所有上游模型均失败时，接口返回 HTTP 502，并在响应体中保留每个模型的错误详情；部分成功仍返回 HTTP 200。
 - 多模型接口不执行本地 Agent 工具循环；当 `tools.mode=local_agent` 时返回 400。需要本地工具执行时请使用单模型接口，或将工具模式设为 `passthrough` 由客户端处理。
+- 非空 `tools/functions`、启用工具的 `tool_choice/function_call`、`parallel_tool_calls:true` 返回 400（`multi_tools_not_supported`）。空列表和明确关闭的参数兼容接收，但不传给上游。
+- 上游任一 choice 返回 `tool_calls` 或工具调用结束标记时，该模型项失败（`multi_tool_calls_not_supported`），不返回其正文或工具指令；仍保留用量并计入失败统计，不因此熔断 Provider。
+- 外层请求任务取消时，会取消并等待子任务清理；串行不再启动后续模型。重复取消不会打断清理。客户端仅断开 TCP 不一定触发服务器任务取消，目前没有主动断连监测，不能保证上游推理立即停止或退还额度。
+
+完整边界见 [多模型工具与取消说明](docs/multi-model-tools.md)。
 
 流式单模型请求也会检查 HTTP 200 SSE 数据中的结构化 `error`：首块即报错时会先尝试下一个 Key或备用模型；流已经输出后才报错时，会转发错误事件并补发 `data: [DONE]`，避免客户端因异常断链而无法结束请求。
 
@@ -374,12 +409,72 @@ GET /health/providers
 
 `/health/providers` 会返回每个供应商的熔断状态、可用 key 数量、连续失败次数和 `default_model`。
 
+`/health` 仅表示 Web 进程可响应，不代表上游模型可用。`GET /stats` 提供当前进程累计请求、成功/失败次数、延迟等统计；流式成功可能仅表示首包收到，不能直接当作完整推理成功率。
+
+### 管理 Agent（可选，只读）
+
+```http
+GET /management/snapshot
+POST /management/report
+```
+
+```yaml
+settings:
+  manager_agent:
+    enabled: false
+    provider: ""         # 分析报告使用的已配置供应商
+    model: ""            # 上游实际模型 ID，需支持工具调用和 JSON 输出
+    max_iterations: 4
+    timeout_seconds: 60
+    max_tokens: 1500
+    auto_apply: false     # 目前只允许 false
+```
+
+- 启用并重启后，使用网关 Key 访问；管理接口要求配置 Key，即使普通网关允许无 Key 运行。
+- `snapshot` 不调用模型；`report` 先采集快照，再让模型通过三个只读工具查看 Provider 状态、调用统计和模型缓存，最后返回中文分析及建议。
+- 建议类型仅为观察、检查供应商、检查路由；不存在自动应用、审批执行或写配置接口。
+- 同进程同时最多一份报告，忙时返回 409。缺少分析模型配置、超时或分析失败时返回 `snapshot_only` 与错误码，保留快照。
+- 分析使用独立连接和克隆的 Key 状态，不改变业务轮询/冷却；仍共享上游账号额度。没有定时任务，只在请求报告时调用模型。
+- 数据是单进程累计快照，模型和统计各最多 100 项；没有历史时间窗、主动健康探测、剩余额度、价格或质量测量。不会执行 `tools/executor.py` 中的本地工具。
+
+详见 [管理 Agent 使用说明](docs/manager-agent.md)。
+
+## MCP 与 OpenClaw / Hermes 接入
+
+普通模型 Provider 配置只会调用单模型聊天接口。需要多模型比较时，使用独立 stdio MCP 工具 `compare_models`，由外部 Agent 负责比较和汇总。
+
+安装可选依赖（Python 3.10+）：
+
+```bash
+python -m pip install -e ".[mcp]"
+```
+
+客户端通过已安装环境的 Python 启动 `python -m app.mcp_server`，或使用命令 `freelance-mcp`。网关须先独立启动；stdio MCP 不开放新的监听端口。
+
+| MCP 环境变量 | 说明 |
+| --- | --- |
+| `FREELANCE_GATEWAY_URL` | 默认 `http://127.0.0.1:8000/v1`；填写基础地址，不含完整多模型路径 |
+| `FREELANCE_GATEWAY_KEY` | 必填，网关 Key，不是供应商 Key |
+| `FREELANCE_MCP_TIMEOUT` | 默认 120 秒，应大于网关多模型总超时；客户端工具超时应更长，例如 150 秒 |
+
+MCP 进程不会自动读取项目 `.env`，需要在客户端环境中显式传入上述变量。工具参数：
+
+```json
+{"question": "比较两个方案的优缺点", "context": "可选背景资料", "parallel": true}
+```
+
+工具不接受模型列表或工具配置。返回文本 JSON 和 `structuredContent`；部分成功保留有效答案且 `isError=false`，全部失败或请求错误为 `isError=true`。模型调用会消耗供应商额度。取消 MCP 会关闭本地 HTTP 等待，但不会保证远端网关任务立即取消。
+
+[MCP 安装和客户端配置示例](docs/mcp.md)提供 OpenClaw 与 Hermes 的配置方法。已通过标准 MCP 客户端到模拟 HTTP 网关的 stdio 协议测试；尚未完成两款宿主的真实模型联调，也未自动修改用户的客户端配置。
+
 ## 配置入口
 
 项目有两个主要配置来源：
 
 - `.env`：放网关访问 key 和供应商 API key。
 - `config.yaml`：放供应商定义、模型别名、默认模型、错误策略、透传策略、工具模式。
+
+`config.yaml.settings` 还控制多模型数量/总超时、结构化日志和可选管理 Agent。修改 `.env` 或 YAML 后需重启加载；模型列表每 6 小时刷新不等于配置热加载。建议从仓库根目录运行；配置查找优先当前工作目录，其次包目录。
 
 ### 供应商配置
 
@@ -842,6 +937,8 @@ settings:
 - 如果希望网关内置工具执行，使用 `local_agent`。
 - 如果某些上游不兼容工具参数，使用 `disabled` 或 provider 的 `disabled_fields`。
 
+本地工具描述根据函数签名生成参数 Schema，包含类型、必填项和默认值；不会替换客户端的工具定义，也未额外增加执行时参数校验。历史本地命令执行仍使用 shell，文件访问校验也不是沙箱隔离；接入 OpenClaw/Hermes 保持 `passthrough`，无需开启本地执行模式。管理报告中的三个只读工具与这里的通用执行器相互独立。
+
 ## 日志文件
 
 ### latest_models.log
@@ -876,12 +973,28 @@ settings:
 - HTTP 状态码。
 - 是否继续重试。
 - 冷却对象：`key`、`model`、`provider`。
-- 错误内容。
+- 默认记录请求 ID 与错误码；开启自由文本诊断时才写入经 Key 脱敏的原始错误内容。
 - 实际 `provider:model`。
 
 ### freelance.log
 
-主运行日志，包含启动预热、请求耗时、模型刷新、上游调用等信息。
+默认使用 JSON Lines，包含请求、Provider 选择、Key 索引、上游调用、首包、工具生命周期及响应结束等事件。相关事件携带 `request_id`，不会为日志先缓存完整 SSE 回答。
+
+```yaml
+settings:
+  logging:
+    format: json                 # json / text，text 也使用新的事件字段
+    level: INFO
+    log_request_payload: false   # 临时调试时记录请求正文，不记录响应正文
+    include_diagnostics: false   # 旧自由文本日志，可能包含上游回显内容
+    max_field_chars: 4096
+```
+
+默认不输出消息正文、Key 首尾片段或原始上游错误文本。已配置 Key 和结构化敏感字段会脱敏，但不能保证识别调试文本中的所有私人信息。旧自由文本日志在默认模式仅保留级别与来源位置，主要调用链使用具名事件。
+
+`request_finished` 的耗时涵盖完整响应传输；`outcome=completed` 仅表示传输完成，流内模型错误应结合 `upstream_failed/stream_failed` 判断。HTTP 200 不一定等于推理成功。
+
+旧日志不会删除，现有文件继续追加，可能同时包含旧文本与新 JSON；依赖旧格式的采集脚本需要更新。当前没有内置日志轮转或保留天数配置。`/stats` 中既有错误信息和 API 错误响应不受上述日志隐私开关控制。
 
 ## 常见更换场景
 
@@ -966,11 +1079,37 @@ providers:
 
 ## 当前实现注意点
 
+- 面向个人使用；没有多租户、计费或任务队列。Key 轮询、冷却、会话切换和统计均是进程内状态，重启会重置，多进程不共享。
+- 多模型接口只做独立调用和结果聚合；没有自动摘要、跨模型复核、投票或业务任务编排。MCP 将结果交给外部 Agent 处理。
+- 管理 Agent 默认关闭，仅提供模型运维分析；没有多个 Agent 实例管理、持久化任务、人工审批执行或独立 manager 启动模式。
+- 请求取消清理针对服务器任务收到取消信号的情况，不保证单纯网络断开就触发清理，也不保证上游退还已经消耗的额度。
+- `tools.mode=local_agent` 是历史本地执行能力，不代表多模型接口或 MCP 支持命令执行。多模型工具结果拒绝规则与单模型工具透传规则不同。
 - `model=auto`、`model=free`、`model=best-free` 当前走同一套聊天候选逻辑；免费过滤主要体现在 `/models?mode=free` 展示接口。
 - `latest_models.log` 只有在模型刷新成功且至少获取到一个模型时才会重写；如果所有供应商 `/models` 都失败，旧文件会保留。
 - `latest_models.log` 的理论排名是按供应商分组展示，每组内部按分数排序，不是一个纯全局列表。
 - 自动路由的“实际排名”优先来自可选的 `custom_ranking`，其后来自当前缓存和 `default_model` 配置，不是基于历史成功率的实时学习排序。
 - 只有配置了 API key 的供应商会实例化并参与自动发现；没有 key 的供应商仍可保留在配置中，但不会被自动路由使用。
+
+## 验证与详细文档
+
+基础测试：
+
+```bash
+python -m unittest discover -s tests -q
+```
+
+MCP 协议测试需先安装 `.[mcp]`；未安装 SDK 时相关测试会跳过。Windows 独立 MCP 环境可运行：
+
+```powershell
+.\.venv-mcp\Scripts\python.exe -m unittest discover -s tests -p test_mcp_bridge.py -v
+```
+
+MCP 测试包含真实 stdio 子进程的初始化、工具发现和调用模拟网关，以及鉴权头、部分成功、超时和取消清理。模拟测试不验证真实供应商可用性，也不等同于 OpenClaw/Hermes 宿主联调；测试数量以当前工作区实际收集结果为准。
+
+- [MCP 接入与客户端配置](docs/mcp.md)
+- [多模型工具边界与取消清理](docs/multi-model-tools.md)
+- [只读管理 Agent](docs/manager-agent.md)
+- [第一阶段结构整理记录](docs/phase-one-refactor.md)
 
 ## License
 
