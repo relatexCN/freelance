@@ -257,6 +257,8 @@ app.add_middleware(RequestEventMiddleware)
 app.include_router(chat.router, prefix="/v1")
 app.include_router(chat.router)
 app.include_router(stats.router)
+from app.manager_agent.api import router as manager_router
+app.include_router(manager_router)
 
 
 @app.get("/")

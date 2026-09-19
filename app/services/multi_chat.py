@@ -24,6 +24,27 @@ class MultiChatRequestError(ValueError):
 
 class MultiChatService:
     @staticmethod
+    async def _cancel_and_wait(tasks):
+        """Own children until cleanup completes, even if cancelled again."""
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if not tasks:
+            return
+        cleanup = asyncio.gather(*tasks, return_exceptions=True)
+        interrupted = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # A repeated cancellation must not interrupt upstream finally
+                # blocks that release HTTP connections.
+                interrupted = True
+        cleanup.result()
+        if interrupted:
+            raise asyncio.CancelledError()
+
+    @staticmethod
     def _resolve_model(model_spec: str):
         """Resolve either an alias/model ID or an explicit provider:model target."""
         spec = str(model_spec or "").strip()
@@ -65,6 +86,7 @@ class MultiChatService:
     @staticmethod
     def prepare_targets(request: MultiChatCompletionRequest) -> list[tuple[str, str]]:
         """Validate a multi request and resolve its explicit or configured targets."""
+        MultiChatService._validate_no_tools(request)
         if config.settings.tools.normalized_mode() == "local_agent":
             raise MultiChatRequestError(
                 "Multi-model requests do not support the local Agent tool loop; "
@@ -101,6 +123,21 @@ class MultiChatService:
                 "too_many_models",
             )
         return targets
+
+    @staticmethod
+    def _validate_no_tools(request: MultiChatCompletionRequest):
+        if (
+            request.tools
+            or request.tool_choice not in (None, "none")
+            or request.parallel_tool_calls
+            or getattr(request, "functions", None)
+            or getattr(request, "function_call", None) not in (None, "none")
+        ):
+            raise MultiChatRequestError(
+                "Multi-model requests only return answers and do not support tool calls. "
+                "Run tools in the calling agent using the single-model endpoint.",
+                "multi_tools_not_supported",
+            )
 
     @staticmethod
     async def _call_model(
@@ -157,6 +194,21 @@ class MultiChatService:
                 else ChatCompletionResponse(**response)
             )
             latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            if any(
+                choice.message.tool_calls or choice.finish_reason in {"tool_calls", "function_call"}
+                for choice in processed.choices
+            ):
+                # A contract mismatch is not a provider outage: do not melt its
+                # keys/models or expose tool instructions as a usable answer.
+                error_code = "multi_tool_calls_not_supported"
+                stats_service.record_request(provider_name, actual_model,
+                                             latency_ms=latency_ms, error=error_code)
+                return MultiChatCompletionItem(
+                    provider=provider_name, model=actual_model, status="error",
+                    latency_ms=latency_ms, error_code=error_code,
+                    error="Upstream returned tool calls; this endpoint only accepts answers.",
+                    usage=processed.usage,
+                )
             stats_service.record_request(
                 provider_name,
                 actual_model,
@@ -215,25 +267,24 @@ class MultiChatService:
             )
             for provider_name, actual_model in targets
         ]
-        done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
-        if pending:
-            logger.warning(
-                f"[MULTI] Overall timeout reached after {timeout_seconds:g}s; "
-                f"cancelling {len(pending)} unfinished model(s)"
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
-        responses = []
-        for target, task in zip(targets, tasks):
-            if task in done:
-                responses.append(task.result())
-            else:
-                responses.append(
-                    MultiChatService._timeout_item(*target, timeout_seconds)
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+            if pending:
+                logger.warning(
+                    f"[MULTI] Overall timeout reached after {timeout_seconds:g}s; "
+                    f"cancelling {len(pending)} unfinished model(s)"
                 )
-        return responses
+            responses = []
+            for target, task in zip(targets, tasks):
+                if task in done:
+                    responses.append(task.result())
+                else:
+                    responses.append(
+                        MultiChatService._timeout_item(*target, timeout_seconds)
+                    )
+            return responses
+        finally:
+            await MultiChatService._cancel_and_wait(tasks)
 
     @staticmethod
     async def _run_serial_with_deadline(
@@ -252,9 +303,12 @@ class MultiChatService:
                     for target in targets[index:]
                 )
                 break
+            task = asyncio.create_task(
+                MultiChatService._call_model(request, provider_name, actual_model)
+            )
             try:
                 response = await asyncio.wait_for(
-                    MultiChatService._call_model(request, provider_name, actual_model),
+                    asyncio.shield(task),
                     timeout=remaining,
                 )
                 responses.append(response)
@@ -273,6 +327,8 @@ class MultiChatService:
                     for target in targets[index + 1:]
                 )
                 break
+            finally:
+                await MultiChatService._cancel_and_wait([task])
         return responses
 
     @staticmethod
@@ -280,6 +336,7 @@ class MultiChatService:
         request: MultiChatCompletionRequest,
         targets: Optional[list[tuple[str, str]]] = None,
     ) -> MultiChatCompletionResponse:
+        MultiChatService._validate_no_tools(request)
         targets = targets or MultiChatService.prepare_targets(request)
         timeout_seconds = config.settings.multi_model_timeout
 

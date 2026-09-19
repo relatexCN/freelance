@@ -127,6 +127,16 @@ class LoggingSettings(BaseModel):
     max_field_chars: int = Field(default=4096, ge=128)
 
 
+class ManagerAgentSettings(BaseModel):
+    enabled: bool = False
+    provider: str = ""
+    model: str = ""
+    max_iterations: int = Field(default=4, ge=1, le=8)
+    timeout_seconds: float = Field(default=60, gt=0, le=300)
+    max_tokens: int = Field(default=1500, ge=128, le=8192)
+    auto_apply: Literal[False] = False
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -147,6 +157,7 @@ class Settings(BaseSettings):
     tools: ToolSettings = Field(default_factory=ToolSettings)
     scoring: ScoringSettings = Field(default_factory=ScoringSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    manager_agent: ManagerAgentSettings = Field(default_factory=ManagerAgentSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -392,6 +403,8 @@ class AppConfig:
             self.settings = Settings()
             if "settings" in raw:
                 s_data = raw["settings"]
+                if "manager_agent" in s_data:
+                    self.settings.manager_agent = ManagerAgentSettings(**(s_data["manager_agent"] or {}))
                 if "logging" in s_data:
                     self.settings.logging = LoggingSettings(**(s_data["logging"] or {}))
                 if "max_retries" in s_data:

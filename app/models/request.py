@@ -83,7 +83,8 @@ class MultiChatCompletionRequest(_ChatCompletionRequestBase):
 
     def to_single_request(self, model: str) -> ChatCompletionRequest:
         data = self.model_dump(
-            exclude={"models", "parallel"},
+            exclude={"models", "parallel", "tools", "tool_choice", "parallel_tool_calls",
+                     "functions", "function_call"},
             exclude_none=True,
         )
         data["model"] = model

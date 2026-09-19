@@ -139,6 +139,14 @@ models:
 
 # 全局设置
 settings:
+  manager_agent:
+    enabled: false
+    provider: ""  # 分析报告使用的已配置供应商，例如 openrouter
+    model: ""     # 上游实际模型 ID（需支持工具调用）
+    max_iterations: 4
+    timeout_seconds: 60
+    max_tokens: 1500
+    auto_apply: false  # 第二阶段只生成建议，不执行配置修改
   logging:
     format: json  # json / text（文本模式也使用新的事件字段）
     level: INFO
