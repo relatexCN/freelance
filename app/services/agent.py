@@ -225,18 +225,21 @@ class AgentService:
 
         if self._tool_mode() != "local_agent":
             async def passthrough_gen():
-                yield first_chunk
-                async for chunk in StreamerService.stream_with_heartbeat(
+                relay = StreamerService.stream_with_heartbeat(
                     gen,
                     p_name,
                     actual_id,
                     self.fastapi_request,
                     initial_chunks=1,
                     initial_bytes=len(first_chunk),
-                ):
-                    if await self.fastapi_request.is_disconnected():
-                        break
-                    yield chunk
+                )
+                try:
+                    yield first_chunk
+                    async for chunk in relay:
+                        yield chunk
+                finally:
+                    await relay.aclose()
+                    await gen.aclose()
 
             return StreamingResponse(passthrough_gen(), media_type="text/event-stream")
 

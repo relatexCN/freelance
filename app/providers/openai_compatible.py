@@ -575,6 +575,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 
             log_event(logger, "upstream_started", provider=self.config.name, model=actual_model,
                       key_index=key_idx, attempt=attempt + 1, stream=True)
+            emitted = False
             
             try:
                 request_kwargs = self._build_request_kwargs(request, actual_model, api_key, stream=True)
@@ -652,6 +653,7 @@ class OpenAICompatibleProvider(BaseProvider):
                             chunks_received += 1
                             bytes_received += len(first_chunk)
                             logger.info(f"[{self.config.name}] First chunk received for {actual_model} at +{ttft:.2f}ms (len={len(first_chunk)})")
+                            emitted = True
                             yield f"{first_chunk}\n\n"
                             if first_chunk == "data: [DONE]":
                                 log_event(logger, "upstream_stream_finished", provider=self.config.name,
@@ -697,6 +699,7 @@ class OpenAICompatibleProvider(BaseProvider):
                                         yield f"{line}\n\n"
                                         yield "data: [DONE]\n\n"
                                         return
+                                    emitted = True
                                     yield f"{line}\n\n"
                                     await asyncio.sleep(0.01)
                                 
@@ -734,6 +737,13 @@ class OpenAICompatibleProvider(BaseProvider):
                 if err.skip_retry or err.disable_model:
                     raise err
                 
+            if emitted:
+                log_event(logger, "stream_retry_suppressed", logging.WARNING,
+                          provider=self.config.name, model=actual_model,
+                          reason="output_already_started")
+                yield 'data: {"error":{"code":"upstream_stream_interrupted","message":"Upstream stream interrupted; retry suppressed"}}\n\n'
+                yield "data: [DONE]\n\n"
+                return
             if attempt < num_keys - 1:
                 logger.info(f"[{self.config.name}] Stream attempt {attempt+1} failed ({last_error}), trying next key...")
                 continue

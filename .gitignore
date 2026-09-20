@@ -25,4 +25,6 @@ __pycache__/
 freelance_llm_api.egg-info/
 build/
 freelance.log
+freelance.log.*
+freelance-content.log*
 freelance.pid

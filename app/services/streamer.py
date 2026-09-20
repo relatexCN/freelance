@@ -77,7 +77,8 @@ class StreamerService:
         start_time = time.time()
         chunks_sent = initial_chunks
         total_bytes = initial_bytes
-        last_activity_time = time.time()
+        last_activity_time = time.monotonic()
+        last_ping_time = last_activity_time
         ping_interval = config.settings.stream_probe.ping_interval
         read_timeout = StreamerService.get_read_timeout(model_id)
         
@@ -86,23 +87,23 @@ class StreamerService:
         timeout_event = asyncio.Event() 
         
         async def heartbeat_task():
-            nonlocal last_activity_time
+            nonlocal last_ping_time
             try:
                 while not stop_event.is_set():
                     if await request.is_disconnected():
                         log_event(logger, "stream_disconnected", provider=p_name, model=model_id)
                         logger.warning(f"[CLIENT_DISCONNECT] Client disconnected for {model_id}")
                         break
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     time_since_activity = current_time - last_activity_time
                     if time_since_activity >= read_timeout:
                         log_event(logger, "stream_timeout", logging.WARNING, provider=p_name, model=model_id)
                         logger.warning(f"[TIMEOUT] Read timeout detected for {model_id} (inactivity: {time_since_activity:.1f}s)")
                         timeout_event.set()
                         break
-                    if time_since_activity >= ping_interval:
+                    if current_time - max(last_activity_time, last_ping_time) >= ping_interval:
                         await message_queue.put(("heartbeat", ": ping\n\n"))
-                        last_activity_time = current_time
+                        last_ping_time = current_time
                     await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"[HEARTBEAT] Error: {e}")
@@ -117,7 +118,7 @@ class StreamerService:
                     if timeout_event.is_set() or await request.is_disconnected():
                         logger.info(f"[STREAM] Stopping business task - timeout={timeout_event.is_set()}, disconnected={await request.is_disconnected()}")
                         break
-                    last_activity_time = time.time()
+                    last_activity_time = time.monotonic()
                     chunk_len = len(chunk) if chunk else 0
                     total_bytes += chunk_len
                     if chunks_sent == 0:
@@ -147,6 +148,8 @@ class StreamerService:
                 # Check for exit conditions before waiting
                 if timeout_event.is_set():
                     logger.warning(f"[STREAM] Timeout event set, exiting loop")
+                    yield 'data: {"error":{"code":"stream_idle_timeout","message":"Upstream stream idle timeout"}}\n\n'
+                    yield "data: [DONE]\n\n"
                     break
                 if await request.is_disconnected():
                     log_event(logger, "stream_disconnected", provider=p_name, model=model_id)
@@ -168,7 +171,21 @@ class StreamerService:
             stop_event.set()
             h_task.cancel()
             b_task.cancel()
+            async def cleanup():
+                await asyncio.gather(h_task, b_task, return_exceptions=True)
+                if hasattr(gen, "aclose"):
+                    await gen.aclose()
+            cleanup_task = asyncio.create_task(cleanup())
+            interrupted = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    interrupted = True
+            cleanup_task.result()
             log_event(logger, "stream_relay_finished", provider=p_name, model=model_id,
                       chunks=chunks_sent, characters=total_bytes,
                       elapsed_ms=round((time.time() - start_time) * 1000, 3))
             logger.info(f"--- [STREAM FINISHED] ({chunks_sent} chunks, {total_bytes} bytes relayed) ---")
+            if interrupted:
+                raise asyncio.CancelledError()

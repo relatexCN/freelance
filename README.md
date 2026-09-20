@@ -985,16 +985,29 @@ settings:
   logging:
     format: json                 # json / text，text 也使用新的事件字段
     level: INFO
-    log_request_payload: false   # 临时调试时记录请求正文，不记录响应正文
+    log_request_payload: false   # 请求正文写入独立内容日志
+    log_response_payload: false  # 响应正文写入独立内容日志
+    content_log_path: freelance-content.log
+    max_body_bytes: 262144       # 单次内容上限；响应超限/不完整/解析失败则省略正文
+    max_log_bytes: 10485760      # 每个文件约 10 MiB 后轮转
+    backup_count: 3             # 保留 3 个备份，不是保留 3 天
     include_diagnostics: false   # 旧自由文本日志，可能包含上游回显内容
     max_field_chars: 4096
 ```
 
-默认不输出消息正文、Key 首尾片段或原始上游错误文本。已配置 Key 和结构化敏感字段会脱敏，但不能保证识别调试文本中的所有私人信息。旧自由文本日志在默认模式仅保留级别与来源位置，主要调用链使用具名事件。
+默认不输出消息正文、Key 首尾片段或原始上游错误文本。已配置 Key 和结构化敏感字段会脱敏，但不能保证识别命令、调试文本或 SSE 分片中的所有私人信息。旧自由文本 INFO/DEBUG 在默认模式被过滤；WARNING 及以上保留级别与来源位置，主要调用链使用具名事件。
+
+正文开关默认关闭，开启后需要重启。内容日志不输出到控制台或主运行日志；响应以解析后的 JSON 或 SSE 事件数组记录，不是拼接后的最终回答。只对聊天接口采集响应，采集内存受 `max_body_bytes` 限制，不改变转发内容。超限、未完整传输、无法解析时记录 `omitted: true`；字段截断标记为 `[TRUNCATED]`。不要将内容日志公开分享；排查完毕应关闭开关，并按需要清理备份。
+
+每个 HTTP 响应附带网关生成的 `X-Request-ID`，对应日志中的 `request_id`。聊天事件还包含规范化请求的 HMAC 指纹 `request_fingerprint`：同一进程内相同请求有相同指纹，用于辅助识别重发，不执行自动去重。指纹密钥启动时随机生成，因此不能跨重启或多 worker 比较；指纹不同也不能证明业务意图不同。
+
+工具执行仍属于 Hermes/OpenClaw 等客户端。网关内容日志只能记录模型工具调用及客户端回传的结果，不能证明命令真正执行。完整脱敏命令、工作目录、退出码和 stdout/stderr、工具调用 ID 需由执行端保留；聊天卡片省略和 Agent 循环预算也需在客户端处理。
+
+流式心跳不再刷新上游数据的空闲期限。上游空闲超时时返回 `stream_idle_timeout` SSE 错误并结束；一旦已输出数据，普通网络异常不会再换 Key 重放回答，而是返回 `upstream_stream_interrupted`。首包前的既有重试/降级保持不变。客户端仍需检查 SSE 错误，HTTP 200 不代表模型业务成功。断开或取消时等待流式子任务清理并关闭上游生成器。
 
 `request_finished` 的耗时涵盖完整响应传输；`outcome=completed` 仅表示传输完成，流内模型错误应结合 `upstream_failed/stream_failed` 判断。HTTP 200 不一定等于推理成功。
 
-旧日志不会删除，现有文件继续追加，可能同时包含旧文本与新 JSON；依赖旧格式的采集脚本需要更新。当前没有内置日志轮转或保留天数配置。`/stats` 中既有错误信息和 API 错误响应不受上述日志隐私开关控制。
+旧日志不会主动删除，首次轮转前可能同时包含旧文本与新 JSON；依赖旧格式的采集脚本需要更新。应用直接管理的运行/内容日志按大小轮转，超过备份数量的旧文件会被覆盖；没有按天过期功能。daemon 的 stdout 重定向、Uvicorn access log 和 `error_models.log` 不受此轮转控制，需由部署端处理。多 worker 不应共享同一个轮转文件，应配置独立路径或使用外部日志收集。`/stats` 中既有错误信息和 API 错误响应不受上述日志隐私开关控制。
 
 ## 常见更换场景
 

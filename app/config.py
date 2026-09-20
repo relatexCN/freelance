@@ -123,6 +123,11 @@ class LoggingSettings(BaseModel):
     format: Literal["json", "text"] = "json"
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_request_payload: bool = False
+    log_response_payload: bool = False
+    content_log_path: str = "freelance-content.log"
+    max_body_bytes: int = Field(default=262144, ge=1024, le=10485760)
+    max_log_bytes: int = Field(default=10485760, ge=1024)
+    backup_count: int = Field(default=3, ge=1, le=30)
     include_diagnostics: bool = False
     max_field_chars: int = Field(default=4096, ge=128)
 

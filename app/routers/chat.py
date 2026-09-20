@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.config import config
-from app.core.observability import log_event
+from app.core.observability import log_event, request_fingerprint
 from app.models import (
     ChatCompletionRequest,
     ModelInfo,
@@ -27,7 +27,8 @@ async def multi_chat_completions(
 ):
     """Return independent answers from multiple configured models."""
     object.__setattr__(request, "_gateway_headers", dict(fastapi_request.headers))
-    log_event(logger, "multi_chat_requested", models=request.models, parallel=request.parallel)
+    log_event(logger, "multi_chat_requested", models=request.models, parallel=request.parallel,
+              request_fingerprint=request_fingerprint(request))
     if config.settings.logging.log_request_payload:
         log_event(logger, "request_payload", request_payload=request.model_dump(exclude_none=True))
     try:
@@ -58,7 +59,7 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
     """
     model_name = (request.model or "auto").lower()
     log_event(logger, "chat_requested", model=model_name, stream=request.stream,
-              message_count=len(request.messages))
+              message_count=len(request.messages), request_fingerprint=request_fingerprint(request))
     if config.settings.logging.log_request_payload:
         log_event(logger, "request_payload", request_payload=request.model_dump(exclude_none=True))
 
