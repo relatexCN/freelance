@@ -12,6 +12,7 @@ import hmac
 import secrets
 import time
 import uuid
+from app.core.response_audit import ResponseAudit
 
 request_id = ContextVar("gateway_request_id", default=None)
 _fingerprint_key = secrets.token_bytes(32)
@@ -26,6 +27,20 @@ def request_fingerprint(request):
 
 def log_event(logger, event, level=logging.INFO, **fields):
     logger.log(level, event, extra={"event": event, "fields": fields})
+
+
+async def _cancel_request(task):
+    if not task.done():
+        task.cancel()
+    cleanup = asyncio.gather(task, return_exceptions=True)
+    interrupted = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            interrupted = True
+    if interrupted:
+        raise asyncio.CancelledError()
 
 
 class EventFormatter(logging.Formatter):
@@ -46,14 +61,16 @@ class EventFormatter(logging.Formatter):
             # Tool arguments are often JSON encoded inside a string.
             if value.lstrip().startswith(("{", "[")):
                 try:
-                    value = json.dumps(self.redact(json.loads(value)), ensure_ascii=False)
+                    # Return immediately: applying regex to serialized JSON again
+                    # can consume escapes and destroy tool argument structure.
+                    return json.dumps(self.redact(json.loads(value)), ensure_ascii=False)
                 except (ValueError, RecursionError):
                     pass
             for secret in sorted(set(self.secrets()), key=len, reverse=True):
                 if secret:
                     value = value.replace(secret, "[REDACTED]")
-            value = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", value)
-            value = re.sub(r"(?i)((?:access_token|api_key|appsecret|client_secret)=)[^&\s\"']+",
+            value = re.sub(r"(?i)(bearer\s+)[^\s\"'`\\]+", r"\1[REDACTED]", value)
+            value = re.sub(r"(?i)((?:access_token|api_key|appsecret|client_secret|secret)=)[^&\s\"'`\\]+",
                            r"\1[REDACTED]", value)
             limit = self.settings.max_field_chars
             return value if len(value) <= limit else value[:limit] + "...[TRUNCATED]"
@@ -145,6 +162,8 @@ class RequestEventMiddleware:
         disconnected = False
         from app.config import config
         settings = config.settings.logging
+        chat_request = scope["path"].rstrip("/") in {"/chat/completions", "/v1/chat/completions"}
+        audit = ResponseAudit() if chat_request else None
         capture = settings.log_response_payload and scope["path"].rstrip("/").endswith(
             ("/chat/completions", "/chat/completions/multi"))
         body = bytearray()
@@ -172,6 +191,8 @@ class RequestEventMiddleware:
                           elapsed_ms=round((time.perf_counter() - start) * 1000, 3))
             elif message["type"] == "http.response.body":
                 byte_count += len(message.get("body", b""))
+                if audit:
+                    audit.feed(message.get("body", b""), "text/event-stream" in content_type)
                 if capture:
                     remaining = max(0, settings.max_body_bytes - len(body))
                     body.extend(message.get("body", b"")[:remaining])
@@ -179,7 +200,31 @@ class RequestEventMiddleware:
                     completed = True
 
         try:
-            await self.app(scope, observed_receive, observed_send)
+            if chat_request:
+                task = asyncio.create_task(self.app(scope, observed_receive, observed_send))
+                try:
+                    finished, _ = await asyncio.wait({task}, timeout=config.settings.reliability.request_timeout_seconds)
+                    timed_out = task not in finished
+                    if timed_out:
+                        await _cancel_request(task)
+                    else:
+                        await task
+                finally:
+                    if not task.done():
+                        await _cancel_request(task)
+                if timed_out:
+                    log_event(self.logger, "request_deadline_exceeded",
+                              timeout_seconds=config.settings.reliability.request_timeout_seconds)
+                    error = {"error": {"code": "request_deadline_exceeded", "message": "Gateway request time budget exceeded"}}
+                    if status is None:
+                        await observed_send({"type": "http.response.start", "status": 504,
+                                             "headers": [(b"content-type", b"application/json")]})
+                        await observed_send({"type": "http.response.body", "body": json.dumps(error).encode()})
+                    elif not completed and "text/event-stream" in content_type:
+                        await observed_send({"type": "http.response.body",
+                                             "body": ("data: " + json.dumps(error) + "\n\ndata: [DONE]\n\n").encode()})
+            else:
+                await self.app(scope, observed_receive, observed_send)
             outcome = "completed" if completed else "incomplete"
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -189,6 +234,9 @@ class RequestEventMiddleware:
             log_event(self.logger, "request_failed", logging.ERROR, error_type=type(exc).__name__)
             raise
         finally:
+            if audit:
+                log_event(self.logger, "response_summary", **audit.summary(
+                    "text/event-stream" in content_type, status, completed))
             if capture:
                 # Never log unparseable raw bytes: they may contain unredacted credentials.
                 payload = None
@@ -205,6 +253,7 @@ class RequestEventMiddleware:
                 log_event(self.logger, "response_payload", response_payload=payload,
                           omitted=omitted, bytes_sent=byte_count)
             log_event(self.logger, "request_finished", status_code=status,
+                      http_outcome="disconnected" if disconnected and not completed else outcome,
                       outcome="disconnected" if disconnected and not completed else outcome,
                       bytes_sent=byte_count,
                       elapsed_ms=round((time.perf_counter() - start) * 1000, 3))

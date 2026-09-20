@@ -119,6 +119,12 @@ class ScoringSettings(BaseModel):
     recency_half_life_days: int = 730
     max_provider_adjustment: float = 0.03
 
+class ReliabilitySettings(BaseModel):
+    request_timeout_seconds: float = Field(default=180, gt=0, le=3600)
+    model_failure_threshold: int = Field(default=3, ge=1, le=100)
+    model_cooldown_seconds: float = Field(default=60, gt=0, le=3600)
+
+
 class LoggingSettings(BaseModel):
     format: Literal["json", "text"] = "json"
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -162,6 +168,7 @@ class Settings(BaseSettings):
     tools: ToolSettings = Field(default_factory=ToolSettings)
     scoring: ScoringSettings = Field(default_factory=ScoringSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    reliability: ReliabilitySettings = Field(default_factory=ReliabilitySettings)
     manager_agent: ManagerAgentSettings = Field(default_factory=ManagerAgentSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
@@ -233,10 +240,11 @@ class ProviderConfig:
         self.key_cooldowns = {}
         self.fatal_keys = set()
         self.model_cooldowns = {}
+        self.transient_model_failures = {}
         self.stream_melted_until = {}
         self.melted_until = 0
 
-    def get_next_key(self) -> tuple[str, int]:
+    def get_next_key(self, excluded=None) -> tuple[str, int]:
         """
         Returns (key, index) for the next healthy API key in the pool.
         Skips keys currently in cooldown. 
@@ -247,6 +255,7 @@ class ProviderConfig:
             return "", -1
             
         now = time.time()
+        excluded = excluded or set()
         num_keys = len(self.api_keys)
         
         # Build status info for logging
@@ -266,6 +275,8 @@ class ProviderConfig:
         # 1. First pass: try to find a completely healthy key
         for i in range(num_keys):
             idx = (self._current_key_idx + i) % num_keys
+            if idx in excluded:
+                continue
             if idx not in self.key_cooldowns or now >= self.key_cooldowns[idx]:
                 # Found a healthy key!
                 if idx in self.key_cooldowns:
@@ -282,6 +293,8 @@ class ProviderConfig:
         # This is for transient errors like 429.
         for i in range(num_keys):
             idx = (self._current_key_idx + i) % num_keys
+            if idx in excluded:
+                continue
             if idx not in self.fatal_keys:
                 self._current_key_idx = (idx + 1) % num_keys
                 remaining = self.key_cooldowns[idx] - now if idx in self.key_cooldowns else 0
@@ -290,6 +303,8 @@ class ProviderConfig:
                 logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (IN_COOLDOWN, {remaining:.0f}s remaining) | Status: {', '.join(status_parts)}")
                 return self.api_keys[idx], idx
         
+        if excluded:
+            return "", -1
         # 3. No non-fatal keys available. Trigger platform-level melt if not already set.
         if not self.is_platform_melted():
              # Use provider_melt duration (default 3h)
@@ -315,6 +330,23 @@ class ProviderConfig:
     def record_model_failure(self, model_id: str, cooldown: int = 3600):
         """Mark a specific model path as hot for a period of time."""
         self.model_cooldowns[model_id] = time.time() + cooldown
+
+    def record_transient_model_failure(self, model_id):
+        count = self.transient_model_failures.get(model_id, 0) + 1
+        self.transient_model_failures[model_id] = count
+        policy = config.settings.reliability
+        if count >= policy.model_failure_threshold:
+            self.model_cooldowns[model_id] = max(self.model_cooldowns.get(model_id, 0),
+                                                time.time() + policy.model_cooldown_seconds)
+            self.transient_model_failures[model_id] = 0
+            log_event(logger, "model_circuit_opened", provider=self.name, model=model_id,
+                      failure_count=count, cooldown_seconds=policy.model_cooldown_seconds)
+            return policy.model_cooldown_seconds
+        return 0
+
+    def record_model_success(self, model_id):
+        self.transient_model_failures.pop(model_id, None)
+        # An older in-flight success must not clear an already-open circuit.
 
     def record_platform_failure(self, cooldown: int = 10800):
         """Mark the entire provider as melted for a period of time.
@@ -412,6 +444,8 @@ class AppConfig:
                     self.settings.manager_agent = ManagerAgentSettings(**(s_data["manager_agent"] or {}))
                 if "logging" in s_data:
                     self.settings.logging = LoggingSettings(**(s_data["logging"] or {}))
+                if "reliability" in s_data:
+                    self.settings.reliability = ReliabilitySettings(**(s_data["reliability"] or {}))
                 if "max_retries" in s_data:
                     self.settings.max_retries = int(s_data["max_retries"])
                 if "max_iterations" in s_data:

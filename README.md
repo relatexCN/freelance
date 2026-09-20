@@ -941,6 +941,30 @@ settings:
 
 ## 日志文件
 
+### 故障处理与项目边界（2026-09）
+
+网关负责：请求追踪、日志脱敏、上游 Key 重试、路由冷却、HTTP 请求预算、SSE 错误传递与响应结果摘要。
+Hermes/OpenClaw 负责：识别流内错误而不是按“空回复”结束、工具执行检查点与恢复、命令展示、业务文件修改后的验收。微信脚本的 URL 改写、Token 保存及敏感日志属于远端业务项目，不由网关自动修复。
+
+```yaml
+settings:
+  reliability:
+    request_timeout_seconds: 180
+    model_failure_threshold: 3
+    model_cooldown_seconds: 60
+```
+
+- `request_timeout_seconds` 是单模型 `/chat/completions`（含 `/v1`）的整次 HTTP 请求预算，覆盖请求解析、路由、Key 重试、降级及流输出；多模型接口仍使用 `multi_model_timeout`。超时取消工作并等待清理，清理耗时可能使实际返回晚于预算。响应头发出前返回 HTTP 504；SSE 已开始后发送 `request_deadline_exceeded` 错误及结束标记，不更改已经发出的 HTTP 200。
+- 同一次 Provider 调用不再重复尝试已经用过的 Key，即使其他并发请求改变了轮询游标。
+- 同一 Provider/模型连续出现 503、504、网络/首包超时或非正常 EOF，达到阈值后施加短期模型冷却。阈值按上游尝试计数，不是按用户消息计数。完整成功响应重置失败计数；已经开启的冷却不会被旧的在途成功请求提前清除。后续路由跳过冷却模型；并发在途请求不会被强制终止。状态仅存在于当前进程。
+- `upstream_failed.cooldown` 为错误策略参数；`cooldown_applied` 记录实际施加的 Key/模型冷却，`model_circuit_opened` 记录短期模型熔断。平台级熔断仍沿用原策略。
+- 上游无 `[DONE]` 即 EOF 视为不完整流。输出前可重试，输出后报错结束，禁止拼接重放。
+- 默认输出 `response_summary`，无需开启正文日志：包含 `model_outcome`、`finish_reasons`、`tool_call_count`、`content_chars`、`stream_error`、`done_received`。它逐行检查聊天 SSE，限制单行缓冲；超限或解析失败明确标为检查不完整，不保存正文。`completed` 仅代表模型协议层正常结束，不代表 Agent 业务任务通过验收；`length/content_filter` 标为 `truncated`。
+- `request_finished.http_outcome` 表示 HTTP 传输结果；原 `outcome` 字段保留兼容。HTTP completed 与模型 error 可以同时出现，这是流内错误的正常表达。
+- JSON 字符串按结构递归脱敏，不再对重新序列化的 JSON 执行第二轮正则替换。截断仅作用于叶子文本，外层工具参数 JSON 保持可解析；代码模板字符串边界不会被查询参数脱敏吞掉。脱敏后的日志仍不是可执行代码副本，也不能保证识别所有自由文本秘密。
+
+以上配置修改后需要重启。当前仓库已有的正文日志启用状态予以保留；排查结束建议关闭正文记录。本次改动不自动重放历史失败任务、不修改外部业务文件，也不执行发布或创建草稿操作。
+
 ### latest_models.log
 
 每次模型缓存刷新成功后重写，包含两部分：

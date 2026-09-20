@@ -147,6 +147,10 @@ settings:
     timeout_seconds: 60
     max_tokens: 1500
     auto_apply: false  # 第二阶段只生成建议，不执行配置修改
+  reliability:
+    request_timeout_seconds: 180 # 单模型 HTTP 请求总预算，含重试、降级和流输出
+    model_failure_threshold: 3   # 同 Provider/模型连续瞬时故障尝试次数
+    model_cooldown_seconds: 60   # 达阈值后后续路由暂时跳过该模型
   logging:
     format: json  # json / text（文本模式也使用新的事件字段）
     level: INFO

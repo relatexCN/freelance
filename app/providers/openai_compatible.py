@@ -377,8 +377,8 @@ class OpenAICompatibleProvider(BaseProvider):
         key_fatal = False
         disable_provider = False
 
-        if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, asyncio.TimeoutError)):
-            error_type = "Timeout" if "timeout" in lower_msg or isinstance(exc, asyncio.TimeoutError) else "NetworkError"
+        if isinstance(exc, (httpx.TransportError, asyncio.TimeoutError)):
+            error_type = "Timeout" if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)) else "NetworkError"
             error_code = "timeout_network"
             cooldown = min(config.settings.cooldown.timeout_network, 60)
             disable_key = True
@@ -414,6 +414,13 @@ class OpenAICompatibleProvider(BaseProvider):
             self.config.record_key_failure(err.key_index, cooldown, is_fatal=err.key_fatal)
         if err.disable_model:
             self.config.record_model_failure(actual_model, cooldown)
+        circuit_cooldown = 0
+        if err.status_code in {503, 504} or err.error_code in {"timeout_network", "first_chunk_timeout", "stream_incomplete"}:
+            circuit_cooldown = self.config.record_transient_model_failure(actual_model)
+        log_event(logger, "cooldown_applied", provider=self.config.name, model=actual_model,
+                  key_index=err.key_index,
+                  key_seconds=cooldown if err.disable_key and err.key_index >= 0 else 0,
+                  model_seconds=cooldown if err.disable_model else circuit_cooldown)
 
     def _raise_exhausted(self, actual_model: str, last_error: Any):
         err = GatewayError.from_exception(last_error, provider=self.config.name, model=actual_model)
@@ -443,11 +450,12 @@ class OpenAICompatibleProvider(BaseProvider):
         
         num_keys = len(self.config.api_keys) or 1
         last_error = None
-        
+        tried_keys = set()
         for attempt in range(num_keys):
-            api_key, key_idx = self.config.get_next_key()
+            api_key, key_idx = self.config.get_next_key(excluded=tried_keys)
             if not api_key:
                 break
+            tried_keys.add(key_idx)
                 
             log_event(logger, "upstream_started", provider=self.config.name, model=actual_model,
                       key_index=key_idx, attempt=attempt + 1, stream=False)
@@ -484,6 +492,7 @@ class OpenAICompatibleProvider(BaseProvider):
                         raise Exception("Upstream returned 200 OK but choices list is empty.")
                     
                     result = self._parse_response(data, request.model)
+                    self.config.record_model_success(actual_model)
                     log_event(logger, "upstream_finished", provider=self.config.name,
                               model=actual_model, key_index=key_idx,
                               elapsed_ms=round((time.perf_counter() - attempt_start) * 1000, 3),
@@ -567,11 +576,12 @@ class OpenAICompatibleProvider(BaseProvider):
         
         num_keys = len(self.config.api_keys) or 1
         last_error = None
-
+        tried_keys = set()
         for attempt in range(num_keys):
-            api_key, key_idx = self.config.get_next_key()
+            api_key, key_idx = self.config.get_next_key(excluded=tried_keys)
             if not api_key:
                 break
+            tried_keys.add(key_idx)
                 
             log_event(logger, "upstream_started", provider=self.config.name, model=actual_model,
                       key_index=key_idx, attempt=attempt + 1, stream=True)
@@ -607,6 +617,9 @@ class OpenAICompatibleProvider(BaseProvider):
                         first_chunk = None
                         try:
                             first_chunk = await asyncio.wait_for(lines_iter.__anext__(), timeout=effective_timeout)
+                        except StopAsyncIteration:
+                            raise GatewayError(message="Upstream stream was empty", error_code="stream_incomplete",
+                                               provider=self.config.name, model=actual_model, key_index=key_idx)
                         except asyncio.TimeoutError:
                             err = GatewayError(
                                 message=f"First chunk timeout ({effective_timeout}s)",
@@ -656,6 +669,7 @@ class OpenAICompatibleProvider(BaseProvider):
                             emitted = True
                             yield f"{first_chunk}\n\n"
                             if first_chunk == "data: [DONE]":
+                                self.config.record_model_success(actual_model)
                                 log_event(logger, "upstream_stream_finished", provider=self.config.name,
                                           model=actual_model, key_index=key_idx, outcome="done")
                                 logger.info(f"[{self.config.name}] Received end signal for {actual_model} in first chunk")
@@ -670,7 +684,8 @@ class OpenAICompatibleProvider(BaseProvider):
                                 
                                 line = line.strip()
                                 if not line: continue
-                                if line == "data: [DONE]": 
+                                if line == "data: [DONE]":
+                                    self.config.record_model_success(actual_model)
                                     log_event(logger, "upstream_stream_finished", provider=self.config.name,
                                               model=actual_model, key_index=key_idx, outcome="done")
                                     chunks_received += 1
@@ -706,7 +721,8 @@ class OpenAICompatibleProvider(BaseProvider):
                             except StopAsyncIteration:
                                 log_event(logger, "upstream_stream_finished", provider=self.config.name,
                                           model=actual_model, key_index=key_idx, outcome="eof")
-                                break
+                                raise GatewayError(message="Upstream ended without DONE", error_code="stream_incomplete",
+                                                   provider=self.config.name, model=actual_model, key_index=key_idx)
                         
                         logger.info(f"[{self.config.name}] Stream finished for {actual_model}: {chunks_received} chunks, {bytes_received} bytes received")
                         return # Success
@@ -727,6 +743,8 @@ class OpenAICompatibleProvider(BaseProvider):
                         
             except GatewayError as e:
                 last_error = e
+                if e.error_code == "stream_incomplete":
+                    self._record_gateway_error(e, actual_model)
                 if e.skip_retry or e.disable_model:
                     raise
             except Exception as e:
