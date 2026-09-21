@@ -103,6 +103,9 @@ class ToolSettings(BaseModel):
     # local_agent: execute supported tool calls inside this gateway.
     # disabled: remove tool request controls before sending upstream.
     mode: str = "passthrough"
+    append_details: bool = False
+    append_results: bool = False
+    detail_max_chars: int = Field(default=32768, ge=1024, le=262144)
 
     def normalized_mode(self) -> str:
         mode = (self.mode or "passthrough").strip().lower()
@@ -509,6 +512,10 @@ class AppConfig:
 
                 if "tools" in s_data:
                     tools_data = s_data["tools"] or {}
+                    validated_tools = ToolSettings(**tools_data)
+                    self.settings.tools.append_details = validated_tools.append_details
+                    self.settings.tools.append_results = validated_tools.append_results
+                    self.settings.tools.detail_max_chars = validated_tools.detail_max_chars
                     if "mode" in tools_data:
                         mode = str(tools_data["mode"]).strip().lower()
                         if mode not in {"passthrough", "local_agent", "disabled"}:
