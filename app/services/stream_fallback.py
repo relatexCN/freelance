@@ -1,0 +1,152 @@
+"""Own candidate selection for the entire stream, not just its first packet."""
+import asyncio
+import json
+import logging
+import time
+import uuid
+
+import httpx
+
+from app.core.observability import log_event
+from app.services.gateway_errors import GatewayError
+from app.services.router import RouterService, get_provider_instance
+from app.services.streamer import StreamerService
+from app.services.stats_service import stats_service
+
+logger = logging.getLogger('freelance.stream_fallback')
+
+
+def can_fallback(error):
+    return (error.status_code in {408, 429, 500, 502, 503, 504, 524}
+            or error.error_code in {'timeout_network', 'first_chunk_timeout', 'stream_incomplete',
+                                   'upstream_stream_interrupted', 'stream_idle_timeout'})
+
+
+async def stream_candidates(request, http_request, candidates):
+    response_id = 'chatcmpl-' + uuid.uuid4().hex
+    created = int(time.time())
+    model = request.model
+    switched = False
+    failed = False
+    tried = set()
+
+    def packet(content):
+        return 'data: ' + json.dumps({'id': response_id, 'object': 'chat.completion.chunk',
+            'created': created, 'model': model, 'choices': [
+                {'index': 0, 'delta': {'content': content}, 'finish_reason': None}]}, ensure_ascii=False) + '\n\n'
+
+    def terminal(code, message):
+        return 'data: ' + json.dumps({'error': {'code': code, 'message': message}}, ensure_ascii=False) + '\n\n'
+
+    for provider_name, actual_model in candidates:
+        if (provider_name, actual_model) in tried:
+            continue
+        tried.add((provider_name, actual_model))
+        if await http_request.is_disconnected():
+            return
+        if not RouterService.is_provider_available(provider_name, actual_model):
+            log_event(logger, 'fallback_candidate_skipped', provider=provider_name, model=actual_model,
+                      reason='unavailable')
+            continue
+        provider = get_provider_instance(provider_name)
+        if provider is None:
+            continue
+        if failed:
+            switched = True
+            # Do not repeat untrusted provider errors or credentials in the notice.
+            yield packet('\n\n【当前模型调用失败，切换新模型】\n'
+                         '以下由备用模型重新回答；前面的未完成内容仅供参考。\n\n')
+            log_event(logger, 'stream_model_switch', provider=provider_name, model=actual_model)
+        log_event(logger, 'provider_selected', provider=provider_name, model=actual_model,
+                  iteration=1, stream=True)
+        probe = StreamerService.get_probe_timeout(actual_model)
+        gen = provider.chat_completion_stream(request, actual_model, timeout=probe)
+        first = True
+        tools_sent = False
+        answer_seen = False
+        pending = []
+        pending_size = 0
+        error = None
+        started = time.monotonic()
+        try:
+            while True:
+                timeout = probe if first else StreamerService.get_read_timeout(actual_model)
+                chunk = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
+                if first:
+                    log_event(logger, 'first_chunk_received', provider=provider_name, model=actual_model,
+                              elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+                    first = False
+                if not chunk.startswith('data:'):
+                    yield chunk
+                    continue
+                raw = chunk[5:].strip()
+                if raw == '[DONE]':
+                    if not pending or not answer_seen:
+                        raise GatewayError('Stream ended without a finish reason', error_code='stream_incomplete')
+                    for ending in pending:
+                        yield ending
+                    if hasattr(provider, 'config'):
+                        provider.config.reset_consecutive_failures()
+                    stats_service.record_request(provider_name, actual_model,
+                                                 latency_ms=(time.monotonic() - started) * 1000)
+                    yield 'data: [DONE]\n\n'
+                    return
+                data = json.loads(raw)
+                if data.get('error'):
+                    upstream_error = data['error']
+                    status = upstream_error.get('code')
+                    try:
+                        status_code = int(status)
+                    except (TypeError, ValueError):
+                        status_code = None
+                    raise GatewayError('Upstream stream failed', status_code=status_code,
+                                       error_code=str(status or 'upstream_error'))
+                if switched:
+                    data.update(id=response_id, created=created, model=model)
+                    chunk = 'data: ' + json.dumps(data, ensure_ascii=False) + '\n\n'
+                else:
+                    response_id = data.get('id', response_id)
+                    created = data.get('created', created)
+                    model = data.get('model', model)
+                for choice in data.get('choices') or []:
+                    delta = choice.get('delta') or {}
+                    answer_seen |= bool(delta.get('content') or delta.get('tool_calls') or delta.get('function_call'))
+                if pending or any(choice.get('finish_reason') for choice in data.get('choices') or []):
+                    # A failed candidate must not send a terminal finish/usage frame.
+                    pending_size += len(chunk)
+                    if pending_size > 262144 or len(pending) >= 32:
+                        raise GatewayError('Too many terminal frames', error_code='stream_incomplete')
+                    pending.append(chunk)
+                else:
+                    for choice in data.get('choices') or []:
+                        delta = choice.get('delta') or {}
+                        if delta.get('tool_calls') or delta.get('function_call'):
+                            tools_sent = True
+                    yield chunk
+        except StopAsyncIteration:
+            error = GatewayError('Upstream ended unexpectedly', error_code='stream_incomplete')
+        except (asyncio.TimeoutError, httpx.TransportError):
+            error = GatewayError('Upstream stream timeout or connection failure', error_code='timeout_network')
+        except GatewayError as exc:
+            error = exc
+        except (ValueError, TypeError, AttributeError):
+            error = GatewayError('Invalid upstream stream data', error_code='invalid_stream')
+        except Exception:
+            error = GatewayError('Upstream stream failed', error_code='upstream_error')
+        finally:
+            await gen.aclose()
+        log_event(logger, 'stream_candidate_failed', provider=provider_name, model=actual_model,
+                  error_code=error.error_code, status_code=error.status_code, tools_sent=tools_sent)
+        RouterService.record_failure(provider_name, actual_model, error)
+        if tools_sent:
+            yield terminal('fallback_blocked_after_tool_call',
+                           '模型调用失败；已发送工具调用，为避免重复执行，未切换模型。')
+            yield 'data: [DONE]\n\n'
+            return
+        if not can_fallback(error):
+            yield terminal(error.error_code, '模型调用失败，此错误不允许自动切换模型。')
+            yield 'data: [DONE]\n\n'
+            return
+        failed = True
+    yield terminal('all_stream_candidates_failed', '所有可用候选模型均失败或不可用，请稍后重试。')
+    yield 'data: [DONE]\n\n'

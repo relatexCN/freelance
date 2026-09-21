@@ -70,6 +70,7 @@ class StreamerService:
         request: Request,
         initial_chunks: int = 0,
         initial_bytes: int = 0,
+        monitor_read_timeout: bool = True,
     ):
         """
         Wraps provider stream with heartbeat functionality and read timeout handling.
@@ -96,7 +97,7 @@ class StreamerService:
                         break
                     current_time = time.monotonic()
                     time_since_activity = current_time - last_activity_time
-                    if time_since_activity >= read_timeout:
+                    if monitor_read_timeout and time_since_activity >= read_timeout:
                         log_event(logger, "stream_timeout", logging.WARNING, provider=p_name, model=model_id)
                         logger.warning(f"[TIMEOUT] Read timeout detected for {model_id} (inactivity: {time_since_activity:.1f}s)")
                         timeout_event.set()

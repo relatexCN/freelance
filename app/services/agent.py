@@ -87,6 +87,16 @@ class AgentService:
         if not models_to_try:
             return make_error_response("No available models found", 404)
 
+        if request.stream and self._tool_mode() != "local_agent":
+            from app.services.stream_fallback import stream_candidates
+            # The requested model remains first; configured defaults provide fallbacks.
+            models_to_try = list(dict.fromkeys(models_to_try + RouterService.build_auto_candidates()))
+            gen = stream_candidates(request, self.fastapi_request, models_to_try)
+            relay = StreamerService.stream_with_heartbeat(
+                gen, 'routing', model_name, self.fastapi_request, initial_chunks=1,
+                monitor_read_timeout=False)
+            return StreamingResponse(relay, media_type="text/event-stream")
+
         max_iterations = getattr(config.settings, "max_iterations", 3)
         iteration = 0
         
