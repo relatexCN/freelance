@@ -16,7 +16,6 @@ from app.utils.responses import make_error_response
 from app.services.router import RouterService, get_provider_instance
 from app.services.streamer import StreamerService
 from app.services.gateway_errors import GatewayError
-from app.services.tool_details import ToolDetailStream, call_details, recent_results
 
 logger = logging.getLogger("freelance.agent")
 
@@ -148,12 +147,6 @@ class AgentService:
                                 text_before, _, text_after = extract_xml_block(content)
                                 final_content = (text_before or "") + (text_after or "")
                                 resp.choices[0].message.content = final_content.strip()
-                            if self._tool_mode() == "passthrough" and config.settings.tools.append_details:
-                                for index, choice in enumerate(resp.choices):
-                                    extra = (recent_results(request) if index == 0 else '')
-                                    extra += call_details(choice.message.tool_calls or [])
-                                    if extra:
-                                        choice.message.content = (choice.message.content or '') + extra
                             return JSONResponse(content=resp.model_dump(exclude_none=True))
                             
                 except Exception as e:
@@ -232,8 +225,6 @@ class AgentService:
 
         if self._tool_mode() != "local_agent":
             async def passthrough_gen():
-                details = ToolDetailStream(request) if (self._tool_mode() == "passthrough"
-                            and config.settings.tools.append_details) else None
                 relay = StreamerService.stream_with_heartbeat(
                     gen,
                     p_name,
@@ -243,11 +234,9 @@ class AgentService:
                     initial_bytes=len(first_chunk),
                 )
                 try:
-                    for output in details.feed(first_chunk) if details else [first_chunk]:
-                        yield output
+                    yield first_chunk
                     async for chunk in relay:
-                        for output in details.feed(chunk) if details else [chunk]:
-                            yield output
+                        yield chunk
                 finally:
                     await relay.aclose()
                     await gen.aclose()

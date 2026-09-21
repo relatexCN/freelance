@@ -216,9 +216,6 @@ settings:
   # disabled     - 发送上游前移除工具相关参数
   tools:
     mode: passthrough
-    append_details: true  # 将脱敏工具参数追加到回答正文，保留原 tool_calls
-    append_results: true  # 只展示当前请求末尾回传的工具结果，不重放全部历史
-    detail_max_chars: 32768
 
   # SSE 探测与优化设置
   stream_probe:
