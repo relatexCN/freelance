@@ -400,6 +400,10 @@ class RouterService:
                   error_type=gw_error.error_type, retryable=gw_error.retryable)
         err_str = str(gw_error)
         stats_service.record_request(p_name, actual_id, error=err_str)
+        # Provider errors are counted by the Provider itself; only count this
+        # gateway-owned deadline here, once, without disabling a whole platform.
+        if gw_error.error_code == 'first_output_timeout':
+            p_cfg.record_transient_model_failure(actual_id)
 
         if isinstance(error, GatewayError):
             err_type = error.error_type

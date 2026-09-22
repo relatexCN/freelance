@@ -954,7 +954,7 @@ settings:
 - 一旦旧模型工具调用片段已经发送，禁止自动切换，返回 `fallback_blocked_after_tool_call`，避免客户端执行重复或混合的调用。这个限制优先于自动降级。
 - 使用统一 completion ID；切换后协议中的 model 保留首次响应标签以兼容客户端，实际 Provider/模型以 `stream_model_switch`、`provider_selected` 日志为准。失败候选的 finish/usage 尾帧被丢弃，成功候选仅发送一次最终 `[DONE]`。上游 usage 不代表所有失败尝试的总费用。
 - 每个候选最多进入一次，冷却候选跳过并记录 `fallback_candidate_skipped`。模型结果只有元数据、无正文和工具调用时视为不完整，继续尝试。
-- 全部尝试共享 `request_timeout_seconds` 总预算，不因切换重置。各候选有自己的首包与空闲超时，心跳不会延长它们。全部失败、无可用备用或总预算耗尽仍明确报错，不能保证上游不可用时一定得到答案。
+- 默认不限制整次请求总时长；仅显式设置正数 `request_timeout_seconds` 时，全部尝试共享该预算，不因切换重置。各候选仍有首包、空闲及首个有效输出等待上限，网关心跳不会延长它们。正文开始后不因累计耗时过长而中断；仅推理而无正文/工具增量仍受首个输出等待上限约束。全部失败、无可用备用或显式预算耗尽仍明确报错，不能保证上游不可用时一定得到答案。
 - 新增 `stream_candidate_failed` 与 `stream_model_switch` 用于区分上游失败和最终模型结果；正常成功且未切换时不追加说明。
 
 日志、请求 ID、心跳及超时/流错误通知独立保留。`local_agent` 模式仍按其原有逻辑执行工具。
@@ -967,18 +967,28 @@ Hermes/OpenClaw 负责：识别流内错误而不是按“空回复”结束、�
 ```yaml
 settings:
   reliability:
-    request_timeout_seconds: 180
+    request_timeout_seconds: 0
+    request_warning_seconds: 180
+    first_output_timeout_seconds: 180
     model_failure_threshold: 3
     model_cooldown_seconds: 60
 ```
 
-- `request_timeout_seconds` 是单模型 `/chat/completions`（含 `/v1`）的整次 HTTP 请求预算，覆盖请求解析、路由、Key 重试、降级及流输出；多模型接口仍使用 `multi_model_timeout`。超时取消工作并等待清理，清理耗时可能使实际返回晚于预算。响应头发出前返回 HTTP 504；SSE 已开始后发送 `request_deadline_exceeded` 错误及结束标记，不更改已经发出的 HTTP 200。
+- `request_timeout_seconds` 默认 `0`，不限制单模型 `/chat/completions`（含 `/v1`）的整次 HTTP 请求总时长。配置正数可恢复硬截止，覆盖请求解析、路由、Key 重试、降级及流输出；多模型接口仍使用 `multi_model_timeout`。启用硬截止时，超时取消工作并等待清理，清理耗时可能使实际返回晚于预算。响应头发出前返回 HTTP 504；SSE 已开始后发送 `request_deadline_exceeded` 错误及结束标记，不更改已经发出的 HTTP 200。
+- `request_warning_seconds` 默认 `180`，超过阈值仅记录一次 `request_slow`，不取消、不重试、不向模型正文追加提示；设为 `0` 可关闭。它不是候选模型预算，也不限制整个 Agent 任务。
+- `first_output_timeout_seconds` 默认 `180`，适用于非 `local_agent` 的单模型流式候选循环：从每个候选开始调用计时，包含连接及其 Key 尝试。角色、元数据、空白正文、心跳、`reasoning` 等推理字段不重置计时；出现非空白正文或工具/旧式函数调用增量后解除此限制，原有空闲超时仍生效。设为 `0` 关闭。超时关闭当前上游流，以 `first_output_timeout` 记录响应过慢并尝试下一候选，每个候选重新计时；每次只计一次模型瞬时失败，达到 `model_failure_threshold` 后按 `model_cooldown_seconds` 短期冷却并跳过后续路由，不禁用整个 Provider。若更短的首包、空闲或总请求预算先耗尽，仍按其原有路径处理。
+- 已发送工具调用后不自动重放或切换的安全限制保持不变。新限制不适用于非流式、多模型聚合或 `local_agent` 路径；不检查业务答案质量、不改写推理为正文。上游仍可能收费，切换也不保证更快。
+- 关闭总时长限制不关闭连接、首包和空闲超时，不增加 Key 或候选重试次数；客户端取消仍会触发清理。客户端及反向代理可能有独立超时，需要自行协调。持续活跃的请求可以长期占用连接，应继续使用现有鉴权和并发限制；网关不会保证任务最终完成，也不会修改客户端恢复消息或业务上下文。
 - 同一次 Provider 调用不再重复尝试已经用过的 Key，即使其他并发请求改变了轮询游标。
 - 同一 Provider/模型连续出现 503、504、网络/首包超时或非正常 EOF，达到阈值后施加短期模型冷却。阈值按上游尝试计数，不是按用户消息计数。完整成功响应重置失败计数；已经开启的冷却不会被旧的在途成功请求提前清除。后续路由跳过冷却模型；并发在途请求不会被强制终止。状态仅存在于当前进程。
 - `upstream_failed.cooldown` 为错误策略参数；`cooldown_applied` 记录实际施加的 Key/模型冷却，`model_circuit_opened` 记录短期模型熔断。平台级熔断仍沿用原策略。
 - 上游无 `[DONE]` 即 EOF 视为不完整流。Provider 输出后不做 Key 重放；跨模型恢复由上述流式调度层处理，并显式提示。
 - 默认输出 `response_summary`，无需开启正文日志：包含 `model_outcome`、`finish_reasons`、`tool_call_count`、`content_chars`、`stream_error`、`done_received`。它逐行检查聊天 SSE，限制单行缓冲；超限或解析失败明确标为检查不完整，不保存正文。`completed` 仅代表模型协议层正常结束，不代表 Agent 业务任务通过验收；`length/content_filter` 标为 `truncated`。
 - `request_finished.http_outcome` 表示 HTTP 传输结果；原 `outcome` 字段保留兼容。HTTP completed 与模型 error 可以同时出现，这是流内错误的正常表达。
+- `content_chars` 保留原有的全部正文字符数；新增 `model_content_chars` 与 `gateway_notice_chars` 分别统计模型正文和网关切换通知。网关通知帧增加顶层 `_gateway_notice: true` 扩展字段；流式候选路径会移除上游同名字段，避免误认来源。客户端可忽略该扩展，原通知文字不变。非流式和 `local_agent` 路径没有此来源认证。
+- `response_summary` 增加 `reasoning_chars`、`reasoning_chunks`、`first_content_ms`、`first_tool_ms`、`first_reasoning_ms`，首个时间从审计开始计时，无该类输出则为 null。推理按 `reasoning`、`reasoning_content`、`reasoning_details[].text` 顺序取一个表示，避免常见重复字段双计；这些是字段字符/块统计，不是 token 计费数据。网关不读取语义来判断任务完成。
+- 普通流式调用新增 `stream_candidate_summary`，无论成功、失败或取消都记录每个候选的上述指标、耗时及错误码；该摘要统计上游已接收帧（含暂存尾帧），HTTP `response_summary` 统计下游实际发送帧，二者统计边界不同。
+- 显式总请求预算耗尽时，若存在活跃流式候选，记录 `request_budget_exhausted_at_candidate` 及其已用时间。总预算不足不是上游故障证据，因此不自动增加健康惩罚；客户端取消同样不惩罚模型。此前失败候选已记录的失败不会重复计数。冷却为进程内状态，恢复后仍可能再次选中该模型；本次不新增跨请求自适应评分算法。
 - JSON 字符串按结构递归脱敏，不再对重新序列化的 JSON 执行第二轮正则替换。截断仅作用于叶子文本，外层工具参数 JSON 保持可解析；代码模板字符串边界不会被查询参数脱敏吞掉。脱敏后的日志仍不是可执行代码副本，也不能保证识别所有自由文本秘密。
 
 以上配置修改后需要重启。当前仓库已有的正文日志启用状态予以保留；排查结束建议关闭正文记录。本次改动不自动重放历史失败任务、不修改外部业务文件，也不执行发布或创建草稿操作。

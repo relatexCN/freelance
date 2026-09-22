@@ -1,5 +1,6 @@
 """Bounded response metadata inspection; never retains or logs conversation text."""
 import json
+import time
 
 
 class ResponseAudit:
@@ -13,6 +14,13 @@ class ResponseAudit:
         self.finish_reasons = set()
         self.tool_slots = set()
         self.content_chars = 0
+        self.gateway_notice_chars = 0
+        self.reasoning_chars = 0
+        self.reasoning_chunks = 0
+        self.started = time.monotonic()
+        self.first_content_ms = None
+        self.first_tool_ms = None
+        self.first_reasoning_ms = None
 
     def inspect(self, data):
         if not isinstance(data, dict):
@@ -32,6 +40,22 @@ class ResponseAudit:
             content = delta.get("content")
             if isinstance(content, str):
                 self.content_chars += len(content)
+                if data.get('_gateway_notice') is True:
+                    self.gateway_notice_chars += len(content)
+                elif content.strip() and self.first_content_ms is None:
+                    self.first_content_ms = round((time.monotonic() - self.started) * 1000, 3)
+            # Providers may duplicate reasoning across these fields: count one representation.
+            reasoning = delta.get('reasoning') or delta.get('reasoning_content')
+            if not isinstance(reasoning, str):
+                reasoning = ''.join(item.get('text', '') for item in delta.get('reasoning_details') or []
+                                    if isinstance(item, dict) and isinstance(item.get('text'), str))
+            if reasoning:
+                self.reasoning_chars += len(reasoning)
+                self.reasoning_chunks += 1
+                if self.first_reasoning_ms is None:
+                    self.first_reasoning_ms = round((time.monotonic() - self.started) * 1000, 3)
+            if (delta.get('tool_calls') or delta.get('function_call')) and self.first_tool_ms is None:
+                self.first_tool_ms = round((time.monotonic() - self.started) * 1000, 3)
             for index, tool in enumerate(delta.get("tool_calls") or []):
                 if len(self.tool_slots) < 1024:
                     self.tool_slots.add((str(choice.get("index", 0))[:32],
@@ -86,5 +110,10 @@ class ResponseAudit:
             outcome = "completed"
         return dict(model_outcome=outcome, finish_reasons=sorted(self.finish_reasons),
                     tool_call_count=len(self.tool_slots), content_chars=self.content_chars,
+                    model_content_chars=self.content_chars - self.gateway_notice_chars,
+                    gateway_notice_chars=self.gateway_notice_chars,
+                    reasoning_chars=self.reasoning_chars, reasoning_chunks=self.reasoning_chunks,
+                    first_content_ms=self.first_content_ms, first_tool_ms=self.first_tool_ms,
+                    first_reasoning_ms=self.first_reasoning_ms,
                     stream_error=self.error, done_received=self.done,
                     inspection_incomplete=self.incomplete)

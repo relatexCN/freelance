@@ -201,11 +201,30 @@ class RequestEventMiddleware:
 
         try:
             if chat_request:
+                policy = config.settings.reliability
+                deadline = policy.request_timeout_seconds
+                warning = policy.request_warning_seconds
                 task = asyncio.create_task(self.app(scope, observed_receive, observed_send))
                 try:
-                    finished, _ = await asyncio.wait({task}, timeout=config.settings.reliability.request_timeout_seconds)
+                    # A slow request is observable without imposing a hard deadline.
+                    # Keep the child task isolated so caller cancellation still awaits cleanup.
+                    if warning and (not deadline or warning < deadline):
+                        finished, _ = await asyncio.wait(
+                            {task}, timeout=max(0, warning - (time.perf_counter() - start)))
+                        if not finished:
+                            log_event(self.logger, "request_slow", logging.WARNING,
+                                      elapsed_ms=round((time.perf_counter() - start) * 1000, 3),
+                                      warning_seconds=warning, timeout_seconds=deadline)
+                    remaining = max(0, deadline - (time.perf_counter() - start)) if deadline else None
+                    finished, _ = await asyncio.wait({task}, timeout=remaining)
                     timed_out = task not in finished
                     if timed_out:
+                        candidate = scope.get('_gateway_candidate')
+                        if candidate and candidate.get('active'):
+                            log_event(self.logger, 'request_budget_exhausted_at_candidate',
+                                      provider=candidate['provider'], model=candidate['model'],
+                                      candidate_elapsed_ms=round((time.monotonic() - candidate['started']) * 1000, 3),
+                                      health_penalty_applied=False)
                         await _cancel_request(task)
                     else:
                         await task

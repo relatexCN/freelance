@@ -7,7 +7,9 @@ import uuid
 
 import httpx
 
+from app.config import config
 from app.core.observability import log_event
+from app.core.response_audit import ResponseAudit
 from app.services.gateway_errors import GatewayError
 from app.services.router import RouterService, get_provider_instance
 from app.services.streamer import StreamerService
@@ -19,7 +21,8 @@ logger = logging.getLogger('freelance.stream_fallback')
 def can_fallback(error):
     return (error.status_code in {408, 429, 500, 502, 503, 504, 524}
             or error.error_code in {'timeout_network', 'first_chunk_timeout', 'stream_incomplete',
-                                   'upstream_stream_interrupted', 'stream_idle_timeout'})
+                                   'upstream_stream_interrupted', 'stream_idle_timeout',
+                                   'first_output_timeout'})
 
 
 async def stream_candidates(request, http_request, candidates):
@@ -32,7 +35,7 @@ async def stream_candidates(request, http_request, candidates):
 
     def packet(content):
         return 'data: ' + json.dumps({'id': response_id, 'object': 'chat.completion.chunk',
-            'created': created, 'model': model, 'choices': [
+            'created': created, 'model': model, '_gateway_notice': True, 'choices': [
                 {'index': 0, 'delta': {'content': content}, 'finish_reason': None}]}, ensure_ascii=False) + '\n\n'
 
     def terminal(code, message):
@@ -64,14 +67,34 @@ async def stream_candidates(request, http_request, candidates):
         first = True
         tools_sent = False
         answer_seen = False
+        output_seen = False
+        output_timeout = config.settings.reliability.first_output_timeout_seconds
         pending = []
         pending_size = 0
         error = None
         started = time.monotonic()
+        candidate_audit = ResponseAudit()
+        candidate_state = dict(provider=provider_name, model=actual_model, started=started, active=True)
+        if hasattr(http_request, 'scope'):
+            http_request.scope['_gateway_candidate'] = candidate_state
         try:
             while True:
                 timeout = probe if first else StreamerService.get_read_timeout(actual_model)
-                chunk = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
+                output_limited = False
+                if output_timeout and not output_seen:
+                    remaining = output_timeout - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise GatewayError('No answer output within candidate budget',
+                                           error_code='first_output_timeout')
+                    output_limited = remaining <= timeout
+                    timeout = min(timeout, remaining)
+                try:
+                    chunk = await asyncio.wait_for(gen.__anext__(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if output_limited:
+                        raise GatewayError('No answer output within candidate budget',
+                                           error_code='first_output_timeout') from None
+                    raise
                 if first:
                     log_event(logger, 'first_chunk_received', provider=provider_name, model=actual_model,
                               elapsed_ms=round((time.monotonic() - started) * 1000, 3))
@@ -87,11 +110,17 @@ async def stream_candidates(request, http_request, candidates):
                         yield ending
                     if hasattr(provider, 'config'):
                         provider.config.reset_consecutive_failures()
+                    candidate_audit.done = True
                     stats_service.record_request(provider_name, actual_model,
                                                  latency_ms=(time.monotonic() - started) * 1000)
                     yield 'data: [DONE]\n\n'
                     return
                 data = json.loads(raw)
+                # This extension is gateway-owned, never trust an upstream marker.
+                if '_gateway_notice' in data:
+                    data.pop('_gateway_notice')
+                    chunk = 'data: ' + json.dumps(data, ensure_ascii=False) + '\n\n'
+                candidate_audit.inspect(data)
                 if data.get('error'):
                     upstream_error = data['error']
                     status = upstream_error.get('code')
@@ -111,6 +140,9 @@ async def stream_candidates(request, http_request, candidates):
                 for choice in data.get('choices') or []:
                     delta = choice.get('delta') or {}
                     answer_seen |= bool(delta.get('content') or delta.get('tool_calls') or delta.get('function_call'))
+                    content = delta.get('content')
+                    output_seen |= bool((isinstance(content, str) and content.strip())
+                                        or delta.get('tool_calls') or delta.get('function_call'))
                 if pending or any(choice.get('finish_reason') for choice in data.get('choices') or []):
                     # A failed candidate must not send a terminal finish/usage frame.
                     pending_size += len(chunk)
@@ -134,9 +166,19 @@ async def stream_candidates(request, http_request, candidates):
         except Exception:
             error = GatewayError('Upstream stream failed', error_code='upstream_error')
         finally:
-            await gen.aclose()
+            try:
+                await gen.aclose()
+            finally:
+                candidate_state['active'] = False
+                candidate_audit.error |= error is not None
+                log_event(logger, 'stream_candidate_summary', provider=provider_name, model=actual_model,
+                          error_code=error.error_code if error else None,
+                          elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                          **candidate_audit.summary(True, None, candidate_audit.done))
         log_event(logger, 'stream_candidate_failed', provider=provider_name, model=actual_model,
-                  error_code=error.error_code, status_code=error.status_code, tools_sent=tools_sent)
+                  error_code=error.error_code, status_code=error.status_code, tools_sent=tools_sent,
+                  elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                  first_output_seen=output_seen)
         RouterService.record_failure(provider_name, actual_model, error)
         if tools_sent:
             yield terminal('fallback_blocked_after_tool_call',

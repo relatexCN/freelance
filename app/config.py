@@ -120,7 +120,9 @@ class ScoringSettings(BaseModel):
     max_provider_adjustment: float = 0.03
 
 class ReliabilitySettings(BaseModel):
-    request_timeout_seconds: float = Field(default=180, gt=0, le=3600)
+    request_timeout_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
+    request_warning_seconds: float = Field(default=180, ge=0, allow_inf_nan=False)
+    first_output_timeout_seconds: float = Field(default=180, ge=0, allow_inf_nan=False)
     model_failure_threshold: int = Field(default=3, ge=1, le=100)
     model_cooldown_seconds: float = Field(default=60, gt=0, le=3600)
 
