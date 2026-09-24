@@ -15,12 +15,14 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[list[dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
+    model_config = {"extra": "allow"}
 
 
 class ResponseFormat(BaseModel):
     """Response format specification."""
 
     type: str = "text"  # "text" or "json_object"
+    model_config = {"extra": "allow"}
 
 
 class _ChatCompletionRequestBase(BaseModel):

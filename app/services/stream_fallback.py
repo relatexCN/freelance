@@ -67,7 +67,6 @@ async def stream_candidates(request, http_request, candidates):
         gen = provider.chat_completion_stream(request, actual_model, timeout=probe)
         first = True
         tools_sent = False
-        answer_seen = False
         output_seen = False
         output_timeout = config.settings.reliability.first_output_timeout_seconds
         pending = []
@@ -108,12 +107,13 @@ async def stream_candidates(request, http_request, candidates):
                     continue
                 raw = chunk[5:].strip()
                 if raw == '[DONE]':
-                    if not pending or not answer_seen:
+                    if not pending or not output_seen:
                         raise GatewayError('Stream ended without a finish reason', error_code='stream_incomplete')
                     for ending in pending:
                         yield ending
                     if hasattr(provider, 'config'):
                         provider.config.reset_consecutive_failures()
+                        provider.config.record_model_success(actual_model)
                     candidate_audit.done = True
                     stats_service.record_request(provider_name, actual_model,
                                                  latency_ms=(time.monotonic() - started) * 1000)
@@ -143,7 +143,6 @@ async def stream_candidates(request, http_request, candidates):
                     model = data.get('model', model)
                 for choice in data.get('choices') or []:
                     delta = choice.get('delta') or {}
-                    answer_seen |= bool(delta.get('content') or delta.get('tool_calls') or delta.get('function_call'))
                     content = delta.get('content')
                     output_seen |= bool((isinstance(content, str) and content.strip())
                                         or delta.get('tool_calls') or delta.get('function_call'))

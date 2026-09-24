@@ -220,10 +220,10 @@ class OpenAICompatibleProvider(BaseProvider):
         return payload
 
     def _build_payload(self, request: ChatCompletionRequest, actual_model: str, stream: bool) -> dict[str, Any]:
-        if self.config.pass_through_body:
+        if self.config.pass_through_body and not getattr(request, '_gateway_normalized_body', False):
             raw_body = getattr(request, "_gateway_raw_body", b"") or b""
             try:
-                payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                payload = json.loads(raw_body.decode("utf-8")) if raw_body else request.to_provider_payload(actual_model)
             except Exception:
                 logger.warning(f"[{self.config.name}] Failed to parse raw body for pass-through; falling back to normalized payload")
                 payload = request.to_provider_payload(actual_model)
@@ -504,6 +504,10 @@ class OpenAICompatibleProvider(BaseProvider):
                         raise Exception("Upstream returned 200 OK but choices list is empty.")
                     
                     result = self._parse_response(data, request.model)
+                    if not any((choice.message.content or '').strip() or choice.message.tool_calls
+                               for choice in result.choices):
+                        raise GatewayError('Upstream returned no usable output', error_code='stream_incomplete',
+                                           provider=self.config.name, model=actual_model)
                     self.config.record_model_success(actual_model)
                     log_event(logger, "upstream_finished", provider=self.config.name,
                               model=actual_model, key_index=key_idx,
@@ -681,7 +685,6 @@ class OpenAICompatibleProvider(BaseProvider):
                             emitted = True
                             yield f"{first_chunk}\n\n"
                             if first_chunk == "data: [DONE]":
-                                self.config.record_model_success(actual_model)
                                 log_event(logger, "upstream_stream_finished", provider=self.config.name,
                                           model=actual_model, key_index=key_idx, outcome="done")
                                 logger.info(f"[{self.config.name}] Received end signal for {actual_model} in first chunk")
@@ -697,7 +700,6 @@ class OpenAICompatibleProvider(BaseProvider):
                                 line = line.strip()
                                 if not line: continue
                                 if line == "data: [DONE]":
-                                    self.config.record_model_success(actual_model)
                                     log_event(logger, "upstream_stream_finished", provider=self.config.name,
                                               model=actual_model, key_index=key_idx, outcome="done")
                                     chunks_received += 1

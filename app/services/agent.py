@@ -1,9 +1,7 @@
-import asyncio
 import time
 import json
-import uuid
 import logging
-from typing import List, Any, Optional, AsyncGenerator
+from typing import List, Optional
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -16,6 +14,7 @@ from app.utils.responses import make_error_response
 from app.services.router import RouterService, get_provider_instance
 from app.services.streamer import StreamerService
 from app.services.gateway_errors import GatewayError
+from app.services.stream_fallback import can_fallback
 
 logger = logging.getLogger("freelance.agent")
 
@@ -76,6 +75,12 @@ class AgentService:
         ))
 
     async def run(self, request: ChatCompletionRequest):
+        if self._tool_mode() == 'local_agent':
+            if request.n not in (None, 1):
+                return make_error_response('Local agent supports n=1 only', 400,
+                                           code='local_multiple_choices')
+            # Local tool rounds mutate messages; never reuse the initial raw body.
+            object.__setattr__(request, '_gateway_normalized_body', True)
         model_name = (request.model or "auto").lower()
         session_id = RouterService.resolve_session_id(request)
         models_to_try = await RouterService.get_models_to_try(
@@ -87,10 +92,11 @@ class AgentService:
         if not models_to_try:
             return make_error_response("No available models found", 404)
 
+        models_to_try = list(dict.fromkeys(models_to_try + RouterService.build_auto_candidates()))
+
         if request.stream and self._tool_mode() != "local_agent":
             from app.services.stream_fallback import stream_candidates
             # The requested model remains first; configured defaults provide fallbacks.
-            models_to_try = list(dict.fromkeys(models_to_try + RouterService.build_auto_candidates()))
             gen = stream_candidates(request, self.fastapi_request, models_to_try)
             relay = StreamerService.stream_with_heartbeat(
                 gen, 'routing', model_name, self.fastapi_request, initial_chunks=1,
@@ -140,9 +146,18 @@ class AgentService:
                         content = message.content or ""
                         tool_results = []
                         if self._tool_mode() == "local_agent":
+                            if iteration >= max_iterations and (message.tool_calls or has_xml_tool_call(content)):
+                                return make_error_response('Local agent iteration limit reached', 500,
+                                                           code='agent_iteration_limit')
+                            if not message.tool_calls and has_xml_tool_call(content):
+                                from app.utils.tool_converter import extract_xml_block
+                                converted = xml_to_tool_calls(content)
+                                if not converted:
+                                    return make_error_response('Invalid XML tool calls', 502, code='invalid_tool_calls')
+                                before, _, after = extract_xml_block(content)
+                                message.tool_calls = converted
+                                message.content = (before or '') + (after or '')
                             tool_results = await self._process_native_tool_calls(message.tool_calls)
-                            if not tool_results:
-                                tool_results = await self._process_xml_tool_calls(content)
 
                         if tool_results and iteration < max_iterations:
                             self._append_assistant_message(request, message)
@@ -164,7 +179,7 @@ class AgentService:
                     last_err = str(e)
                     tried_details.append(f"{p_name}/{actual_id} error: {last_err}")
                     RouterService.record_failure(p_name, actual_id, e)
-                    if isinstance(e, GatewayError) and e.skip_retry:
+                    if isinstance(e, GatewayError) and not can_fallback(e):
                         status_code = e.status_code if e.status_code is not None else 500
                         return make_error_response(
                             last_err,
@@ -209,194 +224,8 @@ class AgentService:
         return make_error_response(f"Agent exceeded max iterations ({max_iterations})", 500)
 
     async def _handle_stream(self, request, provider, p_name, actual_id, iteration, max_iterations):
-        probe_timeout = StreamerService.get_probe_timeout(actual_id)
-        stream_start = time.time()
-        gen = provider.chat_completion_stream(request, actual_id, timeout=probe_timeout)
-
-        try:
-            first_chunk = await gen.__anext__()
-        except GatewayError:
-            raise
-        except Exception as e:
-            raise Exception(f"Failed to get first chunk: {e}")
-
-        first_ttft = (time.time() - stream_start) * 1000
-        log_event(logger, "first_chunk_received", provider=p_name, model=actual_id,
-                  elapsed_ms=round(first_ttft, 3))
-        logger.info(f"[STREAM] First chunk for {actual_id} received at +{first_ttft:.2f}ms (len={len(first_chunk)})")
-        if first_chunk.strip() == "data: [DONE]":
-            logger.info(f"[STREAM] Received end signal for {actual_id} in first chunk")
-
-        p_cfg = config.providers.get(p_name)
-        if p_cfg:
-            p_cfg.reset_consecutive_failures()
-        from app.services.stats_service import stats_service
-        stats_service.record_request(p_name, actual_id, ttft_ms=first_ttft)
-
-        if self._tool_mode() != "local_agent":
-            async def passthrough_gen():
-                relay = StreamerService.stream_with_heartbeat(
-                    gen,
-                    p_name,
-                    actual_id,
-                    self.fastapi_request,
-                    initial_chunks=1,
-                    initial_bytes=len(first_chunk),
-                )
-                try:
-                    yield first_chunk
-                    async for chunk in relay:
-                        yield chunk
-                finally:
-                    await relay.aclose()
-                    await gen.aclose()
-
-            return StreamingResponse(passthrough_gen(), media_type="text/event-stream")
-
-        async def agent_gen(current_gen, current_id, current_first, current_iter):
-            full_content = ""
-            is_suppressing = False
-            tag_start_str = "<function_calls"
-            tag_end_str = "</function_calls>"
-            
-            # Metadata from provider (stable ID)
-            request_id = None
-            
-            def extract_info(c):
-                nonlocal request_id
-                if c.startswith("data: ") and not "[DONE]" in c:
-                    try:
-                        d = json.loads(c[6:])
-                        if "error" in d:
-                            return "", False, True # Added is_error flag content, is_data, is_error
-                        if "id" in d: request_id = d["id"]
-                        choices = d.get("choices")
-                        if choices and isinstance(choices, list) and len(choices) > 0:
-                            content = choices[0].get("delta", {}).get("content", "")
-                            return content if content is not None else "", True, False
-                        return "", True, False
-                    except: return "", True, False
-                return "", False, False
-
-            def make_synthetic_chunk(text, original_chunk_str):
-                # If we must split/modify, try to preserve metadata from the original chunk
-                if not text: return ""
-                try:
-                    d = json.loads(original_chunk_str[6:])
-                    d["choices"][0]["delta"]["content"] = text
-                    return f"data: {json.dumps(d)}\n\n"
-                except:
-                    # Fallback to a plain but consistent chunk
-                    chunk_data = {
-                        "id": request_id or f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
-                    }
-                    return f"data: {json.dumps(chunk_data)}\n\n"
-
-            # 1. Process the very first chunk from the provider
-            delta, is_data, is_error = extract_info(current_first)
-            full_content += delta
-            
-            if is_data and tag_start_str in delta:
-                # Rare: Tag in the first chunk. Enter suppression.
-                is_suppressing = True
-                pre_tag = delta.split(tag_start_str)[0]
-                if pre_tag:
-                    yield make_synthetic_chunk(pre_tag, current_first)
-            else:
-                # Normal: Relay first chunk as-is to establish ID/Role
-                yield current_first
-
-            # 2. Main relay loop
-            pending_buffer = ""
-            async for chunk in StreamerService.stream_with_heartbeat(
-                current_gen,
-                p_name,
-                current_id,
-                self.fastapi_request,
-                initial_chunks=1,
-                initial_bytes=len(current_first),
-            ):
-                if await self.fastapi_request.is_disconnected(): break
-                
-                # Relay non-data pings immediately
-                if not chunk.startswith("data: ") or "[DONE]" in chunk:
-                    yield chunk
-                    continue
-                
-                delta, is_data, is_error = extract_info(chunk)
-                if is_error:
-                    # CRITICAL: Relay error chunks directly so client knows why it failed
-                    yield chunk
-                    continue
-                
-                if not is_suppressing:
-                    # Lookahead logic: Check if current stream is heading towards a tag
-                    potential_new = pending_buffer + delta
-                    
-                    if tag_start_str in potential_new:
-                        # TAG DETECTED!
-                        is_suppressing = True
-                        tag_start_idx = potential_new.find(tag_start_str)
-                        
-                        # Yield everything before the tag
-                        pre_tag_text = potential_new[:tag_start_idx]
-                        if pre_tag_text:
-                            yield make_synthetic_chunk(pre_tag_text, chunk)
-                        
-                        # Full content keeps the tag for internal processing
-                        full_content += delta
-                        pending_buffer = "" # Clear buffer as we've entered suppression mode
-                    elif any(tag_start_str.startswith(potential_new[i:]) for i in range(len(potential_new))):
-                        # POTENTIAL TAG START: Keep in buffer, don't yield yet
-                        pending_buffer = potential_new
-                    else:
-                        # SAFE: No tag detected or possible. Flush buffer + current delta.
-                        if pending_buffer:
-                            yield make_synthetic_chunk(pending_buffer, chunk)
-                            pending_buffer = ""
-                        yield chunk
-                        full_content += delta
-                else:
-                    # SUPPRESSING: Just accumulate for internal agent logic
-                    full_content += delta
-                    if tag_end_str in full_content:
-                        is_suppressing = False
-                        tag_end_idx = full_content.find(tag_end_str) + len(tag_end_str)
-                        # Note: We don't yield post-tag content here immediately as it might 
-                        # contain ANOTHER tag start. The next iteration will handle it.
-                        # For now, just reset is_suppressing and let the next chunk flush.
-            
-            # 3. Final flush of any pending text that wasn't part of a tag
-            if is_suppressing:
-                logger.warning(f'[STREAM] Stream ended while still in suppression mode!')
-            if not is_suppressing and pending_buffer:
-                yield make_synthetic_chunk(pending_buffer, current_first)
-                full_content += pending_buffer
-            
-            # Turn continuation check
-            if has_xml_tool_call(full_content) and current_iter < max_iterations:
-                tool_results = await self._process_xml_tool_calls(full_content)
-                if tool_results:
-                    request.messages.append(ChatMessage(role="assistant", content=full_content))
-                    for tr in tool_results:
-                        request.messages.append(ChatMessage(**tr))
-                    
-                    next_gen = provider.chat_completion_stream(request, current_id, timeout=probe_timeout)
-                    try:
-                        next_first = await next_gen.__anext__()
-                        logger.info(f"[STREAM] First chunk for {current_id} received after tool call (len={len(next_first)})")
-                        async for c in agent_gen(next_gen, current_id, next_first, current_iter + 1):
-                            yield c
-                        return
-                    except Exception as e:
-                        logger.error(f'[STREAM] Failed to continue stream after tool call: {e}')
-            
-            yield f"event: stream_end\ndata: {{\"content_length\": {len(full_content)}}}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            agent_gen(gen, actual_id, first_chunk, iteration),
-            media_type="text/event-stream"
-        )
+        from app.services.local_agent_stream import local_agent_stream
+        gen = local_agent_stream(self, request, provider, p_name, actual_id, max_iterations)
+        return StreamingResponse(StreamerService.stream_with_heartbeat(
+            gen, p_name, actual_id, self.fastapi_request, initial_chunks=1,
+            monitor_read_timeout=False), media_type='text/event-stream')

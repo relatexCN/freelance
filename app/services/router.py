@@ -344,12 +344,10 @@ class RouterService:
 
         if model_name in ("auto", "free", "best-free"):
             # Wait for cache if empty
-            if not config.auto_models_cache and not config.custom_model_ranking:
+            if not RouterService.build_auto_candidates():
                 start_wait = time.time()
                 while not config.auto_models_cache and (time.time() - start_wait) < 5.0:
                     await asyncio.sleep(1.0)
-            if not config.auto_models_cache and not config.custom_model_ranking:
-                return []
             models_to_try = RouterService.build_auto_candidates()
         else:
             p_cfg, actual = config.resolve_model(model_name)
