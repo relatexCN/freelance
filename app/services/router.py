@@ -397,12 +397,13 @@ class RouterService:
         from app.core.observability import log_event
         log_event(logger, "routing_failure", logging.WARNING, provider=p_name, model=actual_id,
                   status_code=gw_error.status_code, error_code=gw_error.error_code,
-                  error_type=gw_error.error_type, retryable=gw_error.retryable)
+                  error_type=gw_error.error_type, retryable=gw_error.retryable,
+                  exception_type=gw_error.exception_type, timeout_phase=gw_error.timeout_phase)
         err_str = str(gw_error)
         stats_service.record_request(p_name, actual_id, error=err_str)
         # Provider errors are counted by the Provider itself; only count this
         # gateway-owned deadline here, once, without disabling a whole platform.
-        if gw_error.error_code == 'first_output_timeout':
+        if gw_error.error_code in {'first_output_timeout', 'candidate_first_chunk_timeout', 'candidate_idle_timeout'}:
             p_cfg.record_transient_model_failure(actual_id)
 
         if isinstance(error, GatewayError):

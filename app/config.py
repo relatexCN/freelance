@@ -250,7 +250,7 @@ class ProviderConfig:
         """
         Returns (key, index) for the next healthy API key in the pool.
         Skips keys currently in cooldown. 
-        UNLESS the key is marked as Fatal (401/403), it won't even be returned as fallback.
+        No key is reused before its cooldown expires.
         """
         if not self.api_keys:
             logger.info(f"[{self.name}] get_next_key: No API keys configured")
@@ -291,29 +291,10 @@ class ProviderConfig:
                 logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (HEALTHY) | Status: {', '.join(status_parts)}")
                 return self.api_keys[idx], idx
 
-        # 2. Fallback: return the next one that is NOT fatal.
-        # This is for transient errors like 429.
-        for i in range(num_keys):
-            idx = (self._current_key_idx + i) % num_keys
-            if idx in excluded:
-                continue
-            if idx not in self.fatal_keys:
-                self._current_key_idx = (idx + 1) % num_keys
-                remaining = self.key_cooldowns[idx] - now if idx in self.key_cooldowns else 0
-                log_event(logger, "key_selected", provider=self.name, key_index=idx,
-                          state="cooldown_fallback", cooldown_remaining_seconds=remaining)
-                logger.info(f"[{self.name}] get_next_key: Selected key[{idx}] (IN_COOLDOWN, {remaining:.0f}s remaining) | Status: {', '.join(status_parts)}")
-                return self.api_keys[idx], idx
-        
-        if excluded:
-            return "", -1
-        # 3. No non-fatal keys available. Trigger platform-level melt if not already set.
-        if not self.is_platform_melted():
-             # Use provider_melt duration (default 3h)
-             self.record_platform_failure(10800)
-             logger.warning(f"[{self.name}] No non-fatal keys available. Melting platform for 3 hours.")
-
-        logger.error(f"[{self.name}] get_next_key: No available keys | Status: {', '.join(status_parts)}")
+        # Unavailability is not a new upstream failure. In particular do not
+        # extend cooldown or trip a platform circuit merely by checking keys.
+        log_event(logger, 'key_pool_unavailable', provider=self.name,
+                  reason='cooldown_or_exhausted')
         return "", -1
 
     def record_key_failure(self, index: int, cooldown: int = 60, is_fatal: bool = False):

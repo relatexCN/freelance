@@ -980,6 +980,9 @@ settings:
 - 已发送工具调用后不自动重放或切换的安全限制保持不变。新限制不适用于非流式、多模型聚合或 `local_agent` 路径；不检查业务答案质量、不改写推理为正文。上游仍可能收费，切换也不保证更快。
 - 关闭总时长限制不关闭连接、首包和空闲超时，不增加 Key 或候选重试次数；客户端取消仍会触发清理。客户端及反向代理可能有独立超时，需要自行协调。持续活跃的请求可以长期占用连接，应继续使用现有鉴权和并发限制；网关不会保证任务最终完成，也不会修改客户端恢复消息或业务上下文。
 - 同一次 Provider 调用不再重复尝试已经用过的 Key，即使其他并发请求改变了轮询游标。
+- Key 冷却严格生效：全部 Key 在冷却中时不再使用 `cooldown_fallback`，记录 `key_pool_unavailable`；聊天调用以 `no_available_keys`（503）交给路由尝试备用，不重复惩罚模型或延长冷却。冷却到期后自动恢复选取；模型列表刷新也不使用冷却 Key 或退化成匿名探测。
+- 候选循环自身的首包和空闲等待超时分别记录 `candidate_first_chunk_timeout`、`candidate_idle_timeout`，与 `first_output_timeout` 一样进入模型级失败阈值；Provider 已记录的网络/HTTP 错误不在路由层重复计入模型失败。客户端取消和总预算耗尽仍不惩罚模型。
+- `upstream_failed`、`routing_failure`、`stream_candidate_failed` 增加 `exception_type`、`timeout_phase`。HTTPX 超时区分 `connect/read/write/pool`，候选等待区分 `candidate_first_chunk/candidate_idle`；连接池等待超时属于本地资源竞争，不因此冷却 Key、模型或 Provider。异常原文不新增到结构化日志，避免泄露凭据。连接阶段标记不能进一步证明是 DNS、TCP、TLS 还是代理故障，仍需在实际部署环境排查。
 - 同一 Provider/模型连续出现 503、504、网络/首包超时或非正常 EOF，达到阈值后施加短期模型冷却。阈值按上游尝试计数，不是按用户消息计数。完整成功响应重置失败计数；已经开启的冷却不会被旧的在途成功请求提前清除。后续路由跳过冷却模型；并发在途请求不会被强制终止。状态仅存在于当前进程。
 - `upstream_failed.cooldown` 为错误策略参数；`cooldown_applied` 记录实际施加的 Key/模型冷却，`model_circuit_opened` 记录短期模型熔断。平台级熔断仍沿用原策略。
 - 上游无 `[DONE]` 即 EOF 视为不完整流。Provider 输出后不做 Key 重放；跨模型恢复由上述流式调度层处理，并显式提示。

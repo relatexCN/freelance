@@ -73,6 +73,8 @@ class GatewayError(Exception):
     cooldown: Optional[int] = None
     provider: str = ""
     model: str = ""
+    exception_type: str = ""
+    timeout_phase: str = ""
 
     def __str__(self) -> str:
         parts = [self.message]

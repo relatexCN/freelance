@@ -22,7 +22,8 @@ def can_fallback(error):
     return (error.status_code in {408, 429, 500, 502, 503, 504, 524}
             or error.error_code in {'timeout_network', 'first_chunk_timeout', 'stream_incomplete',
                                    'upstream_stream_interrupted', 'stream_idle_timeout',
-                                   'first_output_timeout'})
+                                   'first_output_timeout', 'candidate_first_chunk_timeout',
+                                   'candidate_idle_timeout'})
 
 
 async def stream_candidates(request, http_request, candidates):
@@ -94,7 +95,10 @@ async def stream_candidates(request, http_request, candidates):
                     if output_limited:
                         raise GatewayError('No answer output within candidate budget',
                                            error_code='first_output_timeout') from None
-                    raise
+                    raise GatewayError('Candidate stream wait timed out',
+                                       error_code='candidate_first_chunk_timeout' if first else 'candidate_idle_timeout',
+                                       timeout_phase='candidate_first_chunk' if first else 'candidate_idle',
+                                       exception_type='TimeoutError') from None
                 if first:
                     log_event(logger, 'first_chunk_received', provider=provider_name, model=actual_model,
                               elapsed_ms=round((time.monotonic() - started) * 1000, 3))
@@ -177,6 +181,7 @@ async def stream_candidates(request, http_request, candidates):
                           **candidate_audit.summary(True, None, candidate_audit.done))
         log_event(logger, 'stream_candidate_failed', provider=provider_name, model=actual_model,
                   error_code=error.error_code, status_code=error.status_code, tools_sent=tools_sent,
+                  exception_type=error.exception_type, timeout_phase=error.timeout_phase,
                   elapsed_ms=round((time.monotonic() - started) * 1000, 3),
                   first_output_seen=output_seen)
         RouterService.record_failure(provider_name, actual_model, error)

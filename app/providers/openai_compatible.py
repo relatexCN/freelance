@@ -396,26 +396,32 @@ class OpenAICompatibleProvider(BaseProvider):
             error_code=error_code,
             retryable=True,
             key_index=key_idx,
-            disable_key=disable_key,
+            disable_key=disable_key and not isinstance(exc, httpx.PoolTimeout),
             key_fatal=key_fatal,
-            disable_provider=disable_provider,
+            disable_provider=disable_provider and not isinstance(exc, httpx.PoolTimeout),
             cooldown=cooldown,
             provider=self.config.name,
             model=actual_model,
+            exception_type=type(exc).__name__,
+            timeout_phase=next((phase for cls, phase in (
+                (httpx.ConnectTimeout, 'connect'), (httpx.ReadTimeout, 'read'),
+                (httpx.WriteTimeout, 'write'), (httpx.PoolTimeout, 'pool'),
+                (asyncio.TimeoutError, 'unspecified')) if isinstance(exc, cls)), ''),
         )
 
     def _record_gateway_error(self, err: GatewayError, actual_model: str):
         log_event(logger, "upstream_failed", logging.WARNING, provider=self.config.name,
                   model=actual_model, key_index=err.key_index, status_code=err.status_code,
                   error_type=err.error_type, error_code=err.error_code,
-                  retryable=err.retryable, cooldown=err.cooldown)
+                  retryable=err.retryable, cooldown=err.cooldown,
+                  exception_type=err.exception_type, timeout_phase=err.timeout_phase)
         cooldown = err.cooldown or config.settings.cooldown.other_error
         if err.disable_key and err.key_index >= 0:
             self.config.record_key_failure(err.key_index, cooldown, is_fatal=err.key_fatal)
         if err.disable_model:
             self.config.record_model_failure(actual_model, cooldown)
         circuit_cooldown = 0
-        if err.status_code in {503, 504} or err.error_code in {"timeout_network", "first_chunk_timeout", "stream_incomplete"}:
+        if err.timeout_phase != 'pool' and (err.status_code in {503, 504} or err.error_code in {"timeout_network", "first_chunk_timeout", "stream_incomplete"}):
             circuit_cooldown = self.config.record_transient_model_failure(actual_model)
         log_event(logger, "cooldown_applied", provider=self.config.name, model=actual_model,
                   key_index=err.key_index,
@@ -423,12 +429,18 @@ class OpenAICompatibleProvider(BaseProvider):
                   model_seconds=cooldown if err.disable_model else circuit_cooldown)
 
     def _raise_exhausted(self, actual_model: str, last_error: Any):
+        if last_error is None:
+            raise GatewayError('No healthy API keys currently available',
+                               error_code='no_available_keys', status_code=503,
+                               provider=self.config.name, model=actual_model)
         err = GatewayError.from_exception(last_error, provider=self.config.name, model=actual_model)
         raise GatewayError(
             message=f"[{self.config.name}] Exhausted all keys for {actual_model}. Last Error: {err.message}",
             error_type=err.error_type,
             status_code=err.status_code,
             error_code=err.error_code,
+            exception_type=err.exception_type,
+            timeout_phase=err.timeout_phase,
             retryable=err.retryable,
             skip_retry=err.skip_retry,
             key_index=err.key_index,
@@ -775,6 +787,8 @@ class OpenAICompatibleProvider(BaseProvider):
         """List available models with automatic key rotation."""
         url = f"{self.config.base_url}/models"
         api_key, _ = self.config.get_next_key()
+        if self.config.api_keys and not api_key:
+            return []  # Do not turn cooling authenticated requests into anonymous probes.
         try:
             resp = await self.batch_client.get(url, headers=self._build_headers(api_key))
             resp.raise_for_status()
