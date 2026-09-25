@@ -154,6 +154,8 @@ settings:
     first_output_timeout_seconds: 180 # 每个流式候选等待正文/工具增量的上限；推理不重置，0 关闭
     model_failure_threshold: 3   # 同 Provider/模型连续瞬时故障尝试次数
     model_cooldown_seconds: 60   # 达阈值后后续路由暂时跳过该模型
+    model_cooldown_max_seconds: 900 # 连续恢复失败后指数退避上限，成功后重置
+    failure_retry_after_seconds: 30 # 全部候选失败时建议至少等待，区别于本地冷却剩余时间
   logging:
     format: json  # json / text（文本模式也使用新的事件字段）
     level: INFO

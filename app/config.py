@@ -126,6 +126,8 @@ class ReliabilitySettings(BaseModel):
     first_output_timeout_seconds: float = Field(default=180, ge=0, allow_inf_nan=False)
     model_failure_threshold: int = Field(default=3, ge=1, le=100)
     model_cooldown_seconds: float = Field(default=60, gt=0, le=3600)
+    model_cooldown_max_seconds: float = Field(default=900, gt=0, le=86400)
+    failure_retry_after_seconds: int = Field(default=30, ge=1, le=3600)
 
 
 class LoggingSettings(BaseModel):
@@ -244,6 +246,8 @@ class ProviderConfig:
         self.fatal_keys = set()
         self.model_cooldowns = {}
         self.transient_model_failures = {}
+        self.model_backoff_levels = {}
+        self.model_probe_tokens = {}
         self.stream_melted_until = {}
         self.melted_until = 0
 
@@ -319,18 +323,45 @@ class ProviderConfig:
         count = self.transient_model_failures.get(model_id, 0) + 1
         self.transient_model_failures[model_id] = count
         policy = config.settings.reliability
-        if count >= policy.model_failure_threshold:
+        if count >= policy.model_failure_threshold or model_id in self.model_backoff_levels:
+            # Multiple in-flight failures must not exponentially extend an open circuit.
+            if self.model_cooldowns.get(model_id, 0) > time.time():
+                return max(0, self.model_cooldowns[model_id] - time.time())
+            level = min(self.model_backoff_levels.get(model_id, 0) + 1, 20)
+            self.model_backoff_levels[model_id] = level
+            cooldown = min(policy.model_cooldown_seconds * 2 ** (level - 1),
+                           max(policy.model_cooldown_seconds, policy.model_cooldown_max_seconds))
             self.model_cooldowns[model_id] = max(self.model_cooldowns.get(model_id, 0),
-                                                time.time() + policy.model_cooldown_seconds)
+                                                time.time() + cooldown)
             self.transient_model_failures[model_id] = 0
             log_event(logger, "model_circuit_opened", provider=self.name, model=model_id,
-                      failure_count=count, cooldown_seconds=policy.model_cooldown_seconds)
-            return policy.model_cooldown_seconds
+                      failure_count=count, cooldown_seconds=cooldown, backoff_level=level)
+            return cooldown
         return 0
 
     def record_model_success(self, model_id):
+        if self.model_cooldowns.get(model_id, 0) > time.time():
+            return
         self.transient_model_failures.pop(model_id, None)
+        self.model_backoff_levels.pop(model_id, None)
         # An older in-flight success must not clear an already-open circuit.
+
+    def acquire_model_probe(self, model_id):
+        """Reserve a single real recovery request; normal healthy calls are concurrent."""
+        from app.services.gateway_errors import GatewayError
+        if (self.is_platform_melted() or self.is_model_melted(model_id)
+                or model_id in self.model_probe_tokens):
+            raise GatewayError('Model cooling down or recovery probe in progress',
+                               status_code=503, error_code='model_recovering', skip_retry=True)
+        if model_id in self.model_backoff_levels:
+            token = object()
+            self.model_probe_tokens[model_id] = token
+            return token
+        return None
+
+    def release_model_probe(self, model_id, token):
+        if token is not None and self.model_probe_tokens.get(model_id) is token:
+            self.model_probe_tokens.pop(model_id, None)
 
     def record_platform_failure(self, cooldown: int = 10800):
         """Mark the entire provider as melted for a period of time.

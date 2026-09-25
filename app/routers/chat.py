@@ -13,6 +13,7 @@ from app.models import (
     MultiChatCompletionRequest,
 )
 from app.services.agent import AgentService
+from app.services.router import AUTO_ROUTING_ALIASES
 from app.services.multi_chat import MultiChatRequestError, MultiChatService
 from app.utils.responses import make_error_response
 
@@ -71,13 +72,28 @@ async def chat_completions(fastapi_request: Request, request: ChatCompletionRequ
     return await agent.run(request)
 
 
-@router.get("/models", response_model=ModelListResponse)
+def virtual_models():
+    """Advertise routing contracts, not inferred upstream capabilities."""
+    models = {
+        alias: ModelInfo(id=alias, score=None, virtual=True, routing_type="auto")
+        for alias in AUTO_ROUTING_ALIASES
+    }
+    for alias, route in config.model_routes.items():
+        # Chat routing lowercases names before looking them up.
+        if alias == alias.lower() and alias not in models and route.provider in config.providers:
+            models[alias] = ModelInfo(id=alias, score=None, virtual=True,
+                routing_type="configured_alias", route_provider=route.provider, route_model=route.model)
+    return models
+
+
+@router.get("/models", response_model=ModelListResponse, response_model_exclude_none=True)
 async def list_models(mode: str = "all"):
     """Lists available models from the auto-routing cache."""
     from app.scoring import rank_models
 
     scored = rank_models(config.auto_models_cache, only_free=(mode == "free"))
-    return ModelListResponse(data=[
+    aliases = virtual_models()
+    return ModelListResponse(data=list(aliases.values()) + [
         ModelInfo(
             id=str(m["id"]),
             created=int(time.time()),
@@ -88,7 +104,7 @@ async def list_models(mode: str = "all"):
             score_breakdown=m.get("_score_components"),
         )
         for m in scored
-        if isinstance(m, dict) and m.get("id")
+        if isinstance(m, dict) and m.get("id") and str(m["id"]).lower() not in aliases
     ])
 
 
@@ -97,6 +113,10 @@ async def get_model(model_id: str):
     """Fetches details for a specific model from the cache."""
     if model_id.startswith("{"):
         model_id = model_id[1:-1]
+
+    alias = virtual_models().get(model_id.lower())
+    if alias is not None:
+        return alias.model_dump(exclude_none=True)
 
     for m in config.auto_models_cache:
         if m.get("id") == model_id:

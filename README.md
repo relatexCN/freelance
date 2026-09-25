@@ -792,7 +792,7 @@ OPENROUTER_API_KEY=key1,key2,key3
 调用时 `ProviderConfig.get_next_key()` 会：
 
 1. 优先选择不在冷却期、非 fatal 的 key。
-2. 如果没有完全健康的 key，会选择非 fatal 的冷却中 key 作为临时兜底。
+2. 如果没有健康的 key，不会提前复用冷却中的 key；由上层尝试其他候选。
 3. 如果所有 key 都 fatal，会触发 provider 级平台冷却。
 
 HTTP 失败后的 key 处理由 `error_policy` 和错误分类共同决定：
@@ -803,7 +803,9 @@ HTTP 失败后的 key 处理由 `error_policy` 和错误分类共同决定：
 | `401` | 标记当前 key 冷却并 fatal，默认 3 小时 |
 | `403` | 标记当前 key 冷却并 fatal，默认 3 小时 |
 | quota/余额不足 | 标记当前 key 冷却并 fatal，默认 1 小时 |
-| timeout/network | 标记当前 key 短冷却，并可推进 provider 失败统计 |
+| ConnectTimeout / ConnectError | 不惩罚 Key，不逐 Key 重试；记录模型/平台故障并允许切换候选 |
+| 其他 timeout/network | 按既有策略短冷却和统计失败；不将其误认为连接建立失败 |
+| `410` | 当前模型不可用，冷却模型，不换 Key 重试，但允许切换其他候选 |
 | `404` | 默认标记 model 冷却 |
 
 ### 模型级切换
@@ -1202,9 +1204,35 @@ settings:
 - 外层候选首包预算为原首包等待时间加上各 Key 的连接预算；流式转发仍受 `first_output_timeout_seconds` 限制，显式启用的总请求截止和多模型聚合总预算也仍然生效。不是将所有超时统一改为 30 秒。
 - 底层 HTTP transport 不再自行重试；保留 Provider 的 Key 重试和网关候选切换，避免额外隐藏重试叠加。已发送工具调用后的防重放保护保持不变。
 - 流内耗尽错误保留 `all_stream_candidates_failed`，新增 `reason`（`candidates_failed` / `candidates_unavailable`）、`attempted_count`、`skipped_count`、`candidate_errors`。候选错误仅包含 Provider、模型、错误码和超时阶段，不包含凭据、原始请求或上游错误正文。
-- 能计算本地恢复时间时返回 `retry_after_seconds`，表示候选平台、模型和至少一个非永久禁用 Key 均解除冷却的最早等待秒数；不是保证上游恢复。没有可恢复 Key 时不虚构恢复时间。日志增加 `stream_candidates_exhausted` 汇总。
+- 流内耗尽错误的 `retry_after_seconds` 是建议重试间隔，至少为 `failure_retry_after_seconds`（默认 30 秒）；`cooldown_remaining_seconds` 单独表示已知本地冷却最早解除的等待秒数。两者都不保证上游恢复；未知恢复时间时省略冷却字段，但仍提供退避建议。日志 `stream_candidates_exhausted` 同步记录这两个字段。
+- 瞬时模型故障达阈值后，冷却按 `model_cooldown_seconds`（默认 60 秒）递增为 60、120、240、480、900 秒，受 `model_cooldown_max_seconds`（默认 900 秒）限制。冷却中的并发失败不重复升级。到期后由下一笔实际请求做恢复探测，同进程同 Provider/模型只放行一个恢复请求；完整成功重置退避，恢复失败重新冷却，取消释放探测名额。状态是进程内存状态，重启重置，多进程不共享；不额外后台调用模型。
+- 连接超时仍默认 30 秒。启动事件 `reliability_settings_loaded` 记录实际超时与冷却配置，用于排查部署值不同；没有扩大总超时，也不会主动清理客户端历史或生成缺失文件。
 - 已开始的 SSE 响应无法再修改 HTTP 状态或追加响应头，因此等待提示位于流内 `error`，不是 HTTP `Retry-After`。客户端应优先处理流内错误，避免把 HTTP 200、`[DONE]` 或网关切换通知当成任务成功；按等待提示协调重试，不再追加“空回复续写”上下文。
 - 客户端空回复处理、定时任务 `last_status` 和最终内容交付仍由客户端负责，本次网关改动不会自动修复它们。连接持续失败时，应在实际部署环境检查出口、代理、DNS 和 TLS；延长超时不等于恢复网络。
+
+## 启动期间请求
+
+网关开始监听 HTTP 后，在后台执行首次模型缓存加载。初始化完成前，所有 HTTP 路径（包括聊天、模型列表、健康检查和不存在的路径）统一返回 HTTP 503：
+
+```json
+{"error":{"message":"服务启动中，请稍后重试。","type":"service_unavailable","code":"service_starting"}}
+```
+
+响应包含 `Retry-After: 5` 和 `Cache-Control: no-store`，不会转发模型请求或排队执行；客户端需稍后重试。初始化完成后恢复原有路由和鉴权，日志 `service_ready` 表示网关就绪。Uvicorn 的 `Application startup complete` 仅表示 HTTP 生命周期已启动，不代表缓存初始化结束。
+
+模型发现仍为尽力加载：上游列表失败或为空不会永久阻止启动，配置中的默认模型仍可被调用；就绪不保证上游模型健康。初始化出现未处理异常时返回 `service_failed`，停止期间返回 `service_stopping`，均为 503。关闭服务会取消并等待初始化／缓存更新任务退出。
+
+进程尚未监听端口（例如模块导入阶段）时不能返回 HTTP 提示，连接仍可能被拒绝；若需覆盖该阶段，须由独立反向代理提供提示。本功能不修复就绪后不存在的接口导致的 404。
+
+## 虚拟路由的模型发现
+
+`GET /models`、`GET /v1/models` 及对应模型详情接口现包含 `auto`、`free`、`best-free`，以及配置中可解析的显式模型别名。即使模型缓存为空也会展示路由名称；这表示路由被支持，不保证上游当前可用。
+
+虚拟条目标记 `virtual: true`、`owned_by: freelance-gateway`，并包含 `routing_type: auto` 或 `configured_alias`。配置别名另有 `route_provider`、`route_model`；不会为虚拟路由填写上下文长度、工具能力或评分。虚拟名称与缓存中的真实名称冲突时，优先展示虚拟路由，与聊天路由优先级一致。
+
+本次不改变选模策略：`free`、`best-free` 当前与 `auto` 共用候选构建逻辑，名称不代表免费保证。`mode=free` 仍按原逻辑筛选真实缓存模型，同时展示虚拟路由。模型列表中的未知可选字段不再输出 `null`。
+
+服务就绪后的 `/api/v1/models`、`/api/tags`、`/props`、`/v1/props`、`/version` 等未实现探测路径仍返回 404；未知模型详情也保持 404。一次请求的访问、开始和结束日志是不同阶段记录，应按 `request_id` 关联，不能按日志行数统计模型调用次数。
 
 ## License
 

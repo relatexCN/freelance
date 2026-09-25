@@ -19,7 +19,7 @@ logger = logging.getLogger('freelance.stream_fallback')
 
 
 def can_fallback(error):
-    return (error.status_code in {408, 429, 500, 502, 503, 504, 524}
+    return (error.status_code in {408, 410, 429, 500, 502, 503, 504, 524}
             or error.error_code in {'timeout_network', 'first_chunk_timeout', 'stream_incomplete',
                                    'upstream_stream_interrupted', 'stream_idle_timeout',
                                    'first_output_timeout', 'candidate_first_chunk_timeout',
@@ -207,18 +207,20 @@ async def stream_candidates(request, http_request, candidates):
         failed = True
     waits = [RouterService.candidate_retry_after(p, m) for p, m in tried]
     known_waits = [wait for wait in waits if wait is not None]
-    retry_after = min(known_waits) if known_waits else None
+    cooldown_remaining = min(known_waits) if known_waits else None
+    retry_after = max(config.settings.reliability.failure_retry_after_seconds,
+                      cooldown_remaining or 0)
     reason = 'candidates_failed' if attempted_count else 'candidates_unavailable'
     message = ('所有已尝试候选模型均失败，其余候选不可用。' if attempted_count
                else '当前没有可调用的候选模型，未发起上游调用。')
-    if retry_after:
-        message += f'请至少等待 {retry_after} 秒后重试（不保证上游已恢复）。'
-    else:
-        message += '请检查上游连接及模型配置。'
+    message += f'请至少等待 {retry_after} 秒后重试（不保证上游已恢复）。'
+    if cooldown_remaining is None:
+        message += '无法确定可恢复候选，请检查上游连接及模型配置。'
     details = dict(reason=reason, attempted_count=attempted_count, skipped_count=skipped_count,
                    candidate_errors=failures)
-    if retry_after is not None:
-        details['retry_after_seconds'] = retry_after
+    details['retry_after_seconds'] = retry_after
+    if cooldown_remaining is not None:
+        details['cooldown_remaining_seconds'] = cooldown_remaining
     log_event(logger, 'stream_candidates_exhausted', **details)
     yield terminal('all_stream_candidates_failed', message, **details)
     yield 'data: [DONE]\n\n'

@@ -347,7 +347,12 @@ class OpenAICompatibleProvider(BaseProvider):
             disable_key = True
             key_fatal = True
 
-        retryable = policy.should_retry(status_code)
+        if status_code == 410:
+            error_type = "ModelUnavailable"
+            disable_model = True
+            disable_key = disable_provider = False
+            key_fatal = False
+        retryable = policy.should_retry(status_code) and status_code != 410
         return GatewayError(
             message=message or f"HTTP {status_code}",
             error_type=error_type,
@@ -391,13 +396,15 @@ class OpenAICompatibleProvider(BaseProvider):
             disable_key = True
             key_fatal = True
 
+        connection_failure = isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
         return GatewayError(
             message=err_msg,
             error_type=error_type,
             error_code=error_code,
-            retryable=True,
+            retryable=not connection_failure,
+            skip_retry=connection_failure,
             key_index=key_idx,
-            disable_key=disable_key and not isinstance(exc, httpx.PoolTimeout),
+            disable_key=disable_key and not isinstance(exc, (httpx.PoolTimeout, httpx.ConnectTimeout, httpx.ConnectError)),
             key_fatal=key_fatal,
             disable_provider=disable_provider and not isinstance(exc, httpx.PoolTimeout),
             cooldown=cooldown,
@@ -455,6 +462,15 @@ class OpenAICompatibleProvider(BaseProvider):
         )
 
     async def chat_completion(
+        self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
+    ) -> ChatCompletionResponse:
+        token = self.config.acquire_model_probe(actual_model)
+        try:
+            return await self._chat_completion(request, actual_model, timeout)
+        finally:
+            self.config.release_model_probe(actual_model, token)
+
+    async def _chat_completion(
         self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
     ) -> ChatCompletionResponse:
         """Non-streaming chat completion with internal multi-key retry logic."""
@@ -586,6 +602,20 @@ class OpenAICompatibleProvider(BaseProvider):
         )
 
     async def chat_completion_stream(
+        self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
+    ) -> AsyncIterator[str]:
+        token = self.config.acquire_model_probe(actual_model)
+        gen = self._chat_completion_stream(request, actual_model, timeout)
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            try:
+                await gen.aclose()
+            finally:
+                self.config.release_model_probe(actual_model, token)
+
+    async def _chat_completion_stream(
         self, request: ChatCompletionRequest, actual_model: str, timeout: Optional[float] = None
     ) -> AsyncIterator[str]:
         """Streaming chat completion with internal multi-key retry logic."""

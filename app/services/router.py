@@ -12,6 +12,7 @@ from app.providers import get_provider
 from app.services.gateway_errors import GatewayError
 
 logger = logging.getLogger("freelance.router")
+AUTO_ROUTING_ALIASES = ("auto", "free", "best-free")
 
 ERROR_MODELS_LOG = "error_models.log"
 
@@ -275,7 +276,8 @@ class RouterService:
         p_cfg = config.providers.get(p_name)
         if not p_cfg:
             return False
-        return not (p_cfg.is_platform_melted() or p_cfg.is_model_melted(actual_id))
+        return not (p_cfg.is_platform_melted() or p_cfg.is_model_melted(actual_id)
+                    or actual_id in p_cfg.model_probe_tokens)
 
     @staticmethod
     def candidate_retry_after(p_name: str, actual_id: str) -> Optional[int]:
@@ -357,7 +359,7 @@ class RouterService:
         model_name = model_name.lower()
         models_to_try = []
 
-        if model_name in ("auto", "free", "best-free"):
+        if model_name in AUTO_ROUTING_ALIASES:
             # Wait for cache if empty
             if not RouterService.build_auto_candidates():
                 start_wait = time.time()
@@ -373,7 +375,7 @@ class RouterService:
             current_command = RouterService._current_switch_command(messages)
             current_state = RouterService._get_session_switch(session_id)
             needs_auto_candidates = (
-                model_name in ("auto", "free", "best-free")
+                model_name in AUTO_ROUTING_ALIASES
                 or current_command in (("", ""), (RouterService._SWITCH_AUTO, ""))
                 or (current_state is not None and not current_state.explicit)
             )

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
@@ -161,9 +161,37 @@ async def background_cache_updater():
         await update_models_cache()
 
 
+async def initialize_service(app: FastAPI):
+    """Run slow initialization after HTTP serving can begin."""
+    try:
+        for name, p_config in config.providers.items():
+            if p_config.api_keys:
+                get_provider_instance(name, force_create=True)
+        logger.info("[STARTUP] Performing initial model cache hot load...")
+        await update_models_cache()
+        # Discovery is best effort: configured defaults work without a cache.
+        app.state.startup_status = "ready"
+        log_event(logger, "service_ready")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        app.state.startup_status = "failed"
+        log_event(logger, "service_startup_failed", logging.ERROR,
+                  exception_type=type(exc).__name__)
+        return
+    await background_cache_updater()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
+    app.state.startup_status = "starting"
+    log_event(logger, "reliability_settings_loaded",
+              connect_timeout_seconds=config.settings.reliability.connect_timeout_seconds,
+              first_output_timeout_seconds=config.settings.reliability.first_output_timeout_seconds,
+              request_timeout_seconds=config.settings.reliability.request_timeout_seconds,
+              model_cooldown_seconds=config.settings.reliability.model_cooldown_seconds,
+              model_cooldown_max_seconds=config.settings.reliability.model_cooldown_max_seconds)
     # 0. Gateway Key Validation
     has_gw_key = bool(config.settings.api_key or (config.settings.api_keys and config.settings.api_keys.strip()))
     if not has_gw_key:
@@ -173,24 +201,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("✅ [SECURITY] Gateway API Key(s) validated.")
 
-    # 1. Initialize providers eagerly (Only those with API keys)
-    for name, p_config in config.providers.items():
-        if p_config.api_keys:
-            get_provider_instance(name, force_create=True)
-        else:
-            logger.info(f"ℹ️  [STARTUP] Skipping provider '{name}': No API keys configured.")
-    
-    # 2. Initial Hot Load: Ensure cache is ready BEFORE yielding
-    logger.info("⚡ [STARTUP] Performing initial model cache hot load...")
-    await update_models_cache()
-    logger.info("🚀 [STARTUP] Initial hot load complete.")
-    
-    # 3. Start background task
-    task = asyncio.create_task(background_cache_updater())
-    
-    yield
-    task.cancel()
-    logger.info("Freelance API Gateway shutting down")
+    task = asyncio.create_task(initialize_service(app), name="gateway-initialization")
+    try:
+        yield
+    finally:
+        app.state.startup_status = "stopping"
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        logger.info("Freelance API Gateway shutting down")
 
 
 app = FastAPI(
@@ -199,6 +218,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.startup_status = "starting"
 
 # CORS middleware
 app.add_middleware(
@@ -249,7 +269,21 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# Register last so request context surrounds authentication and response streaming.
+@app.middleware("http")
+async def readiness_middleware(request: Request, call_next):
+    """Do not dispatch requests or return misleading 404s while warming up."""
+    status = request.app.state.startup_status
+    if status != "ready":
+        messages = {"starting": "服务启动中，请稍后重试。",
+                    "failed": "服务启动失败，请检查网关日志。",
+                    "stopping": "服务停止中，请稍后重试。"}
+        return JSONResponse(status_code=503, headers={"Retry-After": "5", "Cache-Control": "no-store"},
+            content={"error": {"message": messages.get(status, "服务暂不可用。"),
+                               "type": "service_unavailable", "code": "service_" + status}})
+    return await call_next(request)
+
+
+# Register last so request context surrounds readiness, auth and streaming.
 app.add_middleware(RequestEventMiddleware)
 
 
