@@ -19,6 +19,13 @@ _KNOWN_MODEL_FAMILIES = {
 
 class StreamerService:
     @staticmethod
+    def get_candidate_probe_timeout(model_id: str, key_count: int = 1) -> float:
+        # The outer first-packet deadline also covers connection/key attempts.
+        # first_output_timeout_seconds remains the independent candidate ceiling.
+        return (StreamerService.get_probe_timeout(model_id)
+                + config.settings.reliability.connect_timeout_seconds * max(1, key_count))
+
+    @staticmethod
     def get_model_size_level(model_id: str) -> str:
         """Determine model size level from model ID."""
         model_id_lower = model_id.lower()

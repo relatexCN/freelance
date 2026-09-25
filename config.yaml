@@ -148,6 +148,7 @@ settings:
     max_tokens: 1500
     auto_apply: false  # 第二阶段只生成建议，不执行配置修改
   reliability:
+    connect_timeout_seconds: 30 # 上游连接建立超时；流式、非流式、模型发现共用，修改后重启
     request_timeout_seconds: 0 # 0 不限制单模型 HTTP 请求总时长；正数按秒启用硬截止
     request_warning_seconds: 180 # 超过此时长仅记录一次 request_slow，不中断；0 关闭告警
     first_output_timeout_seconds: 180 # 每个流式候选等待正文/工具增量的上限；推理不重置，0 关闭

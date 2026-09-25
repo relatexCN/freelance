@@ -278,6 +278,21 @@ class RouterService:
         return not (p_cfg.is_platform_melted() or p_cfg.is_model_melted(actual_id))
 
     @staticmethod
+    def candidate_retry_after(p_name: str, actual_id: str) -> Optional[int]:
+        """Earliest locally permitted retry, not a promise of upstream recovery."""
+        import math
+        p_cfg = config.providers.get(p_name)
+        if not p_cfg or not p_cfg.api_keys:
+            return None
+        now = time.time()
+        keys = [p_cfg.key_cooldowns.get(i, 0) for i in range(len(p_cfg.api_keys))
+                if i not in p_cfg.fatal_keys]
+        if not keys:
+            return None
+        ready_at = max(p_cfg.melted_until, p_cfg.model_cooldowns.get(actual_id, 0), min(keys))
+        return max(0, math.ceil(ready_at - now))
+
+    @staticmethod
     def build_auto_candidates() -> List[Tuple[str, str]]:
         """Build auto-routing candidates, applying explicit ranking when present."""
         default_ranked = []

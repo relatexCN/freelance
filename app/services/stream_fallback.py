@@ -33,14 +33,17 @@ async def stream_candidates(request, http_request, candidates):
     switched = False
     failed = False
     tried = set()
+    attempted_count = 0
+    skipped_count = 0
+    failures = []
 
     def packet(content):
         return 'data: ' + json.dumps({'id': response_id, 'object': 'chat.completion.chunk',
             'created': created, 'model': model, '_gateway_notice': True, 'choices': [
                 {'index': 0, 'delta': {'content': content}, 'finish_reason': None}]}, ensure_ascii=False) + '\n\n'
 
-    def terminal(code, message):
-        return 'data: ' + json.dumps({'error': {'code': code, 'message': message}}, ensure_ascii=False) + '\n\n'
+    def terminal(code, message, **details):
+        return 'data: ' + json.dumps({'error': {'code': code, 'message': message, **details}}, ensure_ascii=False) + '\n\n'
 
     for provider_name, actual_model in candidates:
         if (provider_name, actual_model) in tried:
@@ -49,12 +52,16 @@ async def stream_candidates(request, http_request, candidates):
         if await http_request.is_disconnected():
             return
         if not RouterService.is_provider_available(provider_name, actual_model):
+            skipped_count += 1
             log_event(logger, 'fallback_candidate_skipped', provider=provider_name, model=actual_model,
-                      reason='unavailable')
+                      reason='unavailable',
+                      retry_after_seconds=RouterService.candidate_retry_after(provider_name, actual_model))
             continue
         provider = get_provider_instance(provider_name)
         if provider is None:
+            skipped_count += 1
             continue
+        attempted_count += 1
         if failed:
             switched = True
             # Do not repeat untrusted provider errors or credentials in the notice.
@@ -79,7 +86,9 @@ async def stream_candidates(request, http_request, candidates):
             http_request.scope['_gateway_candidate'] = candidate_state
         try:
             while True:
-                timeout = probe if first else StreamerService.get_read_timeout(actual_model)
+                timeout = (StreamerService.get_candidate_probe_timeout(
+                    actual_model, len(getattr(getattr(provider, 'config', None), 'api_keys', [])))
+                    if first else StreamerService.get_read_timeout(actual_model))
                 output_limited = False
                 if output_timeout and not output_seen:
                     remaining = output_timeout - (time.monotonic() - started)
@@ -184,6 +193,8 @@ async def stream_candidates(request, http_request, candidates):
                   elapsed_ms=round((time.monotonic() - started) * 1000, 3),
                   first_output_seen=output_seen)
         RouterService.record_failure(provider_name, actual_model, error)
+        failures.append({'provider': provider_name, 'model': actual_model,
+                         'code': error.error_code, 'timeout_phase': error.timeout_phase})
         if tools_sent:
             yield terminal('fallback_blocked_after_tool_call',
                            '模型调用失败；已发送工具调用，为避免重复执行，未切换模型。')
@@ -194,5 +205,20 @@ async def stream_candidates(request, http_request, candidates):
             yield 'data: [DONE]\n\n'
             return
         failed = True
-    yield terminal('all_stream_candidates_failed', '所有可用候选模型均失败或不可用，请稍后重试。')
+    waits = [RouterService.candidate_retry_after(p, m) for p, m in tried]
+    known_waits = [wait for wait in waits if wait is not None]
+    retry_after = min(known_waits) if known_waits else None
+    reason = 'candidates_failed' if attempted_count else 'candidates_unavailable'
+    message = ('所有已尝试候选模型均失败，其余候选不可用。' if attempted_count
+               else '当前没有可调用的候选模型，未发起上游调用。')
+    if retry_after:
+        message += f'请至少等待 {retry_after} 秒后重试（不保证上游已恢复）。'
+    else:
+        message += '请检查上游连接及模型配置。'
+    details = dict(reason=reason, attempted_count=attempted_count, skipped_count=skipped_count,
+                   candidate_errors=failures)
+    if retry_after is not None:
+        details['retry_after_seconds'] = retry_after
+    log_event(logger, 'stream_candidates_exhausted', **details)
+    yield terminal('all_stream_candidates_failed', message, **details)
     yield 'data: [DONE]\n\n'

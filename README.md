@@ -1188,6 +1188,24 @@ MCP 测试包含真实 stdio 子进程的初始化、工具发现和调用模拟
 - [只读管理 Agent](docs/manager-agent.md)
 - [第一阶段结构整理记录](docs/phase-one-refactor.md)
 
+## 连接超时与失败恢复
+
+在 `config.yaml` 配置，修改后重启网关：
+
+```yaml
+settings:
+  reliability:
+    connect_timeout_seconds: 30
+```
+
+- 默认 30 秒，必须为有限正数；统一用于 OpenAI-compatible Provider 的流式、非流式及模型发现连接。非流式请求的读取超时不再覆盖连接超时。
+- 外层候选首包预算为原首包等待时间加上各 Key 的连接预算；流式转发仍受 `first_output_timeout_seconds` 限制，显式启用的总请求截止和多模型聚合总预算也仍然生效。不是将所有超时统一改为 30 秒。
+- 底层 HTTP transport 不再自行重试；保留 Provider 的 Key 重试和网关候选切换，避免额外隐藏重试叠加。已发送工具调用后的防重放保护保持不变。
+- 流内耗尽错误保留 `all_stream_candidates_failed`，新增 `reason`（`candidates_failed` / `candidates_unavailable`）、`attempted_count`、`skipped_count`、`candidate_errors`。候选错误仅包含 Provider、模型、错误码和超时阶段，不包含凭据、原始请求或上游错误正文。
+- 能计算本地恢复时间时返回 `retry_after_seconds`，表示候选平台、模型和至少一个非永久禁用 Key 均解除冷却的最早等待秒数；不是保证上游恢复。没有可恢复 Key 时不虚构恢复时间。日志增加 `stream_candidates_exhausted` 汇总。
+- 已开始的 SSE 响应无法再修改 HTTP 状态或追加响应头，因此等待提示位于流内 `error`，不是 HTTP `Retry-After`。客户端应优先处理流内错误，避免把 HTTP 200、`[DONE]` 或网关切换通知当成任务成功；按等待提示协调重试，不再追加“空回复续写”上下文。
+- 客户端空回复处理、定时任务 `last_status` 和最终内容交付仍由客户端负责，本次网关改动不会自动修复它们。连接持续失败时，应在实际部署环境检查出口、代理、DNS 和 TLS；延长超时不等于恢复网络。
+
 ## License
 
 MIT

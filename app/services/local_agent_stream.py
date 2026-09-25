@@ -26,7 +26,8 @@ async def local_agent_stream(agent, request, provider, provider_name, model, max
         error = None
         try:
             while True:
-                timeout = (StreamerService.get_probe_timeout(model) if first
+                timeout = (StreamerService.get_candidate_probe_timeout(
+                    model, len(getattr(getattr(provider, 'config', None), 'api_keys', []))) if first
                            else StreamerService.get_read_timeout(model))
                 try:
                     chunk = await asyncio.wait_for(anext(gen), timeout)

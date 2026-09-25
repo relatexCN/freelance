@@ -61,7 +61,7 @@ class OpenAICompatibleProvider(BaseProvider):
         # 1. Initialize Stream Client (optimized for long-lived SSE)
         stream_pool = config.settings.connection_pool.stream
         self.stream_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=provider_config.timeout, write=20.0, pool=60.0),
+            timeout=httpx.Timeout(connect=config.settings.reliability.connect_timeout_seconds, read=provider_config.timeout, write=20.0, pool=60.0),
             limits=httpx.Limits(
                 max_keepalive_connections=stream_pool.max_keepalive, 
                 max_connections=stream_pool.max_connections,
@@ -75,13 +75,14 @@ class OpenAICompatibleProvider(BaseProvider):
         # 2. Initialize Batch Client (optimized for quick requests/retries)
         batch_pool = config.settings.connection_pool.batch
         self.batch_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=provider_config.timeout, write=10.0, pool=30.0),
+            timeout=httpx.Timeout(connect=config.settings.reliability.connect_timeout_seconds, read=provider_config.timeout, write=10.0, pool=30.0),
             limits=httpx.Limits(
                 max_keepalive_connections=batch_pool.max_keepalive, 
                 max_connections=batch_pool.max_connections,
                 keepalive_expiry=batch_pool.keepalive_expiry
             ),
-            transport=httpx.AsyncHTTPTransport(retries=2),
+            # Key/candidate retries are owned above the transport layer.
+            transport=httpx.AsyncHTTPTransport(retries=0),
             follow_redirects=True
         )
         
@@ -478,7 +479,8 @@ class OpenAICompatibleProvider(BaseProvider):
                 resp = await self.batch_client.post(
                     url,
                     **request_kwargs,
-                    timeout=effective_timeout
+                    timeout=httpx.Timeout(connect=config.settings.reliability.connect_timeout_seconds,
+                                          read=effective_timeout, write=10.0, pool=30.0)
                 )
                 
                 if resp.status_code == 200:
@@ -610,7 +612,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     url, 
                     **request_kwargs,
                     timeout=httpx.Timeout(
-                        connect=10.0,
+                        connect=config.settings.reliability.connect_timeout_seconds,
                         read=effective_timeout,
                         write=20.0,
                         pool=60.0

@@ -120,6 +120,7 @@ class ScoringSettings(BaseModel):
     max_provider_adjustment: float = 0.03
 
 class ReliabilitySettings(BaseModel):
+    connect_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     request_timeout_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
     request_warning_seconds: float = Field(default=180, ge=0, allow_inf_nan=False)
     first_output_timeout_seconds: float = Field(default=180, ge=0, allow_inf_nan=False)
