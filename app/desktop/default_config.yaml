@@ -1,0 +1,21 @@
+providers:
+  openrouter:
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY:}
+    timeout: 120
+    default_model: ""
+  ollama:
+    type: openai
+    base_url: https://ollama.com/v1
+    api_key: ${OLLAMA_API_KEY:}
+    timeout: 120
+    default_model: ""
+models: {}
+default_provider: openrouter
+settings:
+  tools:
+    mode: passthrough
+  logging:
+    log_request_payload: false
+    log_response_payload: false

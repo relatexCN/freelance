@@ -59,6 +59,9 @@ class MultiChatCompletionItem(BaseModel):
     usage: Optional[UsageInfo] = None
     error: Optional[str] = None
     error_code: Optional[str] = None
+    structured_content: Optional[Any] = None
+    formatting_status: str = "not_attempted"
+    formatted_by: Optional[str] = None
 
 
 class MultiChatCompletionResponse(BaseModel):

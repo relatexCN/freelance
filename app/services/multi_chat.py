@@ -12,6 +12,7 @@ from app.models import (
     UsageInfo,
 )
 from app.services.router import RouterService, get_provider_instance
+from app.services.output_formatter import formatting_contract, format_output, OutputFormatError
 
 logger = logging.getLogger("freelance.multi_chat")
 
@@ -126,6 +127,10 @@ class MultiChatService:
 
     @staticmethod
     def _validate_no_tools(request: MultiChatCompletionRequest):
+        try:
+            formatting_contract(request)
+        except (ValueError, RecursionError) as exc:
+            raise MultiChatRequestError(str(exc), 'invalid_output_format') from exc
         if (
             request.tools
             or request.tool_choice not in (None, "none")
@@ -159,6 +164,7 @@ class MultiChatService:
                 status="error",
                 latency_ms=0.0,
                 error=f"Provider '{provider_name}' has no configured API key",
+                error_code="provider_not_configured",
             )
         if not RouterService.is_provider_available(provider_name, actual_model):
             return MultiChatCompletionItem(
@@ -167,6 +173,7 @@ class MultiChatService:
                 status="error",
                 latency_ms=0.0,
                 error=RouterService.get_provider_status_message(provider_name, actual_model),
+                error_code="provider_unavailable",
             )
         if provider is None:
             return MultiChatCompletionItem(
@@ -175,6 +182,7 @@ class MultiChatService:
                 status="error",
                 latency_ms=0.0,
                 error=f"Provider '{provider_name}' is unavailable",
+                error_code="provider_unavailable",
             )
 
         single_request = request.to_single_request(actual_model)
@@ -209,22 +217,36 @@ class MultiChatService:
                     error="Upstream returned tool calls; this endpoint only accepts answers.",
                     usage=processed.usage,
                 )
-            stats_service.record_request(
-                provider_name,
-                actual_model,
-                latency_ms=latency_ms,
-            )
-            provider_config.reset_consecutive_failures()
-
             content: Optional[str] = None
             if processed.choices and processed.choices[0].message:
                 content = processed.choices[0].message.content
+            mode, schema = formatting_contract(request)
+            try:
+                if not content or not content.strip():
+                    raise OutputFormatError('empty_model_output', 'Model returned no answer content')
+                content, structured, formatting_status = format_output(
+                    content, mode, schema, processed.choices[0].finish_reason)
+            except OutputFormatError as exc:
+                latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                stats_service.record_request(provider_name, actual_model, latency_ms=latency_ms, error=exc.code)
+                # Output-contract failure is not a network/provider outage.
+                return MultiChatCompletionItem(
+                    provider=provider_name, model=actual_model, status='error',
+                    latency_ms=latency_ms, content=content,
+                    response=processed.model_dump(exclude_none=True), usage=processed.usage,
+                    error_code=exc.code, error=str(exc), formatting_status='error', formatted_by='code')
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            stats_service.record_request(provider_name, actual_model, latency_ms=latency_ms)
+            provider_config.reset_consecutive_failures()
             return MultiChatCompletionItem(
                 provider=provider_name,
                 model=actual_model,
                 status="success",
                 latency_ms=latency_ms,
                 content=content,
+                structured_content=structured,
+                formatting_status=formatting_status,
+                formatted_by='code' if formatting_status == 'json' else None,
                 response=processed.model_dump(exclude_none=True),
                 usage=processed.usage,
             )
@@ -238,6 +260,7 @@ class MultiChatService:
                 status="error",
                 latency_ms=latency_ms,
                 error=str(exc) or repr(exc),
+                error_code=getattr(exc, 'error_code', 'upstream_error'),
             )
 
     @staticmethod

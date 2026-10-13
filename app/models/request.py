@@ -2,7 +2,7 @@
 OpenAI-compatible request models.
 """
 
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -68,6 +68,8 @@ class MultiChatCompletionRequest(_ChatCompletionRequestBase):
 
     models: Optional[list[str]] = Field(default=None, min_length=1)
     parallel: bool = True
+    output_format: Literal["auto", "text", "json"] = "auto"
+    output_schema: Optional[dict[str, Any]] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -85,7 +87,7 @@ class MultiChatCompletionRequest(_ChatCompletionRequestBase):
 
     def to_single_request(self, model: str) -> ChatCompletionRequest:
         data = self.model_dump(
-            exclude={"models", "parallel", "tools", "tool_choice", "parallel_tool_calls",
+            exclude={"models", "parallel", "output_format", "output_schema", "tools", "tool_choice", "parallel_tool_calls",
                      "functions", "function_call"},
             exclude_none=True,
         )

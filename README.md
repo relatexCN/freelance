@@ -97,6 +97,8 @@ providers:
 
 ## 安装与启动
 
+可选桌面客户端支持本地启动/停止、远程连接、供应商与模型别名配置、运行概览和调用测试。安装 `python -m pip install -e ".[desktop]"` 后运行 `python -m app.desktop`，Windows 也可双击 `freelance-desktop.bat`。默认使用独立的用户配置目录；原有 CLI 和 MCP 保持可独立使用。详见 [桌面客户端说明](docs/desktop.md)。
+
 建议使用 Python 3.11（当前已验证环境）；MCP 要求 Python 3.10+。`pyproject.toml` 与启动脚本仍保留旧的 3.8 声明，不能视为当前依赖及代码在 3.8 上已经验证。仓库内置脚本会检查 Python，在首次创建 `.venv` 时安装依赖，并把命令转发给 `app.cli`；已有环境不会自动更新依赖，升级后需手动执行 `python -m pip install -e .`。
 
 ### 1. 准备配置文件
@@ -1187,6 +1189,7 @@ MCP 测试包含真实 stdio 子进程的初始化、工具发现和调用模拟
 
 - [MCP 接入与客户端配置](docs/mcp.md)
 - [多模型工具边界与取消清理](docs/multi-model-tools.md)
+- [多模型结果格式化与结构校验](docs/multi-output-format.md)
 - [只读管理 Agent](docs/manager-agent.md)
 - [第一阶段结构整理记录](docs/phase-one-refactor.md)
 

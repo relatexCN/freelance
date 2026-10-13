@@ -28,3 +28,9 @@ freelance.log
 freelance.log.*
 freelance-content.log*
 freelance.pid
+config.yaml.bak
+.desktop-process.json
+.freelance-config.lock
+desktop-launch.log
+desktop-error.log
+dist/
