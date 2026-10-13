@@ -11,7 +11,7 @@ python -m pip install -e ".[desktop]"
 python -m app.desktop
 ```
 
-也可以使用 `freelance-desktop` 命令，或 Windows 双击 `freelance-desktop.bat`。批处理优先使用项目 `.venv`；请把依赖安装到同一个环境。
+也可以使用 `freelance-desktop` 命令，或 Windows 双击 `freelance-desktop.bat`。批处理优先启动 `dist/FreelanceDesktop/FreelanceDesktop.exe` 或解压后的 `FreelanceDesktop/FreelanceDesktop.exe`，此时无需安装 Python。没有便携版时，使用项目 `.venv`，否则使用 PATH 中的 Python；依赖缺失时显示所选解释器及对应安装命令。开发时直接运行 `python -m app.desktop` 使用源码。
 
 默认本地配置目录为用户目录下的 `.freelance`，独立于仓库配置。第一次打开时创建最小供应商模板，并生成不同的调用 Key 和管理员 Key。已有 Key 不会被自动轮换，已有空值也不会被擅自替换。
 
