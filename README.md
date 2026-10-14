@@ -2,6 +2,8 @@
 
 Freelance API Gateway 是一个 OpenAI 兼容的多供应商 LLM 网关。客户端只需要调用统一的 `/v1/chat/completions`、`/v1/models` 等接口，网关会根据 `config.yaml` 中的供应商、模型别名、默认模型和错误策略，把请求转发到实际上游。
 
+中英文官网源码位于 `website`，构建、预览与静态部署方法见 [官网说明](website/README.md)。执行 `node website/scripts/build.mjs` 可生成独立于网关后端的静态页面。
+
 当前项目重点能力：
 
 - 统一 OpenAI Chat Completions API。
@@ -721,7 +723,7 @@ settings:
 
 可以用 `auto_routing.custom_ranking` 显式指定 `auto/free/best-free` 的优先调用顺序：
 
-桌面版也可在“供应商配置 → 自动路由：模型优先级”添加模型、调整顺序或恢复默认排序，点击“保存优先级”后重启网关生效。本地直接保存配置，远程模式使用管理员 Key 调用管理接口。
+桌面版已将优先级合并进供应商配置表格，用每行的 ↑/↓ 调整调用顺序，也可恢复默认评分排序。点击“保存供应商配置”同时保存供应商与顺序，重启网关后生效。同一供应商的多个已有优先模型保留组内顺序。 未设置默认模型时也可排序，使用 `auto_routing.provider_order` 指定供应商先后，按实际发现的模型参与路由；该顺序优先于跨供应商的模型评分，同一供应商内保留候选顺序。本地直接保存配置，远程模式使用管理员 Key 调用管理接口。
 
 ```yaml
 auto_routing:
@@ -734,7 +736,7 @@ auto_routing:
 - 列表从上到下依次尝试，重复项会自动去重。
 - 自定义项不依赖 `/models` 缓存；只要 provider 已配置 API key，即使模型发现没有返回该模型，它仍可参与调用。
 - 自定义列表之后会追加原有评分和 `default_model` 规则生成的候选，作为回退。
-- 未配置 `auto_routing`、删除 `custom_ranking`，或将它设为 `[]` 时，完全使用原有默认排名。
+- 未配置 `auto_routing` 时使用原有默认排名。若配置了供应商顺序，要完全恢复评分排序，需同时清空 `custom_ranking` 和 `provider_order`（设为 `[]`），或删除整个 `auto_routing`。
 - 推荐使用上面的 `{ provider, model }` 写法；也支持 `models` 中已有的别名，以及 `"provider:model-id"` 简写。
 
 ### 候选列表生成规则

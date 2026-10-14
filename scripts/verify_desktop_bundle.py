@@ -94,6 +94,13 @@ def main():
                 saved = client.request("PUT", "/admin/ranking", {
                     "revision": configuration["revision"], "ranking": {"custom_ranking": []}}, admin=True)
                 assert saved["auto_routing"]["custom_ranking"] == []
+                combined = client.request("PUT", "/admin/providers", {
+                    "revision": saved["revision"],
+                    "provider": {"name": "demo", "base_url": "https://example.test", "default_model": "demo-model", "api_key": ""},
+                    "ranking": {"custom_ranking": [{"provider": "demo", "model": "demo-model"}], "provider_order": ["demo"]}}, admin=True)
+                assert combined["providers"]["demo"]["default_model"] == "demo-model"
+                assert combined["auto_routing"]["custom_ranking"] == [{"provider": "demo", "model": "demo-model"}]
+                assert combined["auto_routing"]["provider_order"] == ["demo"]
                 loaded = client.overview(threading.Event(), include_models=True, include_config=True)
                 assert loaded["state"] == "ready" and "snapshot" in loaded and "models" in loaded and "config" in loaded
                 gateway.stop()

@@ -70,6 +70,14 @@ class RankingRoute(BaseModel):
 class RankingEdit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     custom_ranking: list[RankingRoute] = Field(max_length=1000)
+    provider_order: list[str] | None = Field(default=None, max_length=1000)
+
+
+def read_provider_order(raw):
+    entries = (raw.get("auto_routing") or {}).get("provider_order") or []
+    if not isinstance(entries, list) or any(not isinstance(name, str) or name not in raw.get("providers", {}) for name in entries):
+        raise ValueError("Invalid provider order")
+    return list(dict.fromkeys(entries))
 
 
 def read_ranking(raw):
@@ -248,7 +256,7 @@ class ConfigStore:
             revision = self.revision()
             return {"revision": revision, "pending_restart": revision != self.runtime_revision,
                     "providers": providers, "models": aliases,
-                    "auto_routing": {"custom_ranking": read_ranking(raw)}}
+                    "auto_routing": {"custom_ranking": read_ranking(raw), "provider_order": read_provider_order(raw)}}
 
     def _save(self, revision, change, env_change=None):
         with self._lock, file_lock(self.path.with_name(".freelance-config.lock")):
@@ -287,7 +295,7 @@ class ConfigStore:
                 raise
             return self._read_locked()
 
-    def provider(self, revision, edit: ProviderEdit):
+    def provider(self, revision, edit: ProviderEdit, ranking: RankingEdit | None = None):
         env_change = None
         with self._lock:
             current = self._raw().get("providers", {}).get(edit.name, {})
@@ -307,6 +315,8 @@ class ConfigStore:
                 item.update(base_url=edit.base_url, default_model=edit.default_model, timeout=edit.timeout)
                 if env_change:
                     item["api_key"] = "${" + env_change[0] + ":}"
+                if ranking is not None:
+                    self._apply_ranking(raw, ranking)
             return self._save(revision, change, env_change)
 
     def alias(self, revision, edit: AliasEdit):
@@ -317,15 +327,19 @@ class ConfigStore:
         return self._save(revision, change)
 
     def ranking(self, revision, edit: RankingEdit):
-        def change(raw):
-            routing = raw.get("auto_routing") or {}
-            if not isinstance(routing, dict):
-                raise ValueError("Invalid auto-routing configuration")
-            # Keep unrelated routing options, providers, aliases and credentials.
-            routing["custom_ranking"] = [route.model_dump() for route in edit.custom_ranking]
-            raw["auto_routing"] = routing
-            routing["custom_ranking"] = read_ranking(raw)
-        return self._save(revision, change)
+        return self._save(revision, lambda raw: self._apply_ranking(raw, edit))
+
+    @staticmethod
+    def _apply_ranking(raw, edit):
+        routing = raw.get("auto_routing") or {}
+        if not isinstance(routing, dict):
+            raise ValueError("Invalid auto-routing configuration")
+        routing["custom_ranking"] = [route.model_dump() for route in edit.custom_ranking]
+        raw["auto_routing"] = routing
+        routing["custom_ranking"] = read_ranking(raw)
+        if edit.provider_order is not None:
+            routing["provider_order"] = edit.provider_order
+            routing["provider_order"] = read_provider_order(raw)
 
     def delete_alias(self, revision, alias):
         def change(raw):

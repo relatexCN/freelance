@@ -434,6 +434,7 @@ class AppConfig:
         self.model_routes: dict[str, ModelRoute] = {}
         self.default_provider: str = "ollama"
         self.custom_model_ranking: list[tuple[str, str]] = []
+        self.custom_provider_order: list[str] = []
         self.auto_models_cache: list[dict] = []  # Ranked list of available models
         self.auto_models_last_update: float = 0.0
         self.providers_with_models_in_cache: set = set()  # Providers that successfully returned models
@@ -600,6 +601,10 @@ class AppConfig:
             # entries are unambiguous and are the documented form; aliases are
             # also accepted as a convenience when they exist in `models`.
             auto_routing = raw.get("auto_routing", {}) or {}
+            provider_order = auto_routing.get("provider_order", []) or []
+            if not isinstance(provider_order, list) or any(not isinstance(name, str) or name not in self.providers for name in provider_order):
+                raise ValueError("auto_routing.provider_order must list configured providers")
+            self.custom_provider_order = list(dict.fromkeys(provider_order))
             ranking_data = auto_routing.get("custom_ranking", []) or []
             if not isinstance(ranking_data, list):
                 raise ValueError("auto_routing.custom_ranking must be a list")

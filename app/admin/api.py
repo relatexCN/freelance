@@ -29,6 +29,7 @@ class ProviderUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: str = Field(min_length=64, max_length=64)
     provider: ProviderEdit
+    ranking: RankingEdit | None = None
 
 
 class AliasUpdate(BaseModel):
@@ -75,7 +76,7 @@ def get_config():
 
 @router.put("/providers")
 def update_provider(body: ProviderUpdate):
-    return perform(lambda: store.provider(body.revision, body.provider))
+    return perform(lambda: store.provider(body.revision, body.provider, body.ranking))
 
 
 @router.put("/aliases")

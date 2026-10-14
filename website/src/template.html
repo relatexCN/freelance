@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="{{language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{meta.description}}">
+  <meta name="theme-color" content="#f7f7f4">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="{{meta.title}}">
+  <meta property="og:description" content="{{meta.description}}">
+  <meta property="og:locale" content="{{locale}}">
+  <title>{{meta.title}}</title>
+  <link rel="alternate" hreflang="{{alternateLang}}" href="{{alternate}}">
+  <link rel="alternate" hreflang="{{language}}" href="./index.html">
+  <link rel="alternate" hreflang="x-default" href="{{base}}index.html">
+  <link rel="icon" type="image/svg+xml" href="{{base}}assets/favicon.svg">
+  <link rel="stylesheet" href="{{base}}assets/site.css">
+  <script src="{{base}}assets/site.js" defer></script>
+</head>
+<body>
+  <svg class="icon-defs" aria-hidden="true"><defs>
+    <symbol id="arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="external" viewBox="0 0 24 24"><path d="M8 5h11v11M19 5 5 19"/></symbol>
+    <symbol id="copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M15 8V4H4v11h4"/></symbol>
+    <symbol id="up" viewBox="0 0 24 24"><path d="m6 14 6-6 6 6"/></symbol>
+    <symbol id="down" viewBox="0 0 24 24"><path d="m6 10 6 6 6-6"/></symbol>
+    <symbol id="check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="route" viewBox="0 0 24 24"><path d="M5 12h8m-4 0V5h8m-8 7v7h8"/><circle cx="4" cy="12" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="19" cy="19" r="2"/></symbol>
+  </defs></svg>
+  <a class="skip-link" href="#main">{{nav.skip}}</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="{{base}}index.html" aria-label="Freelance"><img src="{{base}}assets/favicon.svg" width="28" height="28" alt=""><span>freelance<span class="brand-dot">.</span></span></a>
+      <nav id="navigation" class="navigation" aria-label="{{nav.menu}}">
+        <a href="#features">{{nav.features}}</a><a href="#routing">{{nav.routing}}</a><a href="#desktop">{{nav.desktop}}</a><a href="#start">{{nav.start}}</a>
+      </nav>
+      <div class="header-actions">
+        <a class="language-link" href="{{alternate}}" lang="{{alternateLang}}" hreflang="{{alternateLang}}" aria-label="{{nav.languageLabel}}">{{nav.language}}</a>
+        <a class="source-link" href="https://gitee.com/1043312001/freelance" target="_blank" rel="noopener noreferrer">{{nav.source}} <svg class="icon"><use href="#external"/></svg></a>
+        <button class="menu-toggle" aria-controls="navigation" aria-expanded="false" aria-label="{{nav.menu}}"><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+  <main id="main">
+    <section class="hero container">
+      <p class="eyebrow"><span class="tiny-square"></span>{{hero.eyebrow}}</p>
+      <div class="hero-copy"><h1>{{hero.line1}}<br>{{hero.line2}}</h1><div class="hero-aside"><p>{{hero.description}}</p><div class="hero-actions"><a class="button primary" href="#start">{{hero.cta}} <svg class="icon"><use href="#arrow"/></svg></a><a class="text-link" href="https://gitee.com/1043312001/freelance" target="_blank" rel="noopener noreferrer">{{hero.source}} <svg class="icon"><use href="#external"/></svg></a></div><div class="hero-notes"><span>{{hero.note}}</span><span>{{hero.local}}</span></div></div></div>
+      <div class="gateway-preview">
+        <div class="window-bar"><div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div><span>freelance / gateway</span><span class="window-version">OpenAI-compatible API</span></div>
+        <div class="preview-grid">
+          <aside class="preview-sidebar"><span class="preview-brand">F<span>reelance</span></span><div class="preview-nav"><span class="active"><svg class="icon"><use href="#route"/></svg>{{preview.overview}}</span><span>{{preview.providers}}</span><span>{{preview.test}}</span><span>{{preview.help}}</span></div><span class="sidebar-bottom">127.0.0.1:8000</span></aside>
+          <div class="preview-main"><div class="preview-heading"><div><p class="eyebrow">GATEWAY / OVERVIEW</p><h2>{{preview.title}}</h2></div><span class="status-chip"><i class="status-dot"></i>{{preview.ready}}</span></div><p class="preview-subtitle">{{preview.subtitle}}</p>
+            <div class="preview-workspace"><div class="provider-pane"><div class="pane-label">{{preview.label}}<span>03</span></div><div class="provider-row"><span class="provider-symbol">O</span><div><strong>OpenRouter</strong><small>openrouter.ai</small></div><span class="available"><i class="status-dot"></i>{{preview.available}}</span></div><div class="provider-row"><span class="provider-symbol">N</span><div><strong>NVIDIA</strong><small>integrate.api.nvidia.com</small></div><span class="available"><i class="status-dot"></i>{{preview.available}}</span></div><div class="provider-row"><span class="provider-symbol">◉</span><div><strong>Ollama Cloud</strong><small>ollama.com</small></div><span class="available"><i class="status-dot"></i>{{preview.available}}</span></div><div class="endpoint-caption">{{preview.endpoint}}</div><code class="endpoint-code">POST /v1/chat/completions</code></div>
+            <div class="request-pane"><div class="pane-label">{{preview.route}}<code>model: "auto"</code></div><pre class="request-code"><code><span class="code-muted"># OpenAI-compatible</span>
+client = <span class="code-function">OpenAI</span>(
+  base_url=<span class="code-string">"http://localhost:8000/v1"</span>,
+  api_key=<span class="code-string">"YOUR_GATEWAY_KEY"</span>
+)
+
+response = client.chat.completions.<span class="code-function">create</span>(
+  model=<span class="code-string">"auto"</span>,
+  messages=[...]
+)</code></pre><div class="request-path"><span>CLIENT</span><span aria-hidden="true">→</span><strong>FREELANCE</strong><span aria-hidden="true">→</span><span>MODEL</span></div></div></div>
+            <div class="preview-bottom"><svg class="icon"><use href="#check"/></svg>{{preview.footer}}<code>/v1/models</code></div>
+          </div>
+        </div>
+      </div>
+      <p class="illustration-caption">{{preview.caption}}</p>
+    </section>
+    <section class="provider-strip container" aria-label="{{providers.label}}"><p class="eyebrow">{{providers.label}}</p><div class="provider-names"><span>OpenRouter</span><span>NVIDIA</span><span>Ollama</span><span>Groq</span><span>Gemini</span><span>Mistral</span></div><p class="small muted">{{providers.more}}</p></section>
+    <section class="features section container" id="features"><div class="section-heading"><div><p class="eyebrow">{{features.eyebrow}}</p><h2>{{features.title}}</h2></div><p>{{features.description}}</p></div><div class="feature-grid"><article><span class="feature-number">01</span><h3>{{features.oneTitle}}</h3><p>{{features.oneBody}}</p><code>/v1/chat/completions</code></article><article><span class="feature-number">02</span><h3>{{features.twoTitle}}</h3><p>{{features.twoBody}}</p><code>retry → fallback → cooldown</code></article><article><span class="feature-number">03</span><h3>{{features.threeTitle}}</h3><p>{{features.threeBody}}</p><code>HTTP + MCP</code></article></div></section>
+    <section class="routing-section section container" id="routing"><div class="split-copy"><p class="eyebrow">{{routing.eyebrow}}</p><h2>{{routing.title}}</h2><p>{{routing.body}}</p><p class="small muted routing-note">{{routing.note}}</p><div class="config-preview"><div class="code-header"><span>config.yaml</span><button class="icon-button copy-button" data-copy="ranking-code" aria-label="{{routing.copy}}"><svg class="icon"><use href="#copy"/></svg></button></div><pre><code id="ranking-code">auto_routing:
+  custom_ranking:
+    - provider: openrouter
+      model: model-a
+    - provider: nvidia
+      model: model-b
+    - provider: ollama
+      model: model-c</code></pre></div></div>
+      <div class="routing-demo"><div class="demo-heading"><h3>{{routing.demo}}</h3><span class="demo-marker">DEMO</span></div><p class="small muted">{{routing.demoLabel}}</p><div class="ranking-column-head"><span>#</span><span>{{routing.provider}}</span><span>↕</span></div><ol id="ranking-list" class="ranking-list"><li><span class="rank-number">01</span><div><strong>OpenRouter</strong><code>model-a</code></div><span>↑ ↓</span></li><li><span class="rank-number">02</span><div><strong>NVIDIA</strong><code>model-b</code></div><span>↑ ↓</span></li><li><span class="rank-number">03</span><div><strong>Ollama Cloud</strong><code>model-c</code></div><span>↑ ↓</span></li></ol><button id="reset-ranking" class="text-button">{{routing.reset}} <span aria-hidden="true">↺</span></button><div class="demo-options"><label><input type="checkbox" id="simulate-failure">{{routing.fail}}</label><button id="run-demo" class="button ink">{{routing.run}} <svg class="icon"><use href="#arrow"/></svg></button></div><div class="demo-result" aria-live="polite"><div id="route-message">{{routing.idle}}</div><pre><code id="route-response">{ "model": "auto", "demo": true }</code></pre></div></div>
+    </section>
+    <section class="desktop-band" id="desktop"><div class="section container desktop-section"><div class="split-copy"><p class="eyebrow">{{desktop.eyebrow}}</p><h2>{{desktop.title}}</h2><p>{{desktop.body}}</p><ul class="check-list"><li><svg class="icon"><use href="#check"/></svg>{{desktop.item1}}</li><li><svg class="icon"><use href="#check"/></svg>{{desktop.item2}}</li><li><svg class="icon"><use href="#check"/></svg>{{desktop.item3}}</li></ul><a class="text-link desktop-cta" href="#start" data-start-tab="desktop">{{desktop.cta}} <svg class="icon"><use href="#arrow"/></svg></a><a class="small muted guide-link" href="https://gitee.com/1043312001/freelance/blob/desktop/docs/desktop.md" target="_blank" rel="noopener noreferrer">{{desktop.guide}} ↗</a></div>
+      <div class="desktop-visual"><div class="desktop-app"><div class="window-bar"><span>Freelance Gateway</span><span class="window-buttons" aria-hidden="true">—　□　×</span></div><div class="desktop-app-content"><p class="eyebrow">{{desktop.mockLabel}}</p><div class="desktop-status"><span id="desktop-dot" class="status-dot"></span><h3 id="desktop-state">{{desktop.stopped}}</h3></div><div class="desktop-url"><span>Base URL</span><code>http://127.0.0.1:8000/v1</code></div><div class="desktop-controls"><button class="button ink" id="desktop-start">{{desktop.start}}</button><button class="button secondary" id="desktop-stop" disabled>{{desktop.stop}}</button><button class="button secondary" id="desktop-restart" disabled>{{desktop.restart}}</button></div><div class="desktop-divider"></div><div class="pane-label">{{desktop.config}}<span>config.yaml</span></div><div class="desktop-config"><span>01</span><strong>OpenRouter</strong><code>model-a</code><svg class="icon"><use href="#check"/></svg></div><div class="desktop-config"><span>02</span><strong>NVIDIA</strong><code>model-b</code><svg class="icon"><use href="#check"/></svg></div><p class="small muted desktop-directory">{{desktop.directory}}</p></div></div><p class="illustration-caption">{{desktop.notice}}</p><p class="small muted portable-note">{{desktop.portable}}</p></div></div></section>
+    <section class="section container start-section" id="start"><div class="section-heading"><div><p class="eyebrow">{{start.eyebrow}}</p><h2>{{start.title}}</h2></div><p>{{start.body}}</p></div><div class="quickstart-grid"><div class="clone-step"><span class="step-number">01</span><h3>{{start.step1}}</h3><div class="clone-command"><pre><code id="clone-code">git clone https://gitee.com/1043312001/freelance.git
+cd freelance</code></pre><button class="icon-button copy-button" data-copy="clone-code" aria-label="{{start.clone}}"><svg class="icon"><use href="#copy"/></svg></button></div><span class="step-number second-step">02</span><h3>{{start.step2}}</h3><div class="start-tabs" role="tablist" aria-label="{{start.step2}}"><button id="tab-desktop" role="tab" aria-controls="panel-desktop" aria-selected="true" data-tab="desktop">{{start.desktop}} <svg class="icon"><use href="#arrow"/></svg></button><button id="tab-cli" role="tab" aria-controls="panel-cli" aria-selected="false" tabindex="-1" data-tab="cli">{{start.cli}} <svg class="icon"><use href="#arrow"/></svg></button><button id="tab-api" role="tab" aria-controls="panel-api" aria-selected="false" tabindex="-1" data-tab="api">{{start.api}} <svg class="icon"><use href="#arrow"/></svg></button></div></div><div class="start-panels">
+      <div id="panel-desktop" role="tabpanel" aria-labelledby="tab-desktop" tabindex="0"><div class="start-panel-description"><span class="code-language">WINDOWS / POWERSHELL</span><h3>{{start.desktopTitle}}</h3><p>{{start.desktopBody}}</p></div><div class="start-code"><div class="code-header"><span>PowerShell</span><button class="copy-button text-button" data-copy="desktop-code">{{copy.label}}<svg class="icon"><use href="#copy"/></svg></button></div><pre><code id="desktop-code">python -m pip install -e ".[desktop,desktop-build]"
+python scripts/build_desktop.py
+python scripts/verify_desktop_bundle.py</code></pre></div></div>
+      <div id="panel-cli" role="tabpanel" aria-labelledby="tab-cli" tabindex="0" hidden><div class="start-panel-description"><span class="code-language">SERVER / CLI</span><h3>{{start.cliTitle}}</h3><p>{{start.cliBody}}</p></div><div class="start-code"><div class="code-header"><span>PowerShell</span><button class="copy-button text-button" data-copy="cli-code">{{copy.label}}<svg class="icon"><use href="#copy"/></svg></button></div><pre><code id="cli-code">python -m pip install -e .
+Copy-Item .env.example .env
+python -m app.cli start --host 127.0.0.1 --port 8000</code></pre></div></div>
+      <div id="panel-api" role="tabpanel" aria-labelledby="tab-api" tabindex="0" hidden><div class="start-panel-description"><span class="code-language">OPENAI SDK / PYTHON</span><h3>{{start.apiTitle}}</h3><p>{{start.apiBody}}</p></div><div class="start-code"><div class="code-header"><span>Python</span><button class="copy-button text-button" data-copy="api-code">{{copy.label}}<svg class="icon"><use href="#copy"/></svg></button></div><pre><code id="api-code">from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="YOUR_GATEWAY_KEY",
+)
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)</code></pre></div></div>
+    </div></div></section>
+    <section class="section container faq-section"><div><p class="eyebrow">{{faq.eyebrow}}</p><h2>{{faq.title}}</h2></div><div class="faq-list"><details><summary>{{faq.q1}}<span aria-hidden="true">+</span></summary><p>{{faq.a1}}</p></details><details><summary>{{faq.q2}}<span aria-hidden="true">+</span></summary><p>{{faq.a2}}</p></details><details><summary>{{faq.q3}}<span aria-hidden="true">+</span></summary><p>{{faq.a3}}</p></details><details><summary>{{faq.q4}}<span aria-hidden="true">+</span></summary><p>{{faq.a4}}</p></details><details><summary>{{faq.q5}}<span aria-hidden="true">+</span></summary><p>{{faq.a5}}</p></details></div></section>
+    <section class="closing container"><span class="closing-mark" aria-hidden="true">f<span>→</span></span><h2>{{closing.title}}</h2><a class="button primary" href="#start">{{closing.cta}} <svg class="icon"><use href="#arrow"/></svg></a></section>
+  </main>
+  <footer class="site-footer container"><div class="footer-top"><div><a class="brand" href="{{base}}index.html"><img src="{{base}}assets/favicon.svg" width="25" height="25" alt=""><span>freelance.</span></a><p>{{footer.tagline}}</p></div><div class="footer-column"><h3>{{footer.project}}</h3><a href="https://gitee.com/1043312001/freelance" target="_blank" rel="noopener noreferrer">{{footer.repository}} ↗</a><a href="https://gitee.com/1043312001/freelance/blob/desktop/LICENSE" target="_blank" rel="noopener noreferrer">{{footer.license}} ↗</a></div><div class="footer-column"><h3>{{footer.resources}}</h3><a href="https://gitee.com/1043312001/freelance/blob/desktop/README.md" target="_blank" rel="noopener noreferrer">{{footer.docs}} ↗</a><a href="https://gitee.com/1043312001/freelance/blob/desktop/docs/desktop.md" target="_blank" rel="noopener noreferrer">{{footer.desktop}} ↗</a><a href="https://gitee.com/1043312001/freelance/blob/desktop/docs/mcp.md" target="_blank" rel="noopener noreferrer">{{footer.mcp}} ↗</a></div><div class="footer-column"><span class="eyebrow">LANGUAGE</span><a class="language-link" href="{{alternate}}" lang="{{alternateLang}}">{{nav.language}}</a><span class="footer-protocol">OPENAI COMPATIBLE<br>SELF-HOSTED<br>OPEN SOURCE</span></div></div><section class="footer-section footer-friends" data-friends-src="{{friendsUrl}}" hidden></section><div class="footer-bottom"><span>© 2026 Freelance · MIT</span><span>{{footer.note}}</span></div></footer>
+  <div id="copy-notice" role="status" class="copy-notice" hidden></div>
+  <script id="site-copy" type="application/json">{{translations}}</script>
+</body>
+</html>

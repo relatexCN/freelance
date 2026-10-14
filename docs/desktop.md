@@ -29,9 +29,11 @@ python -m app.desktop --workspace D:\deploy\gateway
 
 界面保留“运行概览”“供应商配置”“调用测试”“接入指引”四个标签。模型名称和别名在“调用测试”的可搜索模型框中选择；别名维护位于“供应商配置”底部的“高级配置：模型别名”，默认折叠。已有模型别名及网关 API 不变，保存别名后仍需重启生效。
 
-“供应商配置”中的“自动路由：模型优先级”用于编辑已有的 `auto_routing.custom_ranking`。选择供应商、填写上游真实模型 ID，点击“添加”；选中列表中的模型后可“上移”“下移”或“移除”，首行优先。“恢复默认排序”清空列表草稿，随后点击“保存优先级”才写入配置。保存后重启本地网关；远程网关由服务器 CLI 或服务管理器重启。
+模型优先级已合并到供应商配置表格，不再有独立编辑区域。用每行的 ↑/↓ 调整供应商模型的调用顺序，“优先模型”列显示该供应商当前自定义模型候选（未指定时显示 —，不影响供应商排序）；同一供应商的多个已配置优先模型会整组移动，保留组内顺序。首次调整时，为其他已填写默认模型的供应商补充候选，未设置默认模型的供应商也可通过箭头排序：保存到 auto_routing.provider_order，网关按该供应商实际发现的模型应用顺序，无需填写虚构模型 ID。表格在默认模式下的行序仅为配置展示，不代表运行时评分顺序。
 
-优先级仅作用于 `auto/free/best-free`：指定模型按列表顺序优先尝试，全部失败后继续评分和供应商默认模型生成的候选。空列表恢复默认排序，显式指定单个模型和多模型独立回答不受影响。可以填写未被模型发现列出的模型；供应商需配置可用 Key。读取时兼容 YAML 中的模型别名和 `provider:model` 简写，桌面保存为明确的供应商与模型条目。远程保存需要新版管理接口和管理员 Key。
+排序、恢复默认评分排序和供应商编辑均通过“保存供应商配置”一次保存，随后重启生效。调整箭头不会清空正在编辑的供应商字段。修改默认模型时同步更新该供应商原默认模型对应的优先条目，其他自定义候选保留；恢复默认评分排序会同时清空模型优先级与供应商排序草稿，保存后使用原有评分机制。远程保存需要支持合并更新的新版管理接口，由服务器 CLI 或服务管理器重启网关。
+
+优先级仅作用于 `auto/free/best-free`：指定模型按列表顺序优先尝试，全部失败后继续评分和供应商默认模型生成的候选。模型与供应商排序列表都为空时恢复默认排序，显式指定单个模型和多模型独立回答不受影响。可以填写未被模型发现列出的模型；供应商需配置可用 Key。读取时兼容 YAML 中的模型别名和 `provider:model` 简写，桌面保存为明确的供应商与模型条目。远程保存需要新版管理接口和管理员 Key。
 
 运行状态每两秒在独立后台任务中检查，单次最多等待三秒。进入 ready 后自动加载数据，运行概览每十五秒更新，模型列表每六十秒更新，数据加载总等待上限为八秒。这些后台操作不禁用连接区或配置页面，可被切换连接、用户操作和关闭窗口取消；定期更新不覆盖未保存的配置表单或调用错误提示。保存、进程启停和显式调用仍保留必要的忙碌状态。
 
@@ -78,7 +80,7 @@ ADMIN_API_KEY=<独立的随机管理员密钥>
 | `GET /admin/status` | 启动中、就绪、失败或停止状态；HTTP 监听后即可访问 |
 | `GET /admin/snapshot` | 脱敏的供应商、模型及当前进程累计统计 |
 | `GET /admin/config` | 可编辑字段及配置版本，不返回供应商 Key 或敏感透传字段 |
-| `PUT /admin/providers` | `{revision, provider: {name, base_url, default_model, timeout, api_key?}}` |
+| `PUT /admin/providers` | `{revision, provider: {name, base_url, default_model, timeout, api_key?}, ranking?: {custom_ranking: [...]}}` |
 | `PUT /admin/aliases` | `{revision, route: {alias, provider, model}}` |
 | `DELETE /admin/aliases` | `{revision, alias}` |
 | `PUT /admin/ranking` | `{revision, ranking: {custom_ranking: [{provider, model}, ...]}}` |
@@ -112,3 +114,5 @@ python scripts/build_desktop.py
 旧版 EXE 正在运行时，可使用 `python scripts/build_desktop.py --distpath dist/updated` 将新版构建到独立目录。升级时先在旧窗口选择“停止服务并退出”，再直接启动 `dist/updated/FreelanceDesktop/FreelanceDesktop.exe`；后台进程归属与 EXE 路径关联，保留旧后台时新版不会接管其停止权限。新版默认使用自身 EXE 目录内的配置，旧配置文件保留。更新已有便携目录时保留该目录的 `config.yaml` 和 `.env`。
 
 打包版启动异常记录在配置目录的 `desktop-error.log`；本地后端启动输出在 `desktop-launch.log`。界面预览可使用 `FreelanceDesktop.exe --workspace <临时目录> --preview <PNG路径>`，渲染后自动退出。
+
+供应商顺序优先于跨供应商的评分顺序；同一供应商内保留自定义模型顺序及默认评分候选顺序。箭头使用加粗字体，首行上移、末行下移仍禁用。排序只有点击“保存供应商配置”并重启网关后才影响实际请求。

@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from PySide6.QtCore import QThread, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QCompleter, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -197,11 +197,24 @@ class MainWindow(QMainWindow):
         self.reload_button = QPushButton("重新加载本地配置")
         self.reload_button.clicked.connect(self.reload_config)
         layout.addWidget(self.reload_button)
-        self.provider_table = table(["名称", "地址", "默认模型", "超时秒", "Key 状态"])
+        self.provider_table = table(["名称", "地址", "默认模型", "超时秒", "Key 状态", "优先模型", "排序"])
         self.provider_table.setMinimumHeight(100)
-        self.provider_table.setMaximumHeight(150)
+        self.provider_table.setMaximumHeight(240)
+        header = self.provider_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in (1, 2, 5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 110), (3, 66), (4, 95), (6, 80)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            self.provider_table.setColumnWidth(column, width)
         self.provider_table.itemSelectionChanged.connect(self.select_provider)
         layout.addWidget(self.provider_table)
+        self.order_hint = QLabel()
+        self.order_hint.setWordWrap(True)
+        layout.addWidget(self.order_hint)
+        self.reset_order_button = QPushButton("恢复默认评分排序")
+        self.reset_order_button.clicked.connect(self.reset_provider_order)
+        layout.addWidget(self.reset_order_button)
         form = QFormLayout()
         self.template = QComboBox()
         self.template.addItems(TEMPLATES)
@@ -225,9 +238,6 @@ class MainWindow(QMainWindow):
         save.clicked.connect(self.save_provider)
         layout.addWidget(save)
         layout.addWidget(QLabel("保存后需要重启。修改已有供应商会保留高级参数；配置文件会重排 YAML 并保留一份备份。"))
-        ranking_box = QGroupBox("自动路由：模型优先级")
-        self.build_ranking(QVBoxLayout(ranking_box))
-        layout.addWidget(ranking_box)
         self.alias_toggle = QPushButton("高级配置：模型别名")
         self.alias_toggle.setCheckable(True)
         layout.addWidget(self.alias_toggle)
@@ -238,79 +248,102 @@ class MainWindow(QMainWindow):
         self.alias_toggle.toggled.connect(self.alias_box.setVisible)
         layout.addStretch()
 
-    def build_ranking(self, layout):
-        description = QLabel("从上到下优先尝试，失败后继续默认候选。仅作用于 auto / free / best-free；保存后重启生效。")
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        self.ranking_table = table(["供应商", "上游模型（首行优先）"])
-        self.ranking_table.setMinimumHeight(100)
-        self.ranking_table.setMaximumHeight(180)
-        layout.addWidget(self.ranking_table)
-        form = QFormLayout()
-        self.ranking_provider, self.ranking_model = QComboBox(), QLineEdit()
-        self.ranking_provider.currentTextChanged.connect(self.ranking_default_model)
-        self.ranking_model.setPlaceholderText("填写上游真实模型 ID，可使用未被模型发现列出的模型")
-        form.addRow("供应商", self.ranking_provider)
-        form.addRow("上游模型 ID", self.ranking_model)
-        layout.addLayout(form)
-        buttons = QHBoxLayout()
-        for label, action in (("添加", self.add_ranking), ("移除", self.remove_ranking),
-                              ("上移", lambda: self.move_ranking(-1)), ("下移", lambda: self.move_ranking(1)),
-                              ("恢复默认排序", lambda: fill(self.ranking_table, [])),
-                              ("保存优先级", self.save_ranking)):
-            button = QPushButton(label)
-            button.clicked.connect(action)
-            buttons.addWidget(button)
-        layout.addLayout(buttons)
-        layout.addWidget(QLabel("空列表表示默认排序；添加、调整或恢复默认后，点击“保存优先级”。"))
-
-    def ranking_rows(self):
-        return [[self.ranking_table.item(row, column).text() for column in range(2)]
-                for row in range(self.ranking_table.rowCount())]
-
-    def ranking_default_model(self, provider):
-        if self.configuration:
-            self.ranking_model.setText(self.configuration["providers"].get(provider, {}).get("default_model", ""))
-
-    def add_ranking(self):
-        if not self.configuration:
-            self.problem("请先加载配置；远程模式需要管理员 Key")
-            return
-        row = [self.ranking_provider.currentText(), self.ranking_model.text().strip()]
-        if not all(row):
-            self.problem("请选择供应商并填写上游模型 ID")
-            return
-        rows = self.ranking_rows()
-        if row in rows:
-            self.problem("该供应商与模型已在优先级列表中")
-            return
-        fill(self.ranking_table, [*rows, row])
-        self.ranking_table.setCurrentCell(len(rows), 0)
-
-    def remove_ranking(self):
-        row = self.ranking_table.currentRow()
-        rows = self.ranking_rows()
-        if 0 <= row < len(rows):
-            rows.pop(row)
-            fill(self.ranking_table, rows)
-            if rows:
-                self.ranking_table.setCurrentCell(min(row, len(rows) - 1), 0)
-
-    def move_ranking(self, offset):
-        row = self.ranking_table.currentRow()
-        rows = self.ranking_rows()
-        target = row + offset
-        if 0 <= row < len(rows) and 0 <= target < len(rows):
-            rows[row], rows[target] = rows[target], rows[row]
-            fill(self.ranking_table, rows)
-            self.ranking_table.setCurrentCell(target, 0)
-
-    def save_ranking(self):
+    def render_provider_order(self):
+        selected = self.provider_name.text()
+        self.provider_table.blockSignals(True)
         try:
-            edit = RankingEdit(custom_ranking=[{"provider": p, "model": m} for p, m in self.ranking_rows()])
-            self.save_change("ranking", edit)
-        except ValidationError:
-            self.problem("优先级输入无效，请检查供应商和模型 ID")
+            rows = []
+            for name in self._provider_order:
+                item = self.configuration["providers"][name]
+                models = [route["model"] for route in self._ranking_draft if route["provider"] == name]
+                rows.append([name, item["base_url"], item["default_model"], item["timeout"],
+                             f"{item['key_count']} 个" + ("（环境覆盖）" if item.get("key_environment_override") else ""),
+                             " / ".join(models) or "—", ""])
+            fill(self.provider_table, rows)
+            for row, name in enumerate(self._provider_order):
+                controls = QWidget()
+                buttons = QHBoxLayout(controls)
+                buttons.setContentsMargins(2, 0, 2, 0)
+                buttons.setSpacing(2)
+                for arrow, offset in (("↑", -1), ("↓", 1)):
+                    button = QPushButton(arrow)
+                    arrow_font = button.font()
+                    arrow_font.setBold(True)
+                    arrow_font.setPointSize(14)
+                    button.setFont(arrow_font)
+                    button.setFixedWidth(30)
+                    button.setAccessibleName(("上移 " if offset < 0 else "下移 ") + name)
+                    button.setToolTip("调整该供应商模型的调用顺序，保存后重启生效")
+                    button.setEnabled(self.provider_move_target(name, offset) is not None)
+                    button.clicked.connect(lambda checked=False, provider=name, delta=offset: self.move_provider_order(provider, delta))
+                    buttons.addWidget(button)
+                self.provider_table.setCellWidget(row, 6, controls)
+                self.provider_table.item(row, 5).setToolTip("\n".join(route["model"] for route in self._ranking_draft if route["provider"] == name))
+            self.provider_table.setColumnWidth(6, 80)
+            if selected in self._provider_order:
+                self.provider_table.setCurrentCell(self._provider_order.index(selected), 0)
+        finally:
+            self.provider_table.blockSignals(False)
+        custom_order = not self._order_reset and (self._ranking_dirty or self.configuration.get("auto_routing", {}).get("provider_order"))
+        prefix = "已启用自定义调用顺序。" if self._ranking_draft or custom_order else "当前使用默认评分排序，表格顺序不代表评分顺序。"
+        self.order_hint.setText(prefix + "用 ↑/↓ 调整供应商模型顺序，点击“保存供应商配置”后重启生效；同一供应商的已有优先模型保留组内顺序。" + ("（顺序尚未保存）" if self._ranking_dirty else ""))
+
+    def provider_move_target(self, name, offset):
+        target = self._provider_order.index(name) + offset
+        return target if 0 <= target < len(self._provider_order) else None
+
+    def move_provider_order(self, name, offset):
+        if not self.configuration or self.worker or name not in self._provider_order:
+            return
+        row = self._provider_order.index(name)
+        target = self.provider_move_target(name, offset)
+        if target is None:
+            return
+        # Sorting must not discard an in-progress provider form.
+        if not self.provider_name.text().strip():
+            self.provider_table.setCurrentCell(row, 0)
+            self.select_provider()
+        self._provider_order[row], self._provider_order[target] = self._provider_order[target], self._provider_order[row]
+        groups = {}
+        for route in self._ranking_draft:
+            groups.setdefault(route["provider"], []).append(dict(route))
+        ranking = []
+        for provider in self._provider_order:
+            if provider in groups:
+                ranking.extend(groups[provider])
+            else:
+                model = self.configuration["providers"][provider].get("default_model", "")
+                if model:
+                    ranking.append({"provider": provider, "model": model})
+        self._ranking_draft = ranking
+        self._ranking_dirty = True
+        self._order_reset = False
+        self.render_provider_order()
+
+    def reset_provider_order(self):
+        if not self.configuration or self.worker:
+            return
+        self._ranking_draft = []
+        self._ranking_dirty = True
+        self._order_reset = True
+        self._provider_order = list(self.configuration["providers"])
+        if not self.provider_name.text().strip() and self._provider_order:
+            self.provider_table.setCurrentCell(0, 0)
+            self.select_provider()
+        self.render_provider_order()
+
+    def provider_ranking_edit(self, edit):
+        ranking = [dict(route) for route in self._ranking_draft]
+        previous = self.configuration["providers"].get(edit.name, {}).get("default_model", "")
+        if previous != edit.default_model and previous:
+            ranking = [dict(route, model=edit.default_model) if route["provider"] == edit.name and route["model"] == previous else route for route in ranking]
+            ranking = [route for route in ranking if route["model"]]
+        if ranking and edit.name not in self.configuration["providers"] and edit.default_model:
+            ranking.append({"provider": edit.name, "model": edit.default_model})
+        if self._ranking_dirty or ranking != self._ranking_draft:
+            provider_order = ([] if self._order_reset else list(self._provider_order)) if self._ranking_dirty else None
+            return RankingEdit(custom_ranking=ranking, provider_order=provider_order)
+        return None
 
     def build_aliases(self, layout):
         self.alias_table = table(["客户端别名", "供应商", "上游模型"])
@@ -418,9 +451,10 @@ class MainWindow(QMainWindow):
         self.configuration = None
         fill(self.provider_table, [])
         fill(self.alias_table, [])
-        fill(self.ranking_table, [])
-        self.ranking_provider.clear()
-        self.ranking_model.clear()
+        self._provider_order = []
+        self._ranking_draft = []
+        self._ranking_dirty = False
+        self.order_hint.clear()
         fill(self.health_table, [])
         fill(self.metrics_table, [])
         self.test_model.clear()
@@ -720,16 +754,15 @@ class MainWindow(QMainWindow):
         self.configuration = configuration
         self.provider_key.clear()
         self.clear_key.setChecked(False)
-        fill(self.provider_table, [[name, item["base_url"], item["default_model"], item["timeout"],
-                                    f"{item['key_count']} 个" + ("（环境覆盖）" if item.get("key_environment_override") else "")]
-                                   for name, item in configuration["providers"].items()])
+        self._ranking_draft = [dict(route) for route in configuration.get("auto_routing", {}).get("custom_ranking", [])]
+        self._ranking_dirty = False
+        self._order_reset = False
+        ranked = list(dict.fromkeys([*configuration.get("auto_routing", {}).get("provider_order", []), *(route["provider"] for route in self._ranking_draft)]))
+        self._provider_order = ranked + [name for name in configuration["providers"] if name not in ranked]
+        self.render_provider_order()
         fill(self.alias_table, [[name, item["provider"], item["model"]] for name, item in configuration["models"].items()])
         self.alias_provider.clear()
         self.alias_provider.addItems(list(configuration["providers"]))
-        fill(self.ranking_table, [[item["provider"], item["model"]]
-                                 for item in configuration.get("auto_routing", {}).get("custom_ranking", [])])
-        self.ranking_provider.clear()
-        self.ranking_provider.addItems(list(configuration["providers"]))
         if configuration["pending_restart"]:
             self.notice.setText("配置已保存，重启后生效。远程服务请通过服务器 CLI 或服务管理器重启。")
 
@@ -769,7 +802,7 @@ class MainWindow(QMainWindow):
             self.alias_provider.setCurrentText(self.alias_table.item(row, 1).text())
             self.alias_model.setText(self.alias_table.item(row, 2).text())
 
-    def save_change(self, kind, edit):
+    def save_change(self, kind, edit, ranking=None):
         if self.worker:
             return
         if not self.configuration:
@@ -788,14 +821,17 @@ class MainWindow(QMainWindow):
                 if kind == "ranking":
                     return store.ranking(revision, edit)
                 if kind == "provider":
-                    return store.provider(revision, edit)
+                    return store.provider(revision, edit, ranking)
                 if kind == "alias":
                     return store.alias(revision, edit)
                 return store.delete_alias(revision, edit)
             if kind == "ranking":
                 return client.request("PUT", "/admin/ranking", {"revision": revision, "ranking": edit.model_dump()}, admin=True)
             if kind == "provider":
-                return client.request("PUT", "/admin/providers", {"revision": revision, "provider": edit.model_dump()}, admin=True)
+                payload = {"revision": revision, "provider": edit.model_dump()}
+                if ranking is not None:
+                    payload["ranking"] = ranking.model_dump()
+                return client.request("PUT", "/admin/providers", payload, admin=True)
             if kind == "alias":
                 return client.request("PUT", "/admin/aliases", {"revision": revision, "route": edit.model_dump()}, admin=True)
             return client.request("DELETE", "/admin/aliases", {"revision": revision, "alias": edit}, admin=True)
@@ -811,7 +847,10 @@ class MainWindow(QMainWindow):
             edit = ProviderEdit(name=name, base_url=self.provider_url.text().strip(),
                                 default_model=self.provider_model.text().strip(), timeout=self.provider_timeout.value(),
                                 api_key=key)
-            self.save_change("provider", edit)
+            if not self.configuration:
+                self.problem("请先加载配置；远程模式需要管理员 Key")
+                return
+            self.save_change("provider", edit, self.provider_ranking_edit(edit))
         except ValidationError:
             self.problem("供应商输入无效，请检查名称、地址和 Key；地址不能包含凭据或查询参数")
         except (ValueError, OSError):

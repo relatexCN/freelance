@@ -332,8 +332,13 @@ class RouterService:
                     )
                     default_ranked.append(pair)
 
+        provider_order = getattr(config, "custom_provider_order", [])
+        positions = {name: index for index, name in enumerate(provider_order)}
+        def order_providers(candidates):
+            return sorted(candidates, key=lambda pair: positions.get(pair[0], len(positions))) if positions else candidates
+
         if not config.custom_model_ranking:
-            return default_ranked
+            return order_providers(default_ranked)
 
         # Explicit entries lead.  Keep the normal ranking after them so a
         # partial custom list changes priority without removing safe fallbacks.
@@ -347,7 +352,7 @@ class RouterService:
                 continue
             candidates.append(pair)
             candidate_seen.add(pair)
-        return candidates
+        return order_providers(candidates)
 
     @staticmethod
     async def get_models_to_try(
