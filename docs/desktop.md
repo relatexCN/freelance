@@ -11,27 +11,41 @@ python -m pip install -e ".[desktop]"
 python -m app.desktop
 ```
 
-也可以使用 `freelance-desktop` 命令，或 Windows 双击 `freelance-desktop.bat`。批处理优先启动 `dist/FreelanceDesktop/FreelanceDesktop.exe` 或解压后的 `FreelanceDesktop/FreelanceDesktop.exe`，此时无需安装 Python。没有便携版时，使用项目 `.venv`，否则使用 PATH 中的 Python；依赖缺失时显示所选解释器及对应安装命令。开发时直接运行 `python -m app.desktop` 使用源码。
+安装后也可以使用 `freelance-desktop` 命令启动源码桌面。便携版直接双击所需版本文件夹内的 `FreelanceDesktop.exe`，无需安装 Python；没有自动选择便携版的批处理入口。使用项目 `.venv` 时，先激活该环境再执行源码启动命令。
 
-默认本地配置目录为用户目录下的 `.freelance`，独立于仓库配置。第一次打开时创建最小供应商模板，并生成不同的调用 Key 和管理员 Key。已有 Key 不会被自动轮换，已有空值也不会被擅自替换。
+默认读取程序所在目录的 `config.yaml` 和 `.env`，无需添加参数或指定固定路径。便携版使用 EXE 所在文件夹；源码启动使用项目根目录，不受启动时的工作目录影响。移动整个便携版文件夹时，配置随文件夹一起移动。不会向上寻找源码目录，也不再读取或写入旧版 `.freelance/desktop-workspace.json` 路径记忆文件。
 
-使用已有部署配置：
+程序目录中缺少 `config.yaml` 时自动创建默认模板；缺少 `.env` 或必要 Key 时补充调用 Key、管理员 Key，已有配置和 Key 保留。旧版用户目录和项目目录中的配置不会自动复制到 EXE 目录；如需沿用，可将所需的 `config.yaml`、`.env` 放到 EXE 旁边，或在界面选择该目录。配置修改后仍需重启运行中的网关才能生效。
+
+只有需要使用其他独立部署配置时才指定目录：
 
 ```powershell
-python -m app.desktop --workspace D:\www\freelance
+python -m app.desktop --workspace D:\deploy\gateway
 ```
 
 配置目录可以在界面中选择，但当前目录的本地网关运行期间不能切换。界面显示的本地目录对应实际读写文件，不使用后端的工作目录回退逻辑。
 
 ## 本地使用
 
+界面保留“运行概览”“供应商配置”“调用测试”“接入指引”四个标签。模型名称和别名在“调用测试”的可搜索模型框中选择；别名维护位于“供应商配置”底部的“高级配置：模型别名”，默认折叠。已有模型别名及网关 API 不变，保存别名后仍需重启生效。
+
+运行状态每两秒在独立后台任务中检查，单次最多等待三秒。进入 ready 后自动加载数据，运行概览每十五秒更新，模型列表每六十秒更新，数据加载总等待上限为八秒。这些后台操作不禁用连接区或配置页面，可被切换连接、用户操作和关闭窗口取消；定期更新不覆盖未保存的配置表单或调用错误提示。保存、进程启停和显式调用仍保留必要的忙碌状态。
+
 1. 在“供应商配置”选择模板或已有供应商，填写 Base URL、供应商 Key 和默认模型。
 2. 保存配置。Key 输入留空表示保留，勾选“清空”表示删除该供应商的有效凭据；多个 Key 用英文逗号分隔。
-3. 点击“启动本地网关”。网关只监听 `127.0.0.1`，启动中通过管理员状态接口显示状态。
-4. 点击“连接 / 刷新”读取运行概览、模型及别名，使用“调用测试”验证单模型或多模型调用。
+3. 点击“启动本地网关”。网关只监听 `127.0.0.1`，后台等待就绪后自动加载运行概览和模型列表；重启同样自动重新加载。已有本客户端拥有的后台网关时，点击启动只重新连接和加载，不重复创建进程。
+4. 本地模式不再提供独立“连接 / 刷新”按钮，使用“调用测试”验证调用。若进程已就绪但数据加载失败，界面明确提示并定期重试，也可点击启动重新加载，无需停止或重启进程。
 5. “接入指引”提供 OpenAI 兼容 Base URL 和示例，其他客户端使用调用 Key。
 
 配置保存后重启生效，不执行热更新。修改供应商时保留已有高级字段；界面不编辑工具模式、评分、透传和自动排名等高级配置，可继续手工维护 YAML。
+
+手工修改配置文件后，点击供应商页的“重新加载本地配置”更新表单，即使网关未运行也可使用；这不等于应用配置，生效仍需重启。界面保存配置或别名后直接更新表单。
+
+界面中的调用 Key、管理员 Key 和供应商 Key 明文显示。本地选择供应商时读取并显示其已保存的 Key；只修改默认模型等字段、未修改 Key 时保留原有 Key 引用。远程管理接口仍不返回已保存的供应商 Key，输入框仅显示本次填写的值。
+
+调用 Key 旁的“重新生成 Key”仅在本地模式提供，生成安全随机的主调用密钥并保存到 `.env` 的 `API_KEY`，保留管理员 Key、供应商 Key、额外的 `API_KEYS` 和 YAML 格式。原 `.env` 备份为 `.env.bak`，配置变化时要求先重新加载。若调用 Key 由外部进程环境变量覆盖，该按钮不可用。
+
+网关运行期间生成新 Key，当前窗口继续用旧 Key 保持连接，新 Key 在重启后生效；已运行时再点击启动不会应用新 Key。其他客户端需在重启后改用新 Key。若关闭窗口并保留了尚未重启的旧网关，重新打开后请重启使保存的 Key 生效。按钮不生成管理员或上游供应商的 Key。
 
 桌面客户端启动的是独立后端子进程，不使用 CLI 的 `freelance.pid`。停止和重启仅针对 PID、创建时间、命令行和配置目录均匹配的桌面进程。CLI 已启动的服务不会被桌面停止；端口冲突时更换端口，或用远程模式连接已有服务。
 
@@ -39,7 +53,7 @@ python -m app.desktop --workspace D:\www\freelance
 
 ## 远程使用
 
-切换“远程网关”，填写服务地址与调用 Key。可填写 `http(s)://host:port` 或以 `/v1` 结尾的地址；反向代理路径前缀也支持，需同时代理 `/admin/*` 和业务接口。
+切换“远程网关”，填写服务地址与调用 Key，点击“连接”。远程模式隐藏本地启停按钮，连接、等待就绪和数据加载均在后台执行；修改地址或 Key 后需重新点击连接。可填写 `http(s)://host:port` 或以 `/v1` 结尾的地址；反向代理路径前缀也支持，需同时代理 `/admin/*` 和业务接口。
 
 基础模型列表、供应商状态和调用测试使用现有调用 Key。配置管理和统计快照另需服务端 `.env` 配置：
 
@@ -84,10 +98,12 @@ python -m pip install -e ".[desktop,desktop-build]"
 python scripts/build_desktop.py
 ```
 
-产物为 `dist/FreelanceDesktop/FreelanceDesktop.exe` 及同目录的运行依赖。将整个 `FreelanceDesktop` 文件夹分发或压缩，不能只复制 EXE。使用者无需安装 Python；配置仍保存在用户目录的 `.freelance`，构建不包含仓库 `.env`、运行日志和业务配置。
+产物为 `dist/FreelanceDesktop/FreelanceDesktop.exe` 及同目录的运行依赖。将整个 `FreelanceDesktop` 文件夹分发或压缩，不能只复制 EXE。使用者无需安装 Python；配置默认在 EXE 旁边创建和读取，构建不包含仓库 `.env`、运行日志和业务配置。
 
 打包后本地模式仍使用同一个 EXE 以 `--backend` 参数启动独立后端，远程模式无需启动本地后端。当前未提供安装向导、代码签名或自动更新系统。
 
 构建脚本在 Windows 下隔离第三方工具的 DLL 搜索路径，避免误打包其他工具的 ICU。可运行 `python scripts/verify_desktop_bundle.py`，在临时目录验证实际 EXE 的界面渲染、后端启动、API、进程找回和停止；不会请求真实上游。源码完整回归使用 `python -m unittest discover -s tests -q`，未安装 Qt 时界面测试跳过。
+
+旧版 EXE 正在运行时，可使用 `python scripts/build_desktop.py --distpath dist/updated` 将新版构建到独立目录。升级时先在旧窗口选择“停止服务并退出”，再直接启动 `dist/updated/FreelanceDesktop/FreelanceDesktop.exe`；后台进程归属与 EXE 路径关联，保留旧后台时新版不会接管其停止权限。新版默认使用自身 EXE 目录内的配置，旧配置文件保留。更新已有便携目录时保留该目录的 `config.yaml` 和 `.env`。
 
 打包版启动异常记录在配置目录的 `desktop-error.log`；本地后端启动输出在 `desktop-launch.log`。界面预览可使用 `FreelanceDesktop.exe --workspace <临时目录> --preview <PNG路径>`，渲染后自动退出。

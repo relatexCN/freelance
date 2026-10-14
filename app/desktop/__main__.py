@@ -11,9 +11,12 @@ def main():
         backend_main()
         return 0
     parser = argparse.ArgumentParser(description="Freelance desktop gateway client")
-    parser.add_argument("--workspace", type=Path, default=Path.home() / ".freelance", help="Local configuration directory")
+    parser.add_argument("--workspace", type=Path, help="Override the program's local configuration directory")
     parser.add_argument("--preview", type=Path, help="Save a window preview and exit (for UI verification)")
     args = parser.parse_args()
+    if args.workspace is None:
+        from .workspace import default_workspace
+        args.workspace = default_workspace()
     try:
         from PySide6.QtWidgets import QApplication
         from PySide6.QtGui import QFont, QFontDatabase

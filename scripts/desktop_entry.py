@@ -14,6 +14,12 @@ if __name__ == "__main__":
     except Exception:
         # A windowed executable otherwise hides startup errors in a blocking dialog.
         directory = Path.home() / ".freelance"
+        if "--backend" not in sys.argv and "--workspace" not in sys.argv:
+            try:
+                from app.desktop.workspace import default_workspace
+                directory = default_workspace()
+            except (OSError, ValueError):
+                pass
         if "--backend" in sys.argv:
             directory = Path.cwd()
         if "--workspace" in sys.argv:

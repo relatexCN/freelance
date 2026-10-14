@@ -3,13 +3,17 @@ import subprocess
 import sys
 import os
 import importlib.util
+import argparse
 from pathlib import Path
 
 
 def main():
     root = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(description="Build the portable desktop client")
+    parser.add_argument("--distpath", type=Path, default=root / "dist", help="Build into another directory while an older executable is running")
+    args = parser.parse_args()
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--onedir",
-               "--name", "FreelanceDesktop", "--distpath", str(root / "dist"),
+               "--name", "FreelanceDesktop", "--distpath", str(args.distpath.resolve()),
                "--workpath", str(root / "build" / "desktop"), "--specpath", str(root / "build"),
                "--paths", str(root), "--collect-submodules", "app", "--collect-submodules", "uvicorn",
                "--collect-data", "app.desktop", "--exclude-module", "PySide6.QtWebEngineCore",

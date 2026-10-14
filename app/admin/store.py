@@ -5,6 +5,7 @@ Never import app.config here: the desktop must not load backend environment stat
 import hashlib
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -140,6 +141,47 @@ class ConfigStore:
     def read(self):
         with self._lock, file_lock(self.path.with_name(".freelance-config.lock")):
             return self._read_locked()
+
+    def provider_key(self, name):
+        """Local filesystem access only; this value is never included in admin reads."""
+        with self._lock, file_lock(self.path.with_name(".freelance-config.lock")):
+            item = self._raw().get("providers", {}).get(name, {})
+            if not isinstance(item, dict):
+                raise ValueError("Invalid provider configuration")
+            source = str(item.get("api_key", ""))
+            match = re.fullmatch(r"\$\{(\w+):?([^}]*)\}", source)
+            if not match:
+                return source
+            if match[1] in self.external_env_names:
+                return os.environ.get(match[1], "")
+            env = dotenv_values(self.env_path) if self.env_path.exists() else {}
+            return env.get(match[1], match[2]) or ""
+
+    def regenerate_gateway_key(self, revision):
+        with self._lock, file_lock(self.path.with_name(".freelance-config.lock")):
+            if "API_KEY" in self.external_env_names:
+                raise ValueError("调用 Key 来自进程环境变量，请在运行环境中修改")
+            if revision != self.revision():
+                raise ConflictError("配置已变化，请重新加载配置后再生成 Key")
+            self._raw()  # Do not rotate credentials if configuration is malformed.
+            old_env = self.env_path.read_bytes() if self.env_path.exists() else None
+            content = (old_env or b"").decode("utf-8")
+            new_key = "sk-freelance-" + secrets.token_urlsafe(32)
+            replacement = "API_KEY=" + new_key
+            pattern = r"^(?:export\s+)?API_KEY\s*=.*$"
+            content = re.sub(pattern, lambda _: replacement, content, flags=re.MULTILINE) if re.search(pattern, content, re.MULTILINE) else content.rstrip() + "\n" + replacement + "\n"
+            if old_env is not None:
+                atomic_write(self.env_path.with_name(".env.bak"), old_env)
+            try:
+                atomic_write(self.env_path, content.encode("utf-8"))
+                configuration = self._read_locked()
+            except (OSError, ValueError):
+                if old_env is not None:
+                    atomic_write(self.env_path, old_env)
+                else:
+                    self.env_path.unlink(missing_ok=True)
+                raise
+            return {"api_key": new_key, "configuration": configuration}
 
     def _read_locked(self):
         with self._lock:

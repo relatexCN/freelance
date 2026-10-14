@@ -97,7 +97,37 @@ providers:
 
 ## 安装与启动
 
-可选桌面客户端支持本地启动/停止、远程连接、供应商与模型别名配置、运行概览和调用测试。安装 `python -m pip install -e ".[desktop]"` 后运行 `python -m app.desktop`，Windows 也可双击 `freelance-desktop.bat`。默认使用独立的用户配置目录；原有 CLI 和 MCP 保持可独立使用。详见 [桌面客户端说明](docs/desktop.md)。
+可选桌面客户端支持本地启动/停止、远程连接、供应商与模型别名配置、运行概览和调用测试。源码安装 `python -m pip install -e ".[desktop]"` 后运行 `python -m app.desktop` 或 `freelance-desktop`；便携版直接双击所需版本的 `FreelanceDesktop.exe`。源码桌面默认读取项目根目录的配置，便携版默认读取 EXE 所在目录的配置；原有 CLI 和 MCP 保持可独立使用。详见 [桌面客户端说明](docs/desktop.md)。
+
+### 手动生成 Windows 便携版
+
+建议使用 Python 3.11，在项目根目录打开 PowerShell。首次安装桌面和打包依赖，然后执行构建与验证：
+
+```powershell
+python -m pip install -e ".[desktop,desktop-build]"
+python scripts/build_desktop.py
+python scripts/verify_desktop_bundle.py
+```
+
+默认生成 `dist\FreelanceDesktop\FreelanceDesktop.exe` 及同目录的运行依赖。若希望直接生成在项目根目录下的 `FreelanceDesktop` 文件夹，改用：
+
+```powershell
+python scripts/build_desktop.py --distpath .
+python scripts/verify_desktop_bundle.py --executable FreelanceDesktop\FreelanceDesktop.exe
+```
+
+验证脚本在临时目录检查实际 EXE 的界面、默认配置创建、文件夹移动和本地后端 API，不调用真实上游。构建脚本不会自动生成 ZIP；分发时将整个 `FreelanceDesktop` 文件夹压缩，不能只复制 EXE，使用者无需安装 Python。
+
+首次启动时，EXE 所在目录缺少 `config.yaml` 或 `.env` 时自动创建默认文件；已有配置保留，不绑定固定路径。需要沿用配置时，将所需的 `config.yaml`、`.env` 放在 EXE 旁边。便携版在项目根目录的子文件夹中运行时，仍读取自身文件夹内的配置。
+
+**重复构建会清理目标 `FreelanceDesktop` 文件夹**，构建前先停止网关、退出该目录中的客户端，并备份其 `config.yaml`、`.env`。如旧版仍在运行，可先构建到另一目录：
+
+```powershell
+python scripts/build_desktop.py --distpath dist/updated
+python scripts/verify_desktop_bundle.py --executable dist/updated/FreelanceDesktop/FreelanceDesktop.exe
+```
+
+更新已有便携版时保留原配置；对外分发前移除个人 Key、配置和日志。
 
 建议使用 Python 3.11（当前已验证环境）；MCP 要求 Python 3.10+。`pyproject.toml` 与启动脚本仍保留旧的 3.8 声明，不能视为当前依赖及代码在 3.8 上已经验证。仓库内置脚本会检查 Python，在首次创建 `.venv` 时安装依赖，并把命令转发给 `app.cli`；已有环境不会自动更新依赖，升级后需手动执行 `python -m pip install -e .`。
 

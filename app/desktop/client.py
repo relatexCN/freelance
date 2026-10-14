@@ -17,6 +17,9 @@ def normalize_url(value):
 
 
 class GatewayClient:
+    STATUS_TIMEOUT = 3
+    OVERVIEW_TIMEOUT = 8
+
     def __init__(self, url, api_key="", admin_key=""):
         self.url = normalize_url(url)
         self.api_key, self.admin_key = api_key, admin_key
@@ -42,6 +45,101 @@ class GatewayClient:
                     return result
             self.check(response)
             return response.json()
+
+    def status(self, cancelled):
+        """Cancellable, bounded probe; never use a chat request's long timeout."""
+        return asyncio.run(self._status(cancelled))
+
+    async def _status(self, cancelled):
+        if cancelled.is_set():
+            return None
+
+        async def receive():
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.STATUS_TIMEOUT, connect=min(1, self.STATUS_TIMEOUT)),
+                                         follow_redirects=False) as client:
+                response = await client.get(self.url + ("/admin/status" if self.admin_key else "/health"),
+                                            headers=self.headers(admin=bool(self.admin_key)))
+                if not self.admin_key and response.status_code == 503:
+                    state = response.json().get("error", {}).get("code", "").removeprefix("service_")
+                    if state in {"starting", "failed", "stopping"}:
+                        return {"status": state}
+                self.check(response)
+                return response.json() if self.admin_key else {"status": "ready"}
+
+        return await self._bounded(receive, cancelled, self.STATUS_TIMEOUT)
+
+    def overview(self, cancelled, include_models=True, include_config=False):
+        return asyncio.run(self._overview(cancelled, include_models, include_config))
+
+    async def _overview(self, cancelled, include_models, include_config):
+        async def receive():
+            state = await self._status(cancelled)
+            if state is None:
+                return None
+            if state["status"] != "ready":
+                return {"state": state["status"]}
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.OVERVIEW_TIMEOUT, connect=1),
+                                         follow_redirects=False) as client:
+                async def get(path, admin=False):
+                    response = await client.get(self.url + path, headers=self.headers(admin))
+                    self.check(response)
+                    return response.json()
+
+                paths = [("snapshot", "/admin/snapshot", True)] if self.admin_key else [
+                    ("health", "/health/providers", False), ("stats", "/stats", False)]
+                if include_models:
+                    paths.append(("models", "/v1/models", False))
+                if include_config and self.admin_key:
+                    paths.append(("config", "/admin/config", True))
+                tasks = [asyncio.create_task(get(path, admin)) for _, path, admin in paths]
+                try:
+                    values = await asyncio.gather(*tasks)
+                except Exception:
+                    raise ValueError("网关已就绪，但运行数据加载失败；可重新连接或点击启动网关重试加载") from None
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                result = dict(zip((name for name, _, _ in paths), values))
+                if not self.admin_key:
+                    providers = result.pop("health")["providers"]
+                    stats = result.pop("stats")
+                    result["snapshot"] = {
+                        "providers": [{"provider": name, "available_keys": item["usable_keys"],
+                                       "key_count": item["total_keys"], "cooldown_remaining_seconds": item["melted_remaining_s"],
+                                       "consecutive_failures": item["consecutive_failures"]} for name, item in providers.items()],
+                        "metrics": [{"target": name, **{key: value.get(key) for key in (
+                            "request_count", "success_count", "error_count", "avg_latency_ms")}}
+                            for name, value in stats.items()],
+                    }
+                return {"state": "ready", **result}
+
+        return await self._bounded(receive, cancelled, self.OVERVIEW_TIMEOUT)
+
+    async def _bounded(self, receive, cancelled, timeout):
+        if cancelled.is_set():
+            return None
+
+        async def watch_cancel():
+            while not cancelled.is_set():
+                await asyncio.sleep(0.05)
+
+        receiver = asyncio.create_task(receive())
+        watcher = asyncio.create_task(watch_cancel())
+        try:
+            done, _ = await asyncio.wait({receiver, watcher}, timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if cancelled.is_set():
+                return None
+            if receiver in done:
+                return await receiver
+            if not done:
+                raise ValueError("状态检查超时；请刷新确认网关状态")
+            return None
+        finally:
+            receiver.cancel()
+            watcher.cancel()
+            await asyncio.gather(receiver, watcher, return_exceptions=True)
 
     def stream(self, body, emit, cancelled):
         return asyncio.run(self._stream(body, emit, cancelled))

@@ -1,15 +1,16 @@
 """Desktop shell: local lifecycle, remote administration and API playground."""
 import json
 import threading
+import time
 from pathlib import Path
 
 from dotenv import dotenv_values
 from pydantic import ValidationError
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QCompleter, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QTableWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -65,11 +66,26 @@ def fill(widget, rows):
 
 
 class MainWindow(QMainWindow):
+    OVERVIEW_INTERVAL = 15
+    MODEL_INTERVAL = 60
+
     def __init__(self, workspace):
         super().__init__()
         self.setWindowTitle("Freelance · 模型网关")
         self.resize(1100, 820)
         self.worker = None
+        self.status_worker = None
+        self._status_generation = 0
+        self._last_status = None
+        self._connected = False
+        self._runtime_api_key = None
+        self._needs_load = True
+        self._load_config = False
+        self._load_user_requested = False
+        self._next_overview_at = 0
+        self._next_models_at = 0
+        self._close_after_status = False
+        self._restart_timer_after_cancel = False
         self.configuration = None
         self.local_store = None
         self.local_gateway = None
@@ -100,10 +116,14 @@ class MainWindow(QMainWindow):
         self.url = QLineEdit("http://127.0.0.1:8000")
         connection_layout.addRow("网关地址", self.url)
         self.gateway_key = QLineEdit()
-        self.gateway_key.setEchoMode(QLineEdit.EchoMode.Password)
-        connection_layout.addRow("调用 Key", self.gateway_key)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.gateway_key)
+        self.regenerate_button = QPushButton("重新生成 Key")
+        self.regenerate_button.setToolTip("生成并保存本地网关 API_KEY；重启后生效")
+        self.regenerate_button.clicked.connect(self.regenerate_key)
+        key_row.addWidget(self.regenerate_button)
+        connection_layout.addRow("调用 Key", key_row)
         self.admin_key = QLineEdit()
-        self.admin_key.setEchoMode(QLineEdit.EchoMode.Password)
         connection_layout.addRow("管理员 Key", self.admin_key)
         self.gateway_key.setPlaceholderText("远程模式：输入 API_KEY")
         self.admin_key.setPlaceholderText("远程配置管理：输入 ADMIN_API_KEY")
@@ -111,7 +131,7 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("启动本地网关")
         self.stop_button = QPushButton("停止本地网关")
         self.restart_button = QPushButton("重启本地网关")
-        self.refresh_button = QPushButton("连接 / 刷新")
+        self.refresh_button = QPushButton("连接")
         for button in (self.start_button, self.stop_button, self.restart_button, self.refresh_button):
             controls.addWidget(button)
         connection_layout.addRow(controls)
@@ -119,6 +139,8 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(lambda: self.lifecycle("stop"))
         self.restart_button.clicked.connect(lambda: self.lifecycle("restart"))
         self.refresh_button.clicked.connect(self.refresh)
+        for field in (self.url, self.gateway_key, self.admin_key):
+            field.textEdited.connect(self.connection_edited)
         layout.addWidget(self.connection)
         self.notice = QLabel("选择本地模式配置供应商，或输入远程网关地址连接。")
         self.notice.setWordWrap(True)
@@ -127,7 +149,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs, 1)
         self.build_overview()
         self.build_providers()
-        self.build_aliases()
         self.build_playground()
         self.build_help()
         self.mode.currentIndexChanged.connect(self.mode_changed)
@@ -142,10 +163,16 @@ class MainWindow(QMainWindow):
     def is_local(self):
         return self.mode.currentIndex() == 0
 
-    def page(self, name):
+    def page(self, name, scroll=False):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        self.tabs.addTab(widget, name)
+        if scroll:
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setWidget(widget)
+            self.tabs.addTab(area, name)
+        else:
+            self.tabs.addTab(widget, name)
         return layout
 
     def build_overview(self):
@@ -166,8 +193,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.logs)
 
     def build_providers(self):
-        layout = self.page("供应商配置")
+        layout = self.page("供应商配置", scroll=True)
+        self.reload_button = QPushButton("重新加载本地配置")
+        self.reload_button.clicked.connect(self.reload_config)
+        layout.addWidget(self.reload_button)
         self.provider_table = table(["名称", "地址", "默认模型", "超时秒", "Key 状态"])
+        self.provider_table.setMinimumHeight(100)
+        self.provider_table.setMaximumHeight(150)
         self.provider_table.itemSelectionChanged.connect(self.select_provider)
         layout.addWidget(self.provider_table)
         form = QFormLayout()
@@ -182,7 +214,6 @@ class MainWindow(QMainWindow):
         self.provider_timeout.setRange(1, 3600)
         self.provider_timeout.setValue(120)
         self.provider_key = QLineEdit()
-        self.provider_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.provider_key.setPlaceholderText("留空保留现有 Key；多个 Key 用英文逗号分隔")
         self.clear_key = QCheckBox("清空现有 Key（停用该供应商的调用凭据）")
         for label, widget in (("供应商名称", self.provider_name), ("Base URL", self.provider_url),
@@ -194,12 +225,20 @@ class MainWindow(QMainWindow):
         save.clicked.connect(self.save_provider)
         layout.addWidget(save)
         layout.addWidget(QLabel("保存后需要重启。修改已有供应商会保留高级参数；配置文件会重排 YAML 并保留一份备份。"))
+        self.alias_toggle = QPushButton("高级配置：模型别名")
+        self.alias_toggle.setCheckable(True)
+        layout.addWidget(self.alias_toggle)
+        self.alias_box = QGroupBox("模型别名")
+        self.build_aliases(QVBoxLayout(self.alias_box))
+        layout.addWidget(self.alias_box)
+        self.alias_box.hide()
+        self.alias_toggle.toggled.connect(self.alias_box.setVisible)
+        layout.addStretch()
 
-    def build_aliases(self):
-        layout = self.page("模型与别名")
-        self.models_table = table(["可调用名称", "归属", "路由类型 / 评分"])
-        layout.addWidget(self.models_table)
+    def build_aliases(self, layout):
         self.alias_table = table(["客户端别名", "供应商", "上游模型"])
+        self.alias_table.setMinimumHeight(100)
+        self.alias_table.setMaximumHeight(180)
         self.alias_table.itemSelectionChanged.connect(self.select_alias)
         layout.addWidget(self.alias_table)
         form = QFormLayout()
@@ -219,9 +258,14 @@ class MainWindow(QMainWindow):
 
     def build_playground(self):
         layout = self.page("调用测试")
+        self.playground_page = layout.parentWidget()
         top = QHBoxLayout()
         self.test_model = QComboBox()
         self.test_model.setEditable(True)
+        self.test_model.setPlaceholderText("搜索或输入模型名称 / 别名")
+        self.test_model.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self.test_model.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.test_model.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self.test_model.addItem("auto")
         self.multi = QCheckBox("多模型独立回答（使用各供应商默认模型）")
         top.addWidget(QLabel("模型"))
@@ -285,18 +329,33 @@ class MainWindow(QMainWindow):
             self.mode_changed()
 
     def mode_changed(self):
+        self.invalidate_status()
+        previous_root = self.local_gateway.root if self.local_gateway else None
+        active_key = self._runtime_api_key
+        self._last_status = None
+        self._connected = False
+        self._needs_load = True
+        self._load_config = False
+        self._load_user_requested = False
+        self._next_overview_at = self._next_models_at = 0
         self.configuration = None
         fill(self.provider_table, [])
         fill(self.alias_table, [])
         fill(self.health_table, [])
         fill(self.metrics_table, [])
-        fill(self.models_table, [])
+        self.test_model.clear()
+        self.test_model.addItem("auto")
         self.gateway_key.clear()
         self.admin_key.clear()
         self.provider_key.clear()
         self.url.setReadOnly(self.is_local)
         for widget in (self.workspace, self.choose_button, self.port, self.start_button, self.stop_button, self.restart_button):
             widget.setEnabled(self.is_local)
+        for button in (self.start_button, self.stop_button, self.restart_button, self.reload_button):
+            button.setVisible(self.is_local)
+        self.refresh_button.setVisible(not self.is_local)
+        self.regenerate_button.setVisible(self.is_local)
+        self.regenerate_button.setEnabled(False)
         # Workspace selection is explicit to avoid switching while a process is running.
         self.workspace.setReadOnly(True)
         if self.is_local:
@@ -304,6 +363,7 @@ class MainWindow(QMainWindow):
                 root, keys = prepare_workspace(self.workspace.text())
                 self.local_store = ConfigStore(root / "config.yaml")
                 self.local_gateway = LocalGateway(root)
+                self._runtime_api_key = active_key if previous_root == root and self.local_gateway.owned_process() else None
                 runtime_revision = self.local_gateway.runtime_revision()
                 if runtime_revision:
                     self.local_store.runtime_revision = runtime_revision
@@ -312,22 +372,62 @@ class MainWindow(QMainWindow):
                     self.port.setValue(existing_port)
                 self.gateway_key.setText(keys["API_KEY"])
                 self.admin_key.setText(keys["ADMIN_API_KEY"])
+                self.regenerate_button.setEnabled("API_KEY" not in self.local_store.external_env_names)
                 self.local_url()
                 self.apply_config(self.local_store.read())
                 self.notice.setText("本地配置已加载，可先配置供应商，再启动网关。")
             except (OSError, ValueError):
                 self.problem("无法加载本地配置，请检查目录权限和 YAML 格式")
         else:
+            self._runtime_api_key = active_key
             self.notice.setText("输入远程地址和调用 Key；修改配置另需管理员 Key。")
         self.update_help()
 
     def local_url(self):
+        self.invalidate_status()
         if self.is_local:
             self.url.setText(f"http://127.0.0.1:{self.port.value()}")
         self.update_help()
 
+    def connection_edited(self):
+        if not self.is_local:
+            self.invalidate_status()
+            self._connected = False
+            self._last_status = None
+            self.configuration = None
+            self.notice.setText("连接信息已修改，请点击连接。")
+
+    def reload_config(self):
+        if self.is_local and self.local_store and not self.worker:
+            self.run(lambda worker: self.local_store.read(), self.apply_config)
+
+    def regenerate_key(self):
+        if not self.is_local or not self.local_store or not self.configuration or self.worker:
+            return
+        store = self.local_store
+        revision = self.configuration["revision"]
+        active_key = self.client().api_key if self.local_gateway and self.local_gateway.owned_process() else None
+
+        def done(result):
+            self._runtime_api_key = active_key
+            self.gateway_key.setText(result["api_key"])
+            self.apply_config(result["configuration"])
+            self.notice.setText("新调用 Key 已生成并保存到 .env，启动或重启后生效。" +
+                                ("当前连接继续使用运行中的旧 Key。" if active_key is not None else ""))
+        self.run(lambda worker: store.regenerate_gateway_key(revision), done)
+
+    def request_load(self, config=False):
+        self.invalidate_status()
+        self._needs_load = True
+        self._load_config = config
+        self._load_user_requested = True
+        self._last_status = None
+        self._next_overview_at = self._next_models_at = 0
+        QTimer.singleShot(0, self.poll_status)
+
     def client(self):
-        return GatewayClient(self.url.text(), self.gateway_key.text(), self.admin_key.text())
+        key = self._runtime_api_key if self.is_local and self._runtime_api_key is not None else self.gateway_key.text()
+        return GatewayClient(self.url.text(), key, self.admin_key.text())
 
     def problem(self, message):
         for widget in (self.gateway_key, self.admin_key, self.provider_key):
@@ -337,15 +437,21 @@ class MainWindow(QMainWindow):
         self.notice.setText(message)
         QMessageBox.warning(self, "操作未完成", message)
 
+    def invalidate_status(self):
+        self._status_generation += 1
+        if self.status_worker:
+            self.status_worker.cancelled.set()
+
     def run(self, operation, done, stream=False, quiet=False):
         if self.worker:
             return
+        self.invalidate_status()
         self.connection.setEnabled(False)
         self.tabs.setEnabled(False)
         if stream:
             self.tabs.setEnabled(True)
             for index in range(self.tabs.count()):
-                self.tabs.setTabEnabled(index, index == 3)
+                self.tabs.setTabEnabled(index, self.tabs.widget(index) is self.playground_page)
             self.prompt.setEnabled(False)
             self.test_model.setEnabled(False)
             self.multi.setEnabled(False)
@@ -370,6 +476,8 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         if worker:
             worker.deleteLater()
+        if self._needs_load and self._load_user_requested:
+            QTimer.singleShot(0, self.poll_status)
 
     def append_output(self, text):
         cursor = self.output.textCursor()
@@ -398,87 +506,135 @@ class MainWindow(QMainWindow):
 
         def done(result):
             if "port" in result:
+                if result.get("started", True):
+                    self._runtime_api_key = None
                 self.port.setValue(result["port"])
                 self.local_store.runtime_revision = gateway.runtime_revision() or self.local_store.revision()
                 self.apply_config(self.local_store.read())
+                self.request_load()
+            else:
+                self._runtime_api_key = None
+                self._last_status = None
+                self._needs_load = False
+                fill(self.health_table, [])
+                fill(self.metrics_table, [])
+                self.summary.setText("本地网关已停止。")
             self.notice.setText(result["message"])
             self.port.setEnabled(not bool(gateway.owned_process()))
         self.run(operation, done)
 
     def poll_status(self):
-        if self.worker or not self.is_local or not self.local_gateway:
+        if self.worker or self.status_worker or self._close_after_status:
             return
-        if not self.local_gateway.owned_process():
-            if self.local_gateway.child and self.local_gateway.child.poll() is not None and self.local_gateway.state_path.exists():
-                self.notice.setText("本地网关进程已退出，请查看启动日志；可修正配置后重新启动。")
+        if self.is_local:
+            if not self.local_gateway or not self.local_gateway.owned_process():
+                if self.local_gateway and self.local_gateway.child and self.local_gateway.child.poll() is not None and self.local_gateway.state_path.exists():
+                    self.notice.setText("本地网关进程已退出，请查看启动日志；可修正配置后重新启动。")
+                return
+        elif not self._connected:
             return
         try:
             client = self.client()
         except ValueError:
             return
-        if not client.admin_key:
-            return
+        generation = self._status_generation
+        gateway = self.local_gateway
+        local = self.is_local
+        loading = self._last_status == "ready" and (self._needs_load or time.monotonic() >= self._next_overview_at)
+        include_models = self._needs_load or time.monotonic() >= self._next_models_at
+        include_config = self._load_config
+        worker = Worker(lambda task: client.overview(task.cancelled, include_models, include_config) if loading
+                        else client.status(task.cancelled), self)
+        self.status_worker = worker
+
+        def current():
+            return (generation == self._status_generation and gateway is self.local_gateway
+                    and local == self.is_local and not self.worker and not worker.cancelled.is_set()
+                    and client.url == self.url.text().rstrip("/") and client.admin_key == self.admin_key.text()
+                    and client.api_key == (self._runtime_api_key if self.is_local and self._runtime_api_key is not None else self.gateway_key.text()))
+
         def done(result):
-            self.notice.setText("本地网关：" + result["status"] + ("；配置修改待重启" if self.configuration and self.configuration.get("pending_restart") else ""))
-            if result["status"] == "ready":
-                self.summary.setText("本地网关已就绪。点击“连接 / 刷新”加载运行概览和模型列表。统计为单进程累计值。")
-        self.run(lambda worker: client.request("GET", "/admin/status", admin=True), done, quiet=True)
+            if not current() or not isinstance(result, dict):
+                return
+            state = result.get("state", result.get("status"))
+            if state != self._last_status:
+                self._last_status = state
+                self.notice.setText(("本地" if local else "远程") + "网关：" + str(state))
+                if state == "ready":
+                    self._needs_load = True
+                    self.summary.setText("网关已就绪，正在自动加载运行数据…")
+                else:
+                    self.summary.setText("网关：" + str(state) + "；就绪后自动加载数据。")
+            if loading and state == "ready" and "snapshot" in result:
+                if result.get("config"):
+                    self.apply_config(result["config"])
+                self.apply_runtime(result, client)
+                self._needs_load = self._load_config = False
+                self._next_overview_at = time.monotonic() + self.OVERVIEW_INTERVAL
+                if "models" in result:
+                    self._next_models_at = time.monotonic() + self.MODEL_INTERVAL
+                if self._load_user_requested:
+                    self.notice.setText("网关已就绪，运行数据已加载。" + ("配置修改待重启。" if self.configuration and self.configuration.get("pending_restart") else ""))
+                self._load_user_requested = False
+
+        def failed(message):
+            if not current():
+                return
+            if loading:
+                self._needs_load = False
+                self._next_overview_at = time.monotonic() + self.OVERVIEW_INTERVAL
+                self.summary.setText("网关已就绪，但运行数据加载失败；稍后自动重试，或点击启动 / 连接重试。")
+                if self._load_user_requested:
+                    self.notice.setText(self.summary.text())
+                self._load_user_requested = False
+            elif self._last_status != "unreachable":
+                self._last_status = "unreachable"
+                self.notice.setText(message)
+
+        worker.result.connect(done)
+        worker.error.connect(failed)
+        worker.finished.connect(lambda: self.status_finished(worker))
+        worker.start()
+
+    def status_finished(self, worker):
+        if self.status_worker is worker:
+            self.status_worker = None
+        worker.deleteLater()
+        if self._close_after_status:
+            self._close_after_status = False
+            QTimer.singleShot(0, self.close)
+        elif self._needs_load and self._last_status == "ready":
+            QTimer.singleShot(0, self.poll_status)
 
     def refresh(self):
-        if self.worker:
+        if self.worker or self.is_local:
             return
-        if self.is_local and self.local_store:
-            try:
-                self.apply_config(self.local_store.read())
-            except (OSError, ValueError):
-                self.problem("无法读取本地配置，请检查文件格式与权限")
-                return
-            if not self.local_gateway or not self.local_gateway.owned_process():
-                self.notice.setText("本地配置已刷新；启动网关后可加载运行状态。" + ("配置修改待重启。" if self.configuration["pending_restart"] else ""))
-                return
         try:
             client = self.client()
         except ValueError as exc:
             self.problem(str(exc))
             return
-        self.notice.setText("正在连接网关…")
+        self._connected = True
+        self.url.setText(client.url)
+        self.notice.setText("正在连接远程网关，就绪后自动加载数据…")
         self.update_help()
+        self.request_load(config=True)
 
-        def operation(worker):
-            # Non-admin users can inspect the existing API and test calls.
-            if client.admin_key:
-                state = client.request("GET", "/admin/status", admin=True)
-                if state["status"] != "ready":
-                    return {"state": state["status"]}
-                config = client.request("GET", "/admin/config", admin=True)
-                snap = client.request("GET", "/admin/snapshot", admin=True)
-            else:
-                client.request("GET", "/health")
-                config = None
-                health = client.request("GET", "/health/providers")
-                snap = {"providers": [{"provider": name, "available_keys": item["usable_keys"],
-                                        "key_count": item["total_keys"], "cooldown_remaining_seconds": item["melted_remaining_s"],
-                                        "consecutive_failures": item["consecutive_failures"]} for name, item in health["providers"].items()], "metrics": []}
-            models = client.request("GET", "/v1/models")
-            return {"state": "ready", "config": config, "snapshot": snap, "models": models}
-
-        def done(result):
-            self.notice.setText("网关：" + result["state"])
-            if result["state"] != "ready":
-                return
-            if result["config"]:
-                self.apply_config(result["config"])
-            snap = result["snapshot"]
-            fill(self.health_table, [[p.get(k) for k in ("provider", "available_keys", "key_count", "cooldown_remaining_seconds", "consecutive_failures")] for p in snap["providers"]])
-            fill(self.metrics_table, [[m.get(k) for k in ("target", "request_count", "success_count", "error_count", "avg_latency_ms")] for m in snap["metrics"]])
+    def apply_runtime(self, result, client):
+        snap = result["snapshot"]
+        fill(self.health_table, [[p.get(k) for k in ("provider", "available_keys", "key_count", "cooldown_remaining_seconds", "consecutive_failures")] for p in snap["providers"]])
+        fill(self.metrics_table, [[m.get(k) for k in ("target", "request_count", "success_count", "error_count", "avg_latency_ms")] for m in snap["metrics"]])
+        if "models" in result and not self.test_model.hasFocus() and not self.test_model.view().isVisible():
             models = result["models"].get("data", [])
-            fill(self.models_table, [[m.get("id"), m.get("owned_by"), m.get("routing_type", m.get("score", "—"))] for m in models])
             selected = self.test_model.currentText()
             self.test_model.clear()
-            self.test_model.addItems([m["id"] for m in models])
+            for model in models:
+                self.test_model.addItem(model["id"], model)
+                self.test_model.setItemData(self.test_model.count() - 1,
+                                           "归属：" + str(model.get("owned_by", "—")) + "；路由：" + str(model.get("routing_type", "真实模型")),
+                                           Qt.ItemDataRole.ToolTipRole)
             self.test_model.setCurrentText(selected or "auto")
-            self.summary.setText("已连接。统计为单进程累计值；流式成功计数可能仅代表首包。" + ("没有管理员 Key，配置管理不可用。" if not client.admin_key else ""))
-        self.run(operation, done)
+        self.summary.setText("已连接，运行概览自动更新。统计为单进程累计值；流式成功计数可能仅代表首包。" + ("没有管理员 Key，配置管理不可用。" if not client.admin_key else ""))
 
     def apply_config(self, configuration):
         self.configuration = configuration
@@ -508,6 +664,11 @@ class MainWindow(QMainWindow):
         self.provider_timeout.setValue(int(config["timeout"]))
         self.provider_key.clear()
         self.clear_key.setChecked(False)
+        if self.is_local and self.local_store:
+            try:
+                self.provider_key.setText(self.local_store.provider_key(name))
+            except (OSError, ValueError):
+                self.notice.setText("无法读取本地供应商 Key，请检查配置文件。")
 
     def apply_template(self, label):
         name, url = TEMPLATES[label]
@@ -554,12 +715,19 @@ class MainWindow(QMainWindow):
 
     def save_provider(self):
         try:
-            edit = ProviderEdit(name=self.provider_name.text().strip(), base_url=self.provider_url.text().strip(),
+            name = self.provider_name.text().strip()
+            key = "" if self.clear_key.isChecked() else self.provider_key.text().strip() or None
+            if key is not None and not self.clear_key.isChecked() and self.is_local and self.local_store:
+                if key == self.local_store.provider_key(name):
+                    key = None
+            edit = ProviderEdit(name=name, base_url=self.provider_url.text().strip(),
                                 default_model=self.provider_model.text().strip(), timeout=self.provider_timeout.value(),
-                                api_key="" if self.clear_key.isChecked() else self.provider_key.text().strip() or None)
+                                api_key=key)
             self.save_change("provider", edit)
         except ValidationError:
             self.problem("供应商输入无效，请检查名称、地址和 Key；地址不能包含凭据或查询参数")
+        except (ValueError, OSError):
+            self.problem("无法读取供应商配置，请重新加载后再保存")
 
     def save_alias(self):
         try:
@@ -618,6 +786,13 @@ class MainWindow(QMainWindow):
             self.notice.setText("请等待当前操作结束；流式测试可先取消接收。")
             event.ignore()
             return
+        if self.status_worker:
+            self._restart_timer_after_cancel = self.timer.isActive()
+            self.timer.stop()
+            self._close_after_status = True
+            self.invalidate_status()
+            event.ignore()
+            return
         if self.local_gateway and self.local_gateway.owned_process():
             box = QMessageBox(self)
             box.setWindowTitle("关闭客户端")
@@ -631,6 +806,9 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if box.clickedButton() != keep:
+                if self._restart_timer_after_cancel:
+                    self.timer.start()
+                    self._restart_timer_after_cancel = False
                 event.ignore()
                 return
         self.timer.stop()

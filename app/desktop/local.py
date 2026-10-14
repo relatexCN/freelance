@@ -70,7 +70,7 @@ class LocalGateway:
     def start(self, port):
         existing = self.owned_process()
         if existing:
-            return {"port": self.port(), "message": "已连接桌面客户端启动的后台网关"}
+            return {"port": self.port(), "started": False, "message": "已连接桌面客户端启动的后台网关"}
         with socket.socket() as probe:
             try:
                 probe.bind(("127.0.0.1", port))
@@ -94,7 +94,7 @@ class LocalGateway:
             self.child.terminate()
             self.child.wait(timeout=5)
             raise ValueError("无法保存网关进程状态") from None
-        return {"port": port, "message": "网关进程已启动，正在等待就绪"}
+        return {"port": port, "started": True, "message": "网关进程已启动，正在等待就绪"}
 
     def stop(self):
         process = self.owned_process()
