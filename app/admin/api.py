@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import config, find_config_file, ENV_PATH, EXTERNAL_ENV_NAMES
 from app.manager_agent.monitor import snapshot
-from .store import ConfigStore, ConflictError, ProviderEdit, AliasEdit
+from .store import ConfigStore, ConflictError, ProviderEdit, AliasEdit, RankingEdit
 
 
 store = ConfigStore(find_config_file("config.yaml"), ENV_PATH, EXTERNAL_ENV_NAMES)
@@ -42,6 +42,12 @@ class AliasDelete(BaseModel):
     alias: str
 
 
+class RankingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    revision: str = Field(min_length=64, max_length=64)
+    ranking: RankingEdit
+
+
 def perform(operation):
     try:
         return operation()
@@ -75,6 +81,11 @@ def update_provider(body: ProviderUpdate):
 @router.put("/aliases")
 def update_alias(body: AliasUpdate):
     return perform(lambda: store.alias(body.revision, body.route))
+
+
+@router.put("/ranking")
+def update_ranking(body: RankingUpdate):
+    return perform(lambda: store.ranking(body.revision, body.ranking))
 
 
 @router.delete("/aliases")

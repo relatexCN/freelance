@@ -721,6 +721,8 @@ settings:
 
 可以用 `auto_routing.custom_ranking` 显式指定 `auto/free/best-free` 的优先调用顺序：
 
+桌面版也可在“供应商配置 → 自动路由：模型优先级”添加模型、调整顺序或恢复默认排序，点击“保存优先级”后重启网关生效。本地直接保存配置，远程模式使用管理员 Key 调用管理接口。
+
 ```yaml
 auto_routing:
   custom_ranking:

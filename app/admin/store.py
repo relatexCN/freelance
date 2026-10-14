@@ -61,6 +61,46 @@ class AliasEdit(BaseModel):
         return value
 
 
+class RankingRoute(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    provider: str = Field(min_length=1, max_length=64)
+    model: str = Field(min_length=1, max_length=300)
+
+
+class RankingEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    custom_ranking: list[RankingRoute] = Field(max_length=1000)
+
+
+def read_ranking(raw):
+    """Normalize the backend's dict, alias and provider:model input forms."""
+    routing = raw.get("auto_routing") or {}
+    if not isinstance(routing, dict):
+        raise ValueError("Invalid auto-routing configuration")
+    entries = routing.get("custom_ranking") or []
+    if not isinstance(entries, list):
+        raise ValueError("Invalid model ranking")
+    result, seen = [], set()
+    for entry in entries:
+        if isinstance(entry, str):
+            alias = raw.get("models", {}).get(entry.strip())
+            if isinstance(alias, dict):
+                entry = {"provider": alias.get("provider", ""), "model": alias.get("model", "")}
+            elif ":" in entry:
+                provider, model = entry.split(":", 1)
+                entry = {"provider": provider, "model": model}
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid model ranking entry")
+        route = RankingRoute(provider=str(entry.get("provider", "")), model=str(entry.get("model", "")))
+        if route.provider not in raw.get("providers", {}):
+            raise ValueError("Unknown provider in model ranking")
+        pair = (route.provider, route.model)
+        if pair not in seen:
+            result.append(route.model_dump())
+            seen.add(pair)
+    return result
+
+
 def atomic_write(path: Path, data: bytes):
     """Replace atomically; POSIX mode is private, Windows inherits directory ACLs."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,7 +247,8 @@ class ConfigStore:
                        for name, value in raw.get("models", {}).items() if isinstance(value, dict)}
             revision = self.revision()
             return {"revision": revision, "pending_restart": revision != self.runtime_revision,
-                    "providers": providers, "models": aliases}
+                    "providers": providers, "models": aliases,
+                    "auto_routing": {"custom_ranking": read_ranking(raw)}}
 
     def _save(self, revision, change, env_change=None):
         with self._lock, file_lock(self.path.with_name(".freelance-config.lock")):
@@ -275,9 +316,24 @@ class ConfigStore:
             raw.setdefault("models", {})[edit.alias] = {"provider": edit.provider, "model": edit.model}
         return self._save(revision, change)
 
+    def ranking(self, revision, edit: RankingEdit):
+        def change(raw):
+            routing = raw.get("auto_routing") or {}
+            if not isinstance(routing, dict):
+                raise ValueError("Invalid auto-routing configuration")
+            # Keep unrelated routing options, providers, aliases and credentials.
+            routing["custom_ranking"] = [route.model_dump() for route in edit.custom_ranking]
+            raw["auto_routing"] = routing
+            routing["custom_ranking"] = read_ranking(raw)
+        return self._save(revision, change)
+
     def delete_alias(self, revision, alias):
         def change(raw):
             if alias not in raw.get("models", {}):
                 raise ValueError("Unknown alias")
+            routing = raw.get("auto_routing") or {}
+            if alias in routing.get("custom_ranking", []):
+                # Preserve an alias-backed priority when its display alias is removed.
+                routing["custom_ranking"] = read_ranking(raw)
             del raw["models"][alias]
         return self._save(revision, change)

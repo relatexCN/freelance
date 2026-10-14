@@ -88,12 +88,17 @@ def main():
                     raise RuntimeError("Frozen backend failed: " + gateway.log_tail())
                 assert LocalGateway(root).port() == port
                 assert client.request("GET", "/v1/models")["object"] == "list"
-                assert "providers" in client.request("GET", "/admin/config", admin=True)
+                configuration = client.request("GET", "/admin/config", admin=True)
+                assert "providers" in configuration
+                assert configuration["auto_routing"]["custom_ranking"] == []
+                saved = client.request("PUT", "/admin/ranking", {
+                    "revision": configuration["revision"], "ranking": {"custom_ranking": []}}, admin=True)
+                assert saved["auto_routing"]["custom_ranking"] == []
                 loaded = client.overview(threading.Event(), include_models=True, include_config=True)
                 assert loaded["state"] == "ready" and "snapshot" in loaded and "models" in loaded and "config" in loaded
                 gateway.stop()
                 assert gateway.owned_process() is None
-                print("Frozen local backend, API, reconnect and stop passed")
+                print("Frozen local backend, ranking API, reconnect and stop passed")
             finally:
                 gateway.stop()
 

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from app.admin.store import AliasEdit, ConfigStore, ProviderEdit
+from app.admin.store import AliasEdit, ConfigStore, ProviderEdit, RankingEdit
 from .client import GatewayClient
 from .local import LocalGateway, prepare_workspace
 
@@ -225,6 +225,9 @@ class MainWindow(QMainWindow):
         save.clicked.connect(self.save_provider)
         layout.addWidget(save)
         layout.addWidget(QLabel("保存后需要重启。修改已有供应商会保留高级参数；配置文件会重排 YAML 并保留一份备份。"))
+        ranking_box = QGroupBox("自动路由：模型优先级")
+        self.build_ranking(QVBoxLayout(ranking_box))
+        layout.addWidget(ranking_box)
         self.alias_toggle = QPushButton("高级配置：模型别名")
         self.alias_toggle.setCheckable(True)
         layout.addWidget(self.alias_toggle)
@@ -234,6 +237,80 @@ class MainWindow(QMainWindow):
         self.alias_box.hide()
         self.alias_toggle.toggled.connect(self.alias_box.setVisible)
         layout.addStretch()
+
+    def build_ranking(self, layout):
+        description = QLabel("从上到下优先尝试，失败后继续默认候选。仅作用于 auto / free / best-free；保存后重启生效。")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.ranking_table = table(["供应商", "上游模型（首行优先）"])
+        self.ranking_table.setMinimumHeight(100)
+        self.ranking_table.setMaximumHeight(180)
+        layout.addWidget(self.ranking_table)
+        form = QFormLayout()
+        self.ranking_provider, self.ranking_model = QComboBox(), QLineEdit()
+        self.ranking_provider.currentTextChanged.connect(self.ranking_default_model)
+        self.ranking_model.setPlaceholderText("填写上游真实模型 ID，可使用未被模型发现列出的模型")
+        form.addRow("供应商", self.ranking_provider)
+        form.addRow("上游模型 ID", self.ranking_model)
+        layout.addLayout(form)
+        buttons = QHBoxLayout()
+        for label, action in (("添加", self.add_ranking), ("移除", self.remove_ranking),
+                              ("上移", lambda: self.move_ranking(-1)), ("下移", lambda: self.move_ranking(1)),
+                              ("恢复默认排序", lambda: fill(self.ranking_table, [])),
+                              ("保存优先级", self.save_ranking)):
+            button = QPushButton(label)
+            button.clicked.connect(action)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        layout.addWidget(QLabel("空列表表示默认排序；添加、调整或恢复默认后，点击“保存优先级”。"))
+
+    def ranking_rows(self):
+        return [[self.ranking_table.item(row, column).text() for column in range(2)]
+                for row in range(self.ranking_table.rowCount())]
+
+    def ranking_default_model(self, provider):
+        if self.configuration:
+            self.ranking_model.setText(self.configuration["providers"].get(provider, {}).get("default_model", ""))
+
+    def add_ranking(self):
+        if not self.configuration:
+            self.problem("请先加载配置；远程模式需要管理员 Key")
+            return
+        row = [self.ranking_provider.currentText(), self.ranking_model.text().strip()]
+        if not all(row):
+            self.problem("请选择供应商并填写上游模型 ID")
+            return
+        rows = self.ranking_rows()
+        if row in rows:
+            self.problem("该供应商与模型已在优先级列表中")
+            return
+        fill(self.ranking_table, [*rows, row])
+        self.ranking_table.setCurrentCell(len(rows), 0)
+
+    def remove_ranking(self):
+        row = self.ranking_table.currentRow()
+        rows = self.ranking_rows()
+        if 0 <= row < len(rows):
+            rows.pop(row)
+            fill(self.ranking_table, rows)
+            if rows:
+                self.ranking_table.setCurrentCell(min(row, len(rows) - 1), 0)
+
+    def move_ranking(self, offset):
+        row = self.ranking_table.currentRow()
+        rows = self.ranking_rows()
+        target = row + offset
+        if 0 <= row < len(rows) and 0 <= target < len(rows):
+            rows[row], rows[target] = rows[target], rows[row]
+            fill(self.ranking_table, rows)
+            self.ranking_table.setCurrentCell(target, 0)
+
+    def save_ranking(self):
+        try:
+            edit = RankingEdit(custom_ranking=[{"provider": p, "model": m} for p, m in self.ranking_rows()])
+            self.save_change("ranking", edit)
+        except ValidationError:
+            self.problem("优先级输入无效，请检查供应商和模型 ID")
 
     def build_aliases(self, layout):
         self.alias_table = table(["客户端别名", "供应商", "上游模型"])
@@ -341,6 +418,9 @@ class MainWindow(QMainWindow):
         self.configuration = None
         fill(self.provider_table, [])
         fill(self.alias_table, [])
+        fill(self.ranking_table, [])
+        self.ranking_provider.clear()
+        self.ranking_model.clear()
         fill(self.health_table, [])
         fill(self.metrics_table, [])
         self.test_model.clear()
@@ -646,6 +726,10 @@ class MainWindow(QMainWindow):
         fill(self.alias_table, [[name, item["provider"], item["model"]] for name, item in configuration["models"].items()])
         self.alias_provider.clear()
         self.alias_provider.addItems(list(configuration["providers"]))
+        fill(self.ranking_table, [[item["provider"], item["model"]]
+                                 for item in configuration.get("auto_routing", {}).get("custom_ranking", [])])
+        self.ranking_provider.clear()
+        self.ranking_provider.addItems(list(configuration["providers"]))
         if configuration["pending_restart"]:
             self.notice.setText("配置已保存，重启后生效。远程服务请通过服务器 CLI 或服务管理器重启。")
 
@@ -701,11 +785,15 @@ class MainWindow(QMainWindow):
 
         def operation(worker):
             if local:
+                if kind == "ranking":
+                    return store.ranking(revision, edit)
                 if kind == "provider":
                     return store.provider(revision, edit)
                 if kind == "alias":
                     return store.alias(revision, edit)
                 return store.delete_alias(revision, edit)
+            if kind == "ranking":
+                return client.request("PUT", "/admin/ranking", {"revision": revision, "ranking": edit.model_dump()}, admin=True)
             if kind == "provider":
                 return client.request("PUT", "/admin/providers", {"revision": revision, "provider": edit.model_dump()}, admin=True)
             if kind == "alias":
