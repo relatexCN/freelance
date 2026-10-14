@@ -23,14 +23,14 @@ def prepare_workspace(directory):
     values = dotenv_values(env_path) if env_path.exists() else {}
     # Do not rewrite an existing deployment or silently rotate existing keys.
     additions = []
-    for variable in ("API_KEY", "ADMIN_API_KEY"):
+    for variable in ("API_KEY",):
         if variable not in values and variable not in os.environ:
             additions.append(f"{variable}=sk-freelance-{secrets.token_urlsafe(32)}")
     if additions:
         content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
         atomic_write(env_path, (content.rstrip() + "\n" + "\n".join(additions) + "\n").encode())
     values = dotenv_values(env_path)
-    return root, {name: os.environ.get(name, values.get(name, "") or "") for name in ("API_KEY", "ADMIN_API_KEY")}
+    return root, {name: os.environ.get(name, values.get(name, "") or "") for name in ("API_KEY",)}
 
 
 class LocalGateway:

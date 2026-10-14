@@ -160,7 +160,6 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
     api_key: str = Field(default="", alias="API_KEY")
-    admin_api_key: str = Field(default="", alias="ADMIN_API_KEY")
     api_keys: str = Field(default="", alias="API_KEYS")  # comma-separated string of valid keys
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
     max_iterations: int = Field(default=3, alias="MAX_ITERATIONS")

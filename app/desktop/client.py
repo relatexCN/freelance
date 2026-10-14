@@ -1,4 +1,4 @@
-"""HTTP transport with explicit management/inference credentials and SSE parsing."""
+"""HTTP transport for gateway debugging with inference credentials and SSE parsing."""
 import asyncio
 import json
 from urllib.parse import urlsplit, urlunsplit
@@ -20,12 +20,12 @@ class GatewayClient:
     STATUS_TIMEOUT = 3
     OVERVIEW_TIMEOUT = 8
 
-    def __init__(self, url, api_key="", admin_key=""):
+    def __init__(self, url, api_key=""):
         self.url = normalize_url(url)
-        self.api_key, self.admin_key = api_key, admin_key
+        self.api_key = api_key
 
-    def headers(self, admin=False):
-        key = self.admin_key if admin else self.api_key
+    def headers(self):
+        key = self.api_key
         return {"Authorization": f"Bearer {key}"} if key else {}
 
     @staticmethod
@@ -33,12 +33,12 @@ class GatewayClient:
         if response.is_error:
             # Do not echo raw upstream errors that might contain credentials or prompts.
             messages = {401: "认证失败，请检查对应的 Key", 409: "配置已变化或服务忙，请刷新后重试",
-                        422: "参数无效，请检查输入", 503: "服务未就绪或管理功能未启用"}
+                        422: "参数无效，请检查输入", 503: "服务未就绪，请检查网关启动状态"}
             raise ValueError(messages.get(response.status_code, f"请求失败，HTTP {response.status_code}"))
 
-    def request(self, method, path, body=None, admin=False):
+    def request(self, method, path, body=None):
         with httpx.Client(timeout=httpx.Timeout(120, connect=5), follow_redirects=False) as client:
-            response = client.request(method, self.url + path, json=body, headers=self.headers(admin))
+            response = client.request(method, self.url + path, json=body, headers=self.headers())
             if path == "/v1/chat/completions/multi" and response.status_code in {502, 504}:
                 result = response.json()
                 if isinstance(result, dict) and result.get("status") == "failed" and isinstance(result.get("responses"), list):
@@ -57,21 +57,21 @@ class GatewayClient:
         async def receive():
             async with httpx.AsyncClient(timeout=httpx.Timeout(self.STATUS_TIMEOUT, connect=min(1, self.STATUS_TIMEOUT)),
                                          follow_redirects=False) as client:
-                response = await client.get(self.url + ("/admin/status" if self.admin_key else "/health"),
-                                            headers=self.headers(admin=bool(self.admin_key)))
-                if not self.admin_key and response.status_code == 503:
+                response = await client.get(self.url + "/health",
+                                            headers=self.headers())
+                if response.status_code == 503:
                     state = response.json().get("error", {}).get("code", "").removeprefix("service_")
                     if state in {"starting", "failed", "stopping"}:
                         return {"status": state}
                 self.check(response)
-                return response.json() if self.admin_key else {"status": "ready"}
+                return {"status": "ready"}
 
         return await self._bounded(receive, cancelled, self.STATUS_TIMEOUT)
 
-    def overview(self, cancelled, include_models=True, include_config=False):
-        return asyncio.run(self._overview(cancelled, include_models, include_config))
+    def overview(self, cancelled, include_models=True):
+        return asyncio.run(self._overview(cancelled, include_models))
 
-    async def _overview(self, cancelled, include_models, include_config):
+    async def _overview(self, cancelled, include_models):
         async def receive():
             state = await self._status(cancelled)
             if state is None:
@@ -80,18 +80,15 @@ class GatewayClient:
                 return {"state": state["status"]}
             async with httpx.AsyncClient(timeout=httpx.Timeout(self.OVERVIEW_TIMEOUT, connect=1),
                                          follow_redirects=False) as client:
-                async def get(path, admin=False):
-                    response = await client.get(self.url + path, headers=self.headers(admin))
+                async def get(path):
+                    response = await client.get(self.url + path, headers=self.headers())
                     self.check(response)
                     return response.json()
 
-                paths = [("snapshot", "/admin/snapshot", True)] if self.admin_key else [
-                    ("health", "/health/providers", False), ("stats", "/stats", False)]
+                paths = [("health", "/health/providers"), ("stats", "/stats")]
                 if include_models:
-                    paths.append(("models", "/v1/models", False))
-                if include_config and self.admin_key:
-                    paths.append(("config", "/admin/config", True))
-                tasks = [asyncio.create_task(get(path, admin)) for _, path, admin in paths]
+                    paths.append(("models", "/v1/models"))
+                tasks = [asyncio.create_task(get(path)) for _, path in paths]
                 try:
                     values = await asyncio.gather(*tasks)
                 except Exception:
@@ -100,18 +97,17 @@ class GatewayClient:
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-                result = dict(zip((name for name, _, _ in paths), values))
-                if not self.admin_key:
-                    providers = result.pop("health")["providers"]
-                    stats = result.pop("stats")
-                    result["snapshot"] = {
-                        "providers": [{"provider": name, "available_keys": item["usable_keys"],
-                                       "key_count": item["total_keys"], "cooldown_remaining_seconds": item["melted_remaining_s"],
-                                       "consecutive_failures": item["consecutive_failures"]} for name, item in providers.items()],
-                        "metrics": [{"target": name, **{key: value.get(key) for key in (
-                            "request_count", "success_count", "error_count", "avg_latency_ms")}}
-                            for name, value in stats.items()],
-                    }
+                result = dict(zip((name for name, _ in paths), values))
+                providers = result.pop("health")["providers"]
+                stats = result.pop("stats")
+                result["snapshot"] = {
+                    "providers": [{"provider": name, "available_keys": item["usable_keys"],
+                                   "key_count": item["total_keys"], "cooldown_remaining_seconds": item["melted_remaining_s"],
+                                   "consecutive_failures": item["consecutive_failures"]} for name, item in providers.items()],
+                    "metrics": [{"target": name, **{key: value.get(key) for key in (
+                        "request_count", "success_count", "error_count", "avg_latency_ms")}}
+                        for name, value in stats.items()],
+                }
                 return {"state": "ready", **result}
 
         return await self._bounded(receive, cancelled, self.OVERVIEW_TIMEOUT)

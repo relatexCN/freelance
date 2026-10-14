@@ -8,8 +8,6 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
 
 from app.config import config
 from app.routers import chat, stats
@@ -20,7 +18,7 @@ from app.core.observability import configure_logging, log_event, RequestEventMid
 
 
 def _logging_secrets():
-    keys = [config.settings.api_key, config.settings.admin_api_key]
+    keys = [config.settings.api_key]
     keys.extend(k.strip() for k in config.settings.api_keys.split(","))
     for provider in config.providers.values():
         keys.extend(provider.api_keys)
@@ -236,9 +234,6 @@ app.add_middleware(
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Validate API key if configured."""
-    if request.url.path.startswith("/admin/"):
-        # Administration uses its own required key, never the inference key.
-        return await call_next(request)
     # Skip auth for health check and docs
     if request.url.path in ("/", "/health", "/docs", "/openapi.json", "/redoc"):
         return await call_next(request)
@@ -278,7 +273,7 @@ async def auth_middleware(request: Request, call_next):
 async def readiness_middleware(request: Request, call_next):
     """Do not dispatch requests or return misleading 404s while warming up."""
     status = request.app.state.startup_status
-    if status != "ready" and request.url.path != "/admin/status":
+    if status != "ready":
         messages = {"starting": "服务启动中，请稍后重试。",
                     "failed": "服务启动失败，请检查网关日志。",
                     "stopping": "服务停止中，请稍后重试。"}
@@ -298,17 +293,6 @@ app.include_router(chat.router)
 app.include_router(stats.router)
 from app.manager_agent.api import router as manager_router
 app.include_router(manager_router)
-from app.admin.api import router as admin_router
-app.include_router(admin_router)
-
-
-@app.exception_handler(RequestValidationError)
-async def safe_admin_validation(request: Request, exc: RequestValidationError):
-    if request.url.path.startswith("/admin/"):
-        return JSONResponse(status_code=422, content={"detail": "Invalid administration fields"})
-    return await request_validation_exception_handler(request, exc)
-
-
 @app.get("/")
 async def root():
     """Root endpoint with gateway info."""

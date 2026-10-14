@@ -1,4 +1,4 @@
-"""File-backed configuration edits shared by the desktop and admin API.
+"""File-backed configuration edits for the local desktop client.
 
 Never import app.config here: the desktop must not load backend environment state.
 """

@@ -8,7 +8,7 @@ from dotenv import dotenv_values
 from pydantic import ValidationError
 from PySide6.QtCore import QThread, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QCompleter, QFileDialog, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QCompleter, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
@@ -80,7 +80,6 @@ class MainWindow(QMainWindow):
         self._connected = False
         self._runtime_api_key = None
         self._needs_load = True
-        self._load_config = False
         self._load_user_requested = False
         self._next_overview_at = 0
         self._next_models_at = 0
@@ -101,14 +100,7 @@ class MainWindow(QMainWindow):
         self.mode = QComboBox()
         self.mode.addItems(["本地网关", "远程网关"])
         connection_layout.addRow("运行模式", self.mode)
-        self.workspace = QLineEdit(str(workspace))
-        workspace_row = QHBoxLayout()
-        workspace_row.addWidget(self.workspace)
-        choose = QPushButton("选择目录")
-        choose.clicked.connect(self.choose_workspace)
-        workspace_row.addWidget(choose)
-        self.choose_button = choose
-        connection_layout.addRow("本地配置目录", workspace_row)
+        self._workspace_root = Path(workspace).resolve()
         self.port = QSpinBox()
         self.port.setRange(1024, 65535)
         self.port.setValue(8000)
@@ -123,10 +115,7 @@ class MainWindow(QMainWindow):
         self.regenerate_button.clicked.connect(self.regenerate_key)
         key_row.addWidget(self.regenerate_button)
         connection_layout.addRow("调用 Key", key_row)
-        self.admin_key = QLineEdit()
-        connection_layout.addRow("管理员 Key", self.admin_key)
         self.gateway_key.setPlaceholderText("远程模式：输入 API_KEY")
-        self.admin_key.setPlaceholderText("远程配置管理：输入 ADMIN_API_KEY")
         controls = QHBoxLayout()
         self.start_button = QPushButton("启动本地网关")
         self.stop_button = QPushButton("停止本地网关")
@@ -139,7 +128,7 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(lambda: self.lifecycle("stop"))
         self.restart_button.clicked.connect(lambda: self.lifecycle("restart"))
         self.refresh_button.clicked.connect(self.refresh)
-        for field in (self.url, self.gateway_key, self.admin_key):
+        for field in (self.url, self.gateway_key):
             field.textEdited.connect(self.connection_edited)
         layout.addWidget(self.connection)
         self.notice = QLabel("选择本地模式配置供应商，或输入远程网关地址连接。")
@@ -265,8 +254,9 @@ class MainWindow(QMainWindow):
                 buttons = QHBoxLayout(controls)
                 buttons.setContentsMargins(2, 0, 2, 0)
                 buttons.setSpacing(2)
-                for arrow, offset in (("↑", -1), ("↓", 1)):
+                for arrow, offset in (("^", -1), ("v", 1)):
                     button = QPushButton(arrow)
+                    button.setStyleSheet("padding: 0; font-weight: bold;")
                     arrow_font = button.font()
                     arrow_font.setBold(True)
                     arrow_font.setPointSize(14)
@@ -286,7 +276,7 @@ class MainWindow(QMainWindow):
             self.provider_table.blockSignals(False)
         custom_order = not self._order_reset and (self._ranking_dirty or self.configuration.get("auto_routing", {}).get("provider_order"))
         prefix = "已启用自定义调用顺序。" if self._ranking_draft or custom_order else "当前使用默认评分排序，表格顺序不代表评分顺序。"
-        self.order_hint.setText(prefix + "用 ↑/↓ 调整供应商模型顺序，点击“保存供应商配置”后重启生效；同一供应商的已有优先模型保留组内顺序。" + ("（顺序尚未保存）" if self._ranking_dirty else ""))
+        self.order_hint.setText(prefix + "用 ^/v 调整供应商模型顺序，点击“保存供应商配置”后重启生效；同一供应商的已有优先模型保留组内顺序。" + ("（顺序尚未保存）" if self._ranking_dirty else ""))
 
     def provider_move_target(self, name, offset):
         target = self._provider_order.index(name) + offset
@@ -419,24 +409,15 @@ class MainWindow(QMainWindow):
         url = self.url.text().rstrip("/")
         self.help_text.setPlainText(
             f"OpenAI 兼容客户端接入\n\nBase URL: {url}/v1\n"
-            "API Key: 使用调用 Key，勿使用管理员 Key\nModel: auto 或配置的模型别名\n\n"
+            "API Key: 使用调用 Key\nModel: auto 或配置的模型别名\n\n"
             f"curl {url}/v1/chat/completions \\\n"
             "  -H \"Authorization: Bearer <API_KEY>\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'\n\n"
-            "本地配置不依赖网关运行；保存后重启生效。远程配置需要服务器设置 ADMIN_API_KEY。\n"
+            "本地配置不依赖网关运行；保存后重启生效。远程模式仅用于调用调试与只读状态查看。\n"
             "本地停止只作用于本客户端启动的进程。CLI 启动的服务请在远程模式连接。\n"
             "关闭窗口可保留本地服务；再次打开同一配置目录可重新连接并停止。\n"
             "统计是进程内累计值；流式成功计数可能仅代表收到首包。没有额度和费用统计。\n"
             "远程网络建议使用 HTTPS；连接信息和远程 Key 不持久化。"
         )
-
-    def choose_workspace(self):
-        if self.local_gateway and self.local_gateway.owned_process():
-            self.problem("请先停止当前本地网关，再切换配置目录")
-            return
-        selected = QFileDialog.getExistingDirectory(self, "选择配置目录", self.workspace.text())
-        if selected:
-            self.workspace.setText(selected)
-            self.mode_changed()
 
     def mode_changed(self):
         self.invalidate_status()
@@ -445,7 +426,6 @@ class MainWindow(QMainWindow):
         self._last_status = None
         self._connected = False
         self._needs_load = True
-        self._load_config = False
         self._load_user_requested = False
         self._next_overview_at = self._next_models_at = 0
         self.configuration = None
@@ -460,21 +440,18 @@ class MainWindow(QMainWindow):
         self.test_model.clear()
         self.test_model.addItem("auto")
         self.gateway_key.clear()
-        self.admin_key.clear()
         self.provider_key.clear()
         self.url.setReadOnly(self.is_local)
-        for widget in (self.workspace, self.choose_button, self.port, self.start_button, self.stop_button, self.restart_button):
+        for widget in (self.port, self.start_button, self.stop_button, self.restart_button):
             widget.setEnabled(self.is_local)
         for button in (self.start_button, self.stop_button, self.restart_button, self.reload_button):
             button.setVisible(self.is_local)
         self.refresh_button.setVisible(not self.is_local)
         self.regenerate_button.setVisible(self.is_local)
         self.regenerate_button.setEnabled(False)
-        # Workspace selection is explicit to avoid switching while a process is running.
-        self.workspace.setReadOnly(True)
         if self.is_local:
             try:
-                root, keys = prepare_workspace(self.workspace.text())
+                root, keys = prepare_workspace(self._workspace_root)
                 self.local_store = ConfigStore(root / "config.yaml")
                 self.local_gateway = LocalGateway(root)
                 self._runtime_api_key = active_key if previous_root == root and self.local_gateway.owned_process() else None
@@ -485,7 +462,6 @@ class MainWindow(QMainWindow):
                 if existing_port:
                     self.port.setValue(existing_port)
                 self.gateway_key.setText(keys["API_KEY"])
-                self.admin_key.setText(keys["ADMIN_API_KEY"])
                 self.regenerate_button.setEnabled("API_KEY" not in self.local_store.external_env_names)
                 self.local_url()
                 self.apply_config(self.local_store.read())
@@ -494,7 +470,8 @@ class MainWindow(QMainWindow):
                 self.problem("无法加载本地配置，请检查目录权限和 YAML 格式")
         else:
             self._runtime_api_key = active_key
-            self.notice.setText("输入远程地址和调用 Key；修改配置另需管理员 Key。")
+            self.notice.setText("输入远程地址和调用 Key，仅用于调用调试和只读状态查看。")
+        self.tabs.setTabVisible(1, self.is_local)
         self.update_help()
 
     def local_url(self):
@@ -530,10 +507,9 @@ class MainWindow(QMainWindow):
                                 ("当前连接继续使用运行中的旧 Key。" if active_key is not None else ""))
         self.run(lambda worker: store.regenerate_gateway_key(revision), done)
 
-    def request_load(self, config=False):
+    def request_load(self):
         self.invalidate_status()
         self._needs_load = True
-        self._load_config = config
         self._load_user_requested = True
         self._last_status = None
         self._next_overview_at = self._next_models_at = 0
@@ -541,10 +517,10 @@ class MainWindow(QMainWindow):
 
     def client(self):
         key = self._runtime_api_key if self.is_local and self._runtime_api_key is not None else self.gateway_key.text()
-        return GatewayClient(self.url.text(), key, self.admin_key.text())
+        return GatewayClient(self.url.text(), key)
 
     def problem(self, message):
-        for widget in (self.gateway_key, self.admin_key, self.provider_key):
+        for widget in (self.gateway_key, self.provider_key):
             key = widget.text()
             if key:
                 message = message.replace(key, "[REDACTED]")
@@ -656,15 +632,14 @@ class MainWindow(QMainWindow):
         local = self.is_local
         loading = self._last_status == "ready" and (self._needs_load or time.monotonic() >= self._next_overview_at)
         include_models = self._needs_load or time.monotonic() >= self._next_models_at
-        include_config = self._load_config
-        worker = Worker(lambda task: client.overview(task.cancelled, include_models, include_config) if loading
+        worker = Worker(lambda task: client.overview(task.cancelled, include_models) if loading
                         else client.status(task.cancelled), self)
         self.status_worker = worker
 
         def current():
             return (generation == self._status_generation and gateway is self.local_gateway
                     and local == self.is_local and not self.worker and not worker.cancelled.is_set()
-                    and client.url == self.url.text().rstrip("/") and client.admin_key == self.admin_key.text()
+                    and client.url == self.url.text().rstrip("/")
                     and client.api_key == (self._runtime_api_key if self.is_local and self._runtime_api_key is not None else self.gateway_key.text()))
 
         def done(result):
@@ -680,10 +655,8 @@ class MainWindow(QMainWindow):
                 else:
                     self.summary.setText("网关：" + str(state) + "；就绪后自动加载数据。")
             if loading and state == "ready" and "snapshot" in result:
-                if result.get("config"):
-                    self.apply_config(result["config"])
                 self.apply_runtime(result, client)
-                self._needs_load = self._load_config = False
+                self._needs_load = False
                 self._next_overview_at = time.monotonic() + self.OVERVIEW_INTERVAL
                 if "models" in result:
                     self._next_models_at = time.monotonic() + self.MODEL_INTERVAL
@@ -732,7 +705,7 @@ class MainWindow(QMainWindow):
         self.url.setText(client.url)
         self.notice.setText("正在连接远程网关，就绪后自动加载数据…")
         self.update_help()
-        self.request_load(config=True)
+        self.request_load()
 
     def apply_runtime(self, result, client):
         snap = result["snapshot"]
@@ -748,7 +721,7 @@ class MainWindow(QMainWindow):
                                            "归属：" + str(model.get("owned_by", "—")) + "；路由：" + str(model.get("routing_type", "真实模型")),
                                            Qt.ItemDataRole.ToolTipRole)
             self.test_model.setCurrentText(selected or "auto")
-        self.summary.setText("已连接，运行概览自动更新。统计为单进程累计值；流式成功计数可能仅代表首包。" + ("没有管理员 Key，配置管理不可用。" if not client.admin_key else ""))
+        self.summary.setText("已连接，运行概览自动更新。统计为单进程累计值；流式成功计数可能仅代表首包。")
 
     def apply_config(self, configuration):
         self.configuration = configuration
@@ -803,38 +776,21 @@ class MainWindow(QMainWindow):
             self.alias_model.setText(self.alias_table.item(row, 2).text())
 
     def save_change(self, kind, edit, ranking=None):
+        if not self.is_local:
+            self.problem("远程模式仅支持调用调试，不允许修改服务器配置")
+            return
         if self.worker:
             return
-        if not self.configuration:
-            self.problem("请先加载配置；远程模式需要管理员 Key")
+        if not self.configuration or not self.local_store:
+            self.problem("请先加载本地配置")
             return
-        revision = self.configuration["revision"]
-        try:
-            client = self.client()
-        except ValueError as exc:
-            self.problem(str(exc))
-            return
-        local, store = self.is_local, self.local_store
-
+        revision, store = self.configuration["revision"], self.local_store
         def operation(worker):
-            if local:
-                if kind == "ranking":
-                    return store.ranking(revision, edit)
-                if kind == "provider":
-                    return store.provider(revision, edit, ranking)
-                if kind == "alias":
-                    return store.alias(revision, edit)
-                return store.delete_alias(revision, edit)
-            if kind == "ranking":
-                return client.request("PUT", "/admin/ranking", {"revision": revision, "ranking": edit.model_dump()}, admin=True)
             if kind == "provider":
-                payload = {"revision": revision, "provider": edit.model_dump()}
-                if ranking is not None:
-                    payload["ranking"] = ranking.model_dump()
-                return client.request("PUT", "/admin/providers", payload, admin=True)
+                return store.provider(revision, edit, ranking)
             if kind == "alias":
-                return client.request("PUT", "/admin/aliases", {"revision": revision, "route": edit.model_dump()}, admin=True)
-            return client.request("DELETE", "/admin/aliases", {"revision": revision, "alias": edit}, admin=True)
+                return store.alias(revision, edit)
+            return store.delete_alias(revision, edit)
         self.run(operation, self.apply_config)
 
     def save_provider(self):
@@ -848,7 +804,7 @@ class MainWindow(QMainWindow):
                                 default_model=self.provider_model.text().strip(), timeout=self.provider_timeout.value(),
                                 api_key=key)
             if not self.configuration:
-                self.problem("请先加载配置；远程模式需要管理员 Key")
+                self.problem("请先加载本地配置")
                 return
             self.save_change("provider", edit, self.provider_ranking_edit(edit))
         except ValidationError:

@@ -73,12 +73,12 @@ def main():
         with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(executable)):
             try:
                 gateway.start(port)
-                client = GatewayClient(f"http://127.0.0.1:{port}", keys["API_KEY"], keys["ADMIN_API_KEY"])
+                client = GatewayClient(f"http://127.0.0.1:{port}", keys["API_KEY"])
                 deadline = time.monotonic() + 20
                 ready = False
                 while time.monotonic() < deadline:
                     try:
-                        ready = client.request("GET", "/admin/status", admin=True)["status"] == "ready"
+                        ready = client.status(threading.Event())["status"] == "ready"
                         if ready:
                             break
                     except Exception:
@@ -88,24 +88,18 @@ def main():
                     raise RuntimeError("Frozen backend failed: " + gateway.log_tail())
                 assert LocalGateway(root).port() == port
                 assert client.request("GET", "/v1/models")["object"] == "list"
-                configuration = client.request("GET", "/admin/config", admin=True)
-                assert "providers" in configuration
-                assert configuration["auto_routing"]["custom_ranking"] == []
-                saved = client.request("PUT", "/admin/ranking", {
-                    "revision": configuration["revision"], "ranking": {"custom_ranking": []}}, admin=True)
-                assert saved["auto_routing"]["custom_ranking"] == []
-                combined = client.request("PUT", "/admin/providers", {
-                    "revision": saved["revision"],
-                    "provider": {"name": "demo", "base_url": "https://example.test", "default_model": "demo-model", "api_key": ""},
-                    "ranking": {"custom_ranking": [{"provider": "demo", "model": "demo-model"}], "provider_order": ["demo"]}}, admin=True)
-                assert combined["providers"]["demo"]["default_model"] == "demo-model"
-                assert combined["auto_routing"]["custom_ranking"] == [{"provider": "demo", "model": "demo-model"}]
-                assert combined["auto_routing"]["provider_order"] == ["demo"]
-                loaded = client.overview(threading.Event(), include_models=True, include_config=True)
-                assert loaded["state"] == "ready" and "snapshot" in loaded and "models" in loaded and "config" in loaded
+                before = (root / "config.yaml").read_bytes()
+                try:
+                    client.request("PUT", "/admin/providers", {})
+                    raise AssertionError("Removed management route remains accessible")
+                except ValueError as error:
+                    assert "404" in str(error)
+                assert (root / "config.yaml").read_bytes() == before
+                loaded = client.overview(threading.Event(), include_models=True)
+                assert loaded["state"] == "ready" and "snapshot" in loaded and "models" in loaded and "config" not in loaded
                 gateway.stop()
                 assert gateway.owned_process() is None
-                print("Frozen local backend, ranking API, reconnect and stop passed")
+                print("Frozen health/debug APIs, removed management routes, reconnect and stop passed")
             finally:
                 gateway.stop()
 
