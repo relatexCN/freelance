@@ -276,6 +276,10 @@ class RouterService:
         p_cfg = config.providers.get(p_name)
         if not p_cfg:
             return False
+        now = time.time()
+        if not any(now >= p_cfg.key_cooldowns.get(index, 0)
+                   for index in range(len(p_cfg.api_keys))):
+            return False
         return not (p_cfg.is_platform_melted() or p_cfg.is_model_melted(actual_id)
                     or actual_id in p_cfg.model_probe_tokens)
 

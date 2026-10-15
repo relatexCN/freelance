@@ -32,6 +32,7 @@ async def stream_candidates(request, http_request, candidates):
     model = request.model
     switched = False
     failed = False
+    partial_output_sent = False
     tried = set()
     attempted_count = 0
     skipped_count = 0
@@ -65,8 +66,10 @@ async def stream_candidates(request, http_request, candidates):
         if failed:
             switched = True
             # Do not repeat untrusted provider errors or credentials in the notice.
-            yield packet('\n\n【当前模型调用失败，切换新模型】\n'
-                         '以下由备用模型重新回答；前面的未完成内容仅供参考。\n\n')
+            if partial_output_sent:
+                yield packet('\n\n【当前模型调用失败，切换新模型】\n'
+                             '以下由备用模型重新回答；前面的未完成内容仅供参考。\n\n')
+                partial_output_sent = False
             log_event(logger, 'stream_model_switch', provider=provider_name, model=actual_model)
         log_event(logger, 'provider_selected', provider=provider_name, model=actual_model,
                   iteration=1, stream=True)
@@ -164,6 +167,8 @@ async def stream_candidates(request, http_request, candidates):
                 else:
                     for choice in data.get('choices') or []:
                         delta = choice.get('delta') or {}
+                        partial_output_sent |= bool(delta.get('content') or delta.get('reasoning_content')
+                                                    or delta.get('reasoning'))
                         if delta.get('tool_calls') or delta.get('function_call'):
                             tools_sent = True
                     yield chunk
