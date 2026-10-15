@@ -2,9 +2,9 @@
 OpenAI-compatible request models.
 """
 
-from typing import Any, Optional, Union, Literal
+from typing import Any, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 class ChatMessage(BaseModel):
@@ -26,7 +26,7 @@ class ResponseFormat(BaseModel):
 
 
 class _ChatCompletionRequestBase(BaseModel):
-    """Fields shared by single-model and multi-model chat requests."""
+    """OpenAI-compatible request fields."""
 
     model: Optional[str] = "auto"
     messages: list[ChatMessage]
@@ -61,38 +61,3 @@ class ChatCompletionRequest(_ChatCompletionRequestBase):
         data = self.model_dump(exclude_none=True)
         data["model"] = actual_model
         return data
-
-
-class MultiChatCompletionRequest(_ChatCompletionRequestBase):
-    """Request the same prompt from multiple targets using non-streaming aggregation."""
-
-    models: Optional[list[str]] = Field(default=None, min_length=1)
-    parallel: bool = True
-    output_format: Literal["auto", "text", "json"] = "auto"
-    output_schema: Optional[dict[str, Any]] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_stream_parameter(cls, data):
-        if (
-            isinstance(data, dict)
-            and "stream" in data
-            and data.get("stream") is not None
-            and data.get("stream") is not False
-        ):
-            raise ValueError(
-                "The multi-model endpoint does not support stream=true"
-            )
-        return data
-
-    def to_single_request(self, model: str) -> ChatCompletionRequest:
-        data = self.model_dump(
-            exclude={"models", "parallel", "output_format", "output_schema", "tools", "tool_choice", "parallel_tool_calls",
-                     "functions", "function_call"},
-            exclude_none=True,
-        )
-        data["model"] = model
-        # Compatibility-only stream=false/null may arrive as an allowed extra.
-        # Always enforce non-streaming for each upstream call.
-        data["stream"] = False
-        return ChatCompletionRequest(**data)

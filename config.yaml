@@ -139,14 +139,6 @@ models:
 
 # 全局设置
 settings:
-  manager_agent:
-    enabled: false
-    provider: ""  # 分析报告使用的已配置供应商，例如 openrouter
-    model: ""     # 上游实际模型 ID（需支持工具调用）
-    max_iterations: 4
-    timeout_seconds: 60
-    max_tokens: 1500
-    auto_apply: false  # 第二阶段只生成建议，不执行配置修改
   reliability:
     connect_timeout_seconds: 30 # 上游连接建立超时；流式、非流式、模型发现共用，修改后重启
     request_timeout_seconds: 0 # 0 不限制单模型 HTTP 请求总时长；正数按秒启用硬截止
@@ -159,18 +151,14 @@ settings:
   logging:
     format: json  # json / text（文本模式也使用新的事件字段）
     level: INFO
-    log_request_payload: true  # 临时调试选项；可能包含私人内容
-    log_response_payload: true # 请求/响应正文独立写入内容日志，不输出到控制台
+    log_request_payload: false # 显式开启后才记录请求正文
+    log_response_payload: false # 显式开启后才记录响应正文
     content_log_path: freelance-content.log
     max_body_bytes: 262144      # 响应采集上限；超限或不完整时不写正文
     max_log_bytes: 10485760     # 每个日志文件约 10 MiB 后轮转
     backup_count: 3
     include_diagnostics: false  # 自由文本诊断可能包含上游回显内容
     max_field_chars: 4096
-  # 单次 /chat/completions/multi 最多调用的模型数量
-  multi_model_max_models: 5
-  # 多模型非流式聚合的整次请求总超时（秒），包含所有模型及其内部 Key 重试
-  multi_model_timeout: 90
   # 最大重试次数
   max_retries: 2
   # 统一超时时间（秒），null表示使用各提供商默认超时
@@ -217,7 +205,6 @@ settings:
 
   # 工具调用处理方式：
   # passthrough  - 原样转发 OpenAI tools/tool_calls，由客户端负责处理（默认）
-  # local_agent  - 在网关内部执行受支持的工具调用
   # disabled     - 发送上游前移除工具相关参数
   tools:
     mode: passthrough

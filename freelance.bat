@@ -4,7 +4,7 @@ SETLOCAL EnableDelayedExpansion
 :: Check for Python
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Python not found. Please install Python 3.8 or higher.
+    echo [ERROR] Python not found. Please install Python 3.10 or higher.
     exit /b 1
 )
 

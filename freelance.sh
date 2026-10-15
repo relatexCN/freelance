@@ -14,7 +14,7 @@ check_python() {
 PYTHON_CMD=$(check_python)
 
 if [ -z "$PYTHON_CMD" ]; then
-    echo "[ERROR] Python not found. Please install Python 3.8 or higher."
+    echo "[ERROR] Python not found. Please install Python 3.10 or higher."
     exit 1
 fi
 

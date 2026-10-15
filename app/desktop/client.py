@@ -39,10 +39,6 @@ class GatewayClient:
     def request(self, method, path, body=None):
         with httpx.Client(timeout=httpx.Timeout(120, connect=5), follow_redirects=False) as client:
             response = client.request(method, self.url + path, json=body, headers=self.headers())
-            if path == "/v1/chat/completions/multi" and response.status_code in {502, 504}:
-                result = response.json()
-                if isinstance(result, dict) and result.get("status") == "failed" and isinstance(result.get("responses"), list):
-                    return result
             self.check(response)
             return response.json()
 

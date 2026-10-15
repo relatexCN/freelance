@@ -7,7 +7,7 @@ name = "freelance-llm-api"
 version = "0.1.0"
 description = "Freelance LLM API Gateway"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
@@ -18,16 +18,13 @@ dependencies = [
     "pyyaml>=6.0.0",
     "sse-starlette>=2.2.0",
     "psutil>=6.0.0",
-    "jsonschema>=4.18,<5",
 ]
 
 [project.scripts]
 freelance-api = "app.cli:main"
-freelance-mcp = "app.mcp_server:main"
 freelance-desktop = "app.desktop.__main__:main"
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.28,<2; python_version >= '3.10'"]
 desktop = ["PySide6-Essentials>=6.8,<7; python_version >= '3.10'"]
 desktop-build = ["pyinstaller>=6.11,<7; python_version >= '3.10'"]
 

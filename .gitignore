@@ -2,6 +2,7 @@
 venv/
 env/
 .venv/
+# Legacy local environments stay excluded from source releases
 .venv-mcp/
 
 # Environment variables (contains secrets)

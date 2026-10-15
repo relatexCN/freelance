@@ -165,7 +165,7 @@ class RequestEventMiddleware:
         chat_request = scope["path"].rstrip("/") in {"/chat/completions", "/v1/chat/completions"}
         audit = ResponseAudit() if chat_request else None
         capture = settings.log_response_payload and scope["path"].rstrip("/").endswith(
-            ("/chat/completions", "/chat/completions/multi"))
+            "/chat/completions")
         body = bytearray()
         content_type = ""
         outcome = "incomplete"

@@ -10,53 +10,20 @@ from app.models import (
     ChatCompletionRequest,
     ModelInfo,
     ModelListResponse,
-    MultiChatCompletionRequest,
 )
 from app.services.agent import AgentService
 from app.services.router import AUTO_ROUTING_ALIASES
-from app.services.multi_chat import MultiChatRequestError, MultiChatService
 from app.utils.responses import make_error_response
 
 router = APIRouter()
 logger = logging.getLogger("freelance")
 
 
-@router.post("/chat/completions/multi")
-async def multi_chat_completions(
-    fastapi_request: Request,
-    request: MultiChatCompletionRequest,
-):
-    """Return independent answers from multiple configured models."""
-    object.__setattr__(request, "_gateway_headers", dict(fastapi_request.headers))
-    log_event(logger, "multi_chat_requested", models=request.models, parallel=request.parallel,
-              request_fingerprint=request_fingerprint(request))
-    if config.settings.logging.log_request_payload:
-        log_event(logger, "request_payload", request_payload=request.model_dump(exclude_none=True))
-    try:
-        targets = MultiChatService.prepare_targets(request)
-    except MultiChatRequestError as exc:
-        return make_error_response(
-            str(exc),
-            400,
-            type="invalid_request_error",
-            code=exc.code,
-        )
-
-    result = await MultiChatService.run(request, targets)
-    body = result.model_dump(exclude_none=True)
-    if result.status == "failed":
-        all_timed_out = all(
-            item.error_code == "multi_timeout" for item in result.responses
-        )
-        return JSONResponse(status_code=504 if all_timed_out else 502, content=body)
-    return body
-
-
 @router.post("/chat/completions")
 async def chat_completions(fastapi_request: Request, request: ChatCompletionRequest):
     """
     OpenAI-compatible chat completion endpoint.
-    Orchestrates multi-turn dialogue via AgentService.
+    Routes a single OpenAI-compatible chat request.
     """
     model_name = (request.model or "auto").lower()
     log_event(logger, "chat_requested", model=model_name, stream=request.stream,

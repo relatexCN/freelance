@@ -367,13 +367,11 @@ class MainWindow(QMainWindow):
         self.test_model.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.test_model.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self.test_model.addItem("auto")
-        self.multi = QCheckBox("多模型独立回答（使用各供应商默认模型）")
         top.addWidget(QLabel("模型"))
         top.addWidget(self.test_model, 1)
-        top.addWidget(self.multi)
         layout.addLayout(top)
         self.prompt = QPlainTextEdit()
-        self.prompt.setPlaceholderText("输入测试问题。单模型以流式输出；多模型返回独立结果，不自动汇总。")
+        self.prompt.setPlaceholderText("输入测试问题，以流式方式查看所选模型的回答。")
         self.prompt.setMaximumHeight(120)
         layout.addWidget(self.prompt)
         controls = QHBoxLayout()
@@ -544,7 +542,6 @@ class MainWindow(QMainWindow):
                 self.tabs.setTabEnabled(index, self.tabs.widget(index) is self.playground_page)
             self.prompt.setEnabled(False)
             self.test_model.setEnabled(False)
-            self.multi.setEnabled(False)
             self.cancel_button.setEnabled(True)
         worker = Worker(operation, self)
         self.worker = worker
@@ -562,7 +559,6 @@ class MainWindow(QMainWindow):
             self.tabs.setTabEnabled(index, True)
         self.prompt.setEnabled(True)
         self.test_model.setEnabled(True)
-        self.multi.setEnabled(True)
         self.cancel_button.setEnabled(False)
         if worker:
             worker.deleteLater()
@@ -835,18 +831,12 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self.problem(str(exc))
             return
-        multi = self.multi.isChecked()
         body = {"messages": [{"role": "user", "content": prompt}]}
         self.output.clear()
         self.notice.setText("正在调用模型…")
-        if multi:
-            body["parallel"] = True
-            self.run(lambda worker: client.request("POST", "/v1/chat/completions/multi", body),
-                     lambda result: (self.output.setPlainText(json.dumps(result, ensure_ascii=False, indent=2)), self.notice.setText("多模型调用结束：" + result.get("status", "请查看结果"))))
-        else:
-            body.update(model=self.test_model.currentText() or "auto", stream=True)
-            self.run(lambda worker: client.stream(body, worker.chunk.emit, worker.cancelled),
-                     lambda result: self.notice.setText(result), stream=True)
+        body.update(model=self.test_model.currentText() or "auto", stream=True)
+        self.run(lambda worker: client.stream(body, worker.chunk.emit, worker.cancelled),
+                 lambda result: self.notice.setText(result), stream=True)
 
     def cancel_test(self):
         if self.worker:

@@ -1,4 +1,4 @@
-from .request import ChatMessage, ChatCompletionRequest, MultiChatCompletionRequest, ResponseFormat
+from .request import ChatMessage, ChatCompletionRequest, ResponseFormat
 from .response import (
     ChatCompletionResponse,
     ChatCompletionMessage,
@@ -9,6 +9,4 @@ from .response import (
     StreamChoice,
     ModelInfo,
     ModelListResponse,
-    MultiChatCompletionItem,
-    MultiChatCompletionResponse,
 )

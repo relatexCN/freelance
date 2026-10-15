@@ -89,11 +89,16 @@ def main():
                 assert LocalGateway(root).port() == port
                 assert client.request("GET", "/v1/models")["object"] == "list"
                 before = (root / "config.yaml").read_bytes()
-                try:
-                    client.request("PUT", "/admin/providers", {})
-                    raise AssertionError("Removed management route remains accessible")
-                except ValueError as error:
-                    assert "404" in str(error)
+                for method, path in [("PUT", "/admin/providers"),
+                                     ("POST", "/v1/chat/completions/multi"),
+                                     ("POST", "/chat/completions/multi"),
+                                     ("GET", "/management/snapshot"),
+                                     ("POST", "/management/report")]:
+                    try:
+                        client.request(method, path, {})
+                        raise AssertionError("Removed route remains accessible: " + path)
+                    except ValueError as error:
+                        assert "404" in str(error)
                 assert (root / "config.yaml").read_bytes() == before
                 loaded = client.overview(threading.Event(), include_models=True)
                 assert loaded["state"] == "ready" and "snapshot" in loaded and "models" in loaded and "config" not in loaded

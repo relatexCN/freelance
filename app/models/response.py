@@ -47,35 +47,6 @@ class ChatCompletionResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
-class MultiChatCompletionItem(BaseModel):
-    """One independently completed model call in a multi-model response."""
-
-    provider: str
-    model: str
-    status: str
-    latency_ms: float
-    content: Optional[str] = None
-    response: Optional[dict[str, Any]] = None
-    usage: Optional[UsageInfo] = None
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-    structured_content: Optional[Any] = None
-    formatting_status: str = "not_attempted"
-    formatted_by: Optional[str] = None
-
-
-class MultiChatCompletionResponse(BaseModel):
-    """Aggregated responses for the same prompt across multiple models."""
-
-    id: str = Field(default_factory=lambda: f"multi-{uuid.uuid4().hex[:12]}")
-    object: str = "multi.chat.completion"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    status: str
-    parallel: bool
-    responses: list[MultiChatCompletionItem] = Field(default_factory=list)
-    usage: UsageInfo = Field(default_factory=UsageInfo)
-
-
 # --- Streaming response models ---
 
 

@@ -101,13 +101,12 @@ class ErrorPolicySettings(BaseModel):
 class ToolSettings(BaseModel):
     """Tool-call handling mode."""
     # passthrough: forward tool definitions/calls without local execution.
-    # local_agent: execute supported tool calls inside this gateway.
     # disabled: remove tool request controls before sending upstream.
     mode: str = "passthrough"
 
     def normalized_mode(self) -> str:
         mode = (self.mode or "passthrough").strip().lower()
-        return mode if mode in {"passthrough", "local_agent", "disabled"} else "passthrough"
+        return mode if mode in {"passthrough", "disabled"} else "passthrough"
 
 
 class ScoringSettings(BaseModel):
@@ -144,16 +143,6 @@ class LoggingSettings(BaseModel):
     max_field_chars: int = Field(default=4096, ge=128)
 
 
-class ManagerAgentSettings(BaseModel):
-    enabled: bool = False
-    provider: str = ""
-    model: str = ""
-    max_iterations: int = Field(default=4, ge=1, le=8)
-    timeout_seconds: float = Field(default=60, gt=0, le=300)
-    max_tokens: int = Field(default=1500, ge=128, le=8192)
-    auto_apply: Literal[False] = False
-
-
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -162,9 +151,6 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="API_KEY")
     api_keys: str = Field(default="", alias="API_KEYS")  # comma-separated string of valid keys
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
-    max_iterations: int = Field(default=3, alias="MAX_ITERATIONS")
-    multi_model_max_models: int = Field(default=5, alias="MULTI_MODEL_MAX_MODELS")
-    multi_model_timeout: float = Field(default=90, alias="MULTI_MODEL_TIMEOUT")
     unified_timeout: Optional[float] = Field(default=None, alias="UNIFIED_TIMEOUT")
     switch_session_ttl_seconds: int = Field(default=86400, alias="SWITCH_SESSION_TTL_SECONDS")
     cooldown: CooldownSettings = Field(default_factory=CooldownSettings)
@@ -175,7 +161,6 @@ class Settings(BaseSettings):
     scoring: ScoringSettings = Field(default_factory=ScoringSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     reliability: ReliabilitySettings = Field(default_factory=ReliabilitySettings)
-    manager_agent: ManagerAgentSettings = Field(default_factory=ManagerAgentSettings)
 
     # Legacy fields removed. All provider config now lives in config.yaml
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -457,26 +442,12 @@ class AppConfig:
             self.settings = Settings()
             if "settings" in raw:
                 s_data = raw["settings"]
-                if "manager_agent" in s_data:
-                    self.settings.manager_agent = ManagerAgentSettings(**(s_data["manager_agent"] or {}))
                 if "logging" in s_data:
                     self.settings.logging = LoggingSettings(**(s_data["logging"] or {}))
                 if "reliability" in s_data:
                     self.settings.reliability = ReliabilitySettings(**(s_data["reliability"] or {}))
                 if "max_retries" in s_data:
                     self.settings.max_retries = int(s_data["max_retries"])
-                if "max_iterations" in s_data:
-                    self.settings.max_iterations = int(s_data["max_iterations"])
-                if "multi_model_max_models" in s_data:
-                    max_models = int(s_data["multi_model_max_models"])
-                    if max_models <= 0:
-                        raise ValueError("settings.multi_model_max_models must be positive")
-                    self.settings.multi_model_max_models = max_models
-                if "multi_model_timeout" in s_data:
-                    multi_timeout = float(s_data["multi_model_timeout"])
-                    if multi_timeout <= 0:
-                        raise ValueError("settings.multi_model_timeout must be positive")
-                    self.settings.multi_model_timeout = multi_timeout
                 if "unified_timeout" in s_data:
                     unified_timeout_val = s_data["unified_timeout"]
                     if unified_timeout_val is not None:
@@ -528,7 +499,7 @@ class AppConfig:
                     tools_data = s_data["tools"] or {}
                     if "mode" in tools_data:
                         mode = str(tools_data["mode"]).strip().lower()
-                        if mode not in {"passthrough", "local_agent", "disabled"}:
+                        if mode not in {"passthrough", "disabled"}:
                             raise ValueError(f"Invalid tools.mode: {mode}")
                         self.settings.tools.mode = mode
 
